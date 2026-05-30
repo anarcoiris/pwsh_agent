@@ -1,0 +1,18 @@
+# config.yaml - Pulse pwsh_agent Configuration
+
+ollama:
+  # Base URL for the local Ollama instance (same port 11435)
+  base_url: "http://localhost:11435"
+  
+  # Default model used for coding, reasoning, and tool calling
+  default_model: "qwen2.5-coder:7b-openclaw"
+  
+  # Conversational/translation model if needed
+  conversational_model: "chat-analyzer"
+
+agent:
+  # Maximum steps in a single autonomous ReAct loop
+  max_steps: 30
+  
+  # Thought budget limit for the sequentialthinking tool
+  max_thoughts: 30
