@@ -26,6 +26,7 @@ def resolve_project_file(name: str) -> Path | None:
         direct = (root / Path(*rel_parts)).resolve()
         if direct.is_file():
             return direct
+        return None
 
     for sub in _PCAP_SEARCH_DIRS:
         base = root / sub if sub else root

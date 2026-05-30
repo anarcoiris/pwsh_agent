@@ -22,7 +22,7 @@ def test_extracts_watcher_deliverable():
 
 def test_pending_deliverables():
     intent = TaskIntentExtractor.parse(MSG)
-    root = Path(__file__).resolve().parent.parent
+    root = Path(__file__).resolve().parent.parent / "nonexistent_temp_dir"
     pending = intent.pending_deliverables(root)
     assert "watcher/watcher.py" in pending
 

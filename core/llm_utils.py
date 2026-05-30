@@ -154,11 +154,41 @@ class ResultCompactor:
         try:
             data = json.loads(result)
             analysis = data.get("analysis", data)
-            # Keep only top-level summary keys
-            compact = {
-                k: (v[:20000] if isinstance(v, str) else v)
-                for k, v in analysis.items()
-            }
+
+            # Priority order for compaction: preserve key_fields and
+            # verbose_log_file metadata at full fidelity (they're already
+            # compact).  Truncate the large text blobs proportionally.
+            _PRIORITY_KEYS = ["key_fields", "potential_plaintext_credentials"]
+            _LARGE_KEYS = ["packet_summary", "protocol_hierarchy", "ip_conversations"]
+            _META_KEYS = ["verbose_log_file", "verbose_log_lines", "verbose_log_bytes",
+                          "packet_summary_error"]
+
+            compact: dict = {}
+            budget = cls.MAX_CHARS - 200  # room for JSON envelope
+
+            # Pass 1: keep priority + meta fields (small/important)
+            for k in _PRIORITY_KEYS + _META_KEYS:
+                if k in analysis:
+                    v = analysis[k]
+                    s = json.dumps(v, default=str)
+                    if len(s) < 15_000:
+                        compact[k] = v
+                        budget -= len(s)
+                    else:
+                        compact[k] = v[:15_000] if isinstance(v, str) else v
+                        budget -= 15_000
+
+            # Pass 2: large text blobs — allocate remaining budget evenly
+            large_present = [k for k in _LARGE_KEYS if k in analysis]
+            if large_present and budget > 0:
+                per_key = max(2_000, budget // len(large_present))
+                for k in large_present:
+                    v = analysis[k]
+                    if isinstance(v, str) and len(v) > per_key:
+                        compact[k] = v[:per_key] + f"\n[... truncated from {len(v)} chars]"
+                    else:
+                        compact[k] = v
+
             return (
                 "[PCAP ANALYSIS COMPACTED]\n"
                 + json.dumps(compact, indent=2)[:cls.MAX_CHARS]

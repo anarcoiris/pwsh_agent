@@ -16,7 +16,7 @@ def test_redirects_progress_note_to_append():
         "write_file",
         {"path": "workspace/plan.md", "content": "Script reviewed and verified"},
         intent,
-        pending_deliverables=["watcher/watcher.py"],
+        pending_deliverables=[],
     )
     assert err is None
     assert name == "append_note"

@@ -42,7 +42,7 @@ from core.llm_utils import (
 )
 from core.parser import AgentOutputParser
 from core.task_intent import TaskIntent, TaskIntentExtractor
-from core.chat_goals import ChatGoals, ChatGoalGuard
+from core.chat_goals import ChatGoals, ChatGoalGuard, ChatGoalRegistry
 from core.write_guard import WriteGuard
 from core.execution_policy import ExecutionPolicy
 
@@ -306,11 +306,12 @@ class ReActAgent:
             "- workspace/plan.md and workspace/status.md are progress logs ONLY — use append_note, never write_file for short status lines.\n"
             "- Do NOT substitute plan.md for a code deliverable. Do NOT claim a script was created until write_file succeeded on the target path.\n\n"
 
-            "TOOL CALL FORMAT — prefer native tool_calls, or use XML tags:\n"
+            "TOOL CALL FORMAT:\n"
+            "You MUST use XML tags for ALL tool calls. DO NOT write Python or PowerShell pseudo-code like `run_script(...)`.\n"
             "<tool_call>\n"
             '{"name": "host_exec", "arguments": {"command": "Get-Process"}}\n'
             "</tool_call>\n\n"
-
+            
             "AVAILABLE TOOLS:\n"
             "— Core — sequentialthinking, host_exec, run_script, find_file, read_file, write_file, append_note\n"
             "— Network Capture — list_network_interfaces, capture_packets, analyze_pcapng\n"
@@ -322,6 +323,7 @@ class ReActAgent:
             "- Progress notes: append_note on workspace/plan.md or workspace/status.md. Code deliverables: write_file to the user-specified path.\n"
             "- Do NOT invent facts. Run a tool to verify everything.\n"
             "- Emit only ONE tool call per turn.\n"
+            "- DO NOT write Python code (like `run_script(...)`) to execute tools. Use ONLY the <tool_call> XML format.\n"
             "- Never repeat the exact same tool call with identical arguments.\n"
             "- Use finding_create immediately when you discover a significant issue.\n"
             "- Executing direct shell commands via host_exec is a strict LAST RESORT. Always prefer high-level specialized tools (e.g. port_scan, dns_lookup, system_info, analyze_pcapng) whenever they are available to minimize raw shell usage.\n"
@@ -455,6 +457,13 @@ class ReActAgent:
                 "role":    "user",
                 "content": failure_hint,
             })
+        else:
+            reflection_hint = self._build_tool_reflection_hint(tool_name, result)
+            if reflection_hint:
+                self.ctx_manager.add_message({
+                    "role":    "user",
+                    "content": reflection_hint,
+                })
 
         duration_ms = int((time.monotonic() - t_start) * 1000)
         result_str  = json.dumps(result, default=str)
@@ -481,12 +490,33 @@ class ReActAgent:
         if tool_name == "analyze_pcapng" and isinstance(result, dict) and result.get("success"):
             analysis = result.get("analysis", {})
             parts = []
-            for key in ("packet_summary", "potential_plaintext_credentials", "protocol_hierarchy"):
+            _SECTION_CAP = 8_000
+            _TOTAL_CAP = 20_000
+
+            # Prefer targeted key_fields extraction (compact, useful)
+            key_fields = analysis.get("key_fields")
+            if key_fields:
+                parts.append(f"### key_fields\n{key_fields[:_SECTION_CAP]}")
+
+            for key in ("potential_plaintext_credentials", "packet_summary", "protocol_hierarchy"):
                 val = analysis.get(key)
                 if val:
-                    parts.append(f"### {key}\n{val[:1500]}")
+                    parts.append(f"### {key}\n{val[:_SECTION_CAP]}")
+
+            # Reference the log file so the agent can read_file in chunks
+            log_file = analysis.get("verbose_log_file")
+            if log_file:
+                log_bytes = analysis.get("verbose_log_bytes", 0)
+                parts.append(
+                    f"### verbose_log\n"
+                    f"Full verbose decode ({log_bytes} chars) saved to:\n"
+                    f"  {log_file}\n"
+                    f"Use read_file(path=\"{log_file}\", line_start=1, line_count=100) to inspect."
+                )
+
             if parts:
-                self._last_pcap_summary = "\n\n".join(parts)
+                joined = "\n\n".join(parts)
+                self._last_pcap_summary = joined[:_TOTAL_CAP]
 
         self.ctx_manager.add_message({
             "role":    "tool",
@@ -716,9 +746,9 @@ class ReActAgent:
         )
         self.ctx_manager.add_message({"role": "user", "content": chat_directive + message})
 
-        chat_goals = ChatGoals.from_message(message)
+        chat_goals = ChatGoalRegistry.match_message(message)
         if not chat_goals:
-            chat_goals = ChatGoals.from_session(
+            chat_goals = ChatGoalRegistry.match_session(
                 self.ctx_manager.get_messages(), message
             )
         self._chat_goals = chat_goals
@@ -1040,6 +1070,52 @@ class ReActAgent:
         if not excerpt:
             return None
         return f"[SYSTEM] Tool failure — follow this playbook excerpt:\n{excerpt}"
+
+    @staticmethod
+    def _build_tool_reflection_hint(tool_name: str, result: Any) -> str | None:
+        """Inject the tool's schema + playbook excerpt to help self-correct after failure."""
+        if not isinstance(result, dict) or result.get("success") is not False:
+            return None
+
+        # Avoid double hinting if we already have a host_exec/run_script failure hint
+        if tool_name in ("host_exec", "run_script"):
+            stderr = str(result.get("stderr", "") or result.get("error", ""))
+            patterns = (
+                r"ModuleNotFoundError",
+                r"No module named",
+                r"extensi.*\.ps1",
+                r"\.py'",
+                r"not found",
+            )
+            if any(re.search(p, stderr, re.I) for p in patterns):
+                return None
+
+        # Find schema
+        schema = next((s for s in tools.TOOLS_SCHEMA if s.get("function", {}).get("name") == tool_name), None)
+        schema_str = ""
+        if schema:
+            schema_str = f"Tool Schema:\n{json.dumps(schema.get('function', {}), indent=2)}\n"
+
+        # Find playbook from RAG
+        playbook = ""
+        try:
+            from core.rag import get_rag_context_for_tools
+            playbook = get_rag_context_for_tools([tool_name], max_chars=1200)
+        except Exception:
+            pass
+
+        hint_parts = [
+            f"[SYSTEM] Tool '{tool_name}' failed.",
+        ]
+        if schema_str:
+            hint_parts.append(schema_str)
+        if playbook:
+            hint_parts.append(f"Playbook Excerpt:\n{playbook}")
+
+        hint_parts.append(
+            f"Please review the schema and correct your parameters before calling '{tool_name}' again."
+        )
+        return "\n\n".join(hint_parts)
 
     @staticmethod
     def _format_tool_summary(tools_executed: list[str], paths_written: list[str]) -> str:

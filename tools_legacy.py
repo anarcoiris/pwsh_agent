@@ -506,6 +506,11 @@ def analyze_pcapng(
     Analyzes an existing pcapng/pcap file using tshark to yield protocol stats,
     network conversations, potential plaintext passwords, and custom filtered logs.
     Supports individual packet decodes with verbose and raw byte dumps.
+
+    When verbose=True, the full -V output is written to a log file under
+    workspace/pcap_logs/ and a targeted field-extraction summary is returned
+    in the result dict for LLM context.  This avoids blowing up the context
+    window with 100KB+ of raw protocol headers.
     """
     from core.artifacts import resolve_project_file
 
@@ -540,6 +545,13 @@ def analyze_pcapng(
 
     analysis_report = {}
 
+    # ── Context-budget constants ─────────────────────────────────────────
+    # Maximum chars we allow the packet_summary section to occupy in
+    # the JSON result that goes into the LLM context window.
+    _MAX_SUMMARY_CHARS = 30_000
+    # Per-packet size estimate for a verbose (-V) decode (bytes).
+    _VERBOSE_PACKET_EST = 4_000
+
     try:
         # 1. Get Protocol Hierarchy Statistics
         cmd_phs = [tshark_path, "-r", str(pcap_path), "-z", "io,phs"]
@@ -554,7 +566,6 @@ def analyze_pcapng(
             analysis_report["ip_conversations"] = res_conv.stdout.strip()
 
         # 3. Check for plaintext credentials / unencrypted protocols (HTTP/FTP/SMTP/TELNET)
-        # Search for USER/PASS/Authorization in FTP, SMTP, HTTP
         cred_filter = "http.authorization || ftp.request.command == \"USER\" || ftp.request.command == \"PASS\" || smtp.req.parameter"
         cmd_creds = [tshark_path, "-r", str(pcap_path), "-Y", cred_filter, "-T", "fields", "-e", "frame.number", "-e", "ip.src", "-e", "ip.dst", "-e", "col.Protocol", "-e", "col.Info"]
         res_creds = subprocess.run(cmd_creds, capture_output=True, text=True, timeout=30)
@@ -562,21 +573,91 @@ def analyze_pcapng(
             analysis_report["potential_plaintext_credentials"] = res_creds.stdout.strip()
 
         # 4. Filtered Packet List Output
-        # Read first N packets or packets matching the custom display filter expression
+        # ── Dynamic limit for verbose mode ──────────────────────────────
+        effective_limit = limit
+        if verbose:
+            # Probe: grab 1 verbose packet to measure actual size
+            probe_cmd = [tshark_path, "-r", str(pcap_path), "-V", "-c", "1"]
+            if filter_expression:
+                probe_cmd.extend(["-Y", filter_expression])
+            probe_res = subprocess.run(
+                probe_cmd, capture_output=True, text=True, timeout=15
+            )
+            probe_size = len(probe_res.stdout) if probe_res.returncode == 0 else _VERBOSE_PACKET_EST
+            probe_size = max(probe_size, 500)  # floor
+
+            # How many packets can we fit within our context budget?
+            dynamic_max = max(1, _MAX_SUMMARY_CHARS // probe_size)
+            effective_limit = min(limit, dynamic_max)
+
         cmd_packets = [tshark_path, "-r", str(pcap_path)]
         if filter_expression:
             cmd_packets.extend(["-Y", filter_expression])
-        
+
         if verbose:
             cmd_packets.append("-V")
         if show_bytes:
             cmd_packets.append("-x")
 
-        # Limit the packet reading
-        cmd_packets.extend(["-c", str(limit)])
-        res_packets = subprocess.run(cmd_packets, capture_output=True, text=True, timeout=30)
+        cmd_packets.extend(["-c", str(effective_limit)])
+        res_packets = subprocess.run(cmd_packets, capture_output=True, text=True, timeout=60)
+
         if res_packets.returncode == 0:
-            analysis_report["packet_summary"] = res_packets.stdout.strip()
+            full_output = res_packets.stdout.strip()
+
+            if verbose and len(full_output) > _MAX_SUMMARY_CHARS:
+                # ── Dump full output to log file ────────────────────────
+                log_dir = Path(__file__).resolve().parent / "workspace" / "pcap_logs"
+                log_dir.mkdir(parents=True, exist_ok=True)
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                log_name = f"verbose_{ts}.txt"
+                log_path = log_dir / log_name
+                log_path.write_text(full_output, encoding="utf-8")
+                analysis_report["verbose_log_file"] = str(log_path)
+                analysis_report["verbose_log_lines"] = full_output.count("\n")
+                analysis_report["verbose_log_bytes"] = len(full_output)
+
+                # ── Targeted field extraction for context ───────────────
+                # Instead of the full -V dump, run a second pass extracting
+                # only the fields the user typically cares about.
+                field_cmd = [
+                    tshark_path, "-r", str(pcap_path),
+                    "-T", "fields",
+                    "-e", "frame.number",
+                    "-e", "ip.src", "-e", "ip.dst",
+                    "-e", "col.Protocol",
+                    "-e", "http.request.method",
+                    "-e", "http.host",
+                    "-e", "http.request.uri",
+                    "-e", "http.content_type",
+                    "-e", "http.authorization",
+                    "-e", "http.set_cookie",
+                    "-e", "http.cookie",
+                    "-e", "http.file_data",
+                    "-e", "xml",
+                    "-e", "data.text",
+                    "-e", "text",
+                    "-E", "header=y",
+                    "-E", "separator=\t",
+                    "-E", "quote=d",
+                    "-c", str(effective_limit),
+                ]
+                if filter_expression:
+                    field_cmd.extend(["-Y", filter_expression])
+                field_res = subprocess.run(
+                    field_cmd, capture_output=True, text=True, timeout=30,
+                )
+                if field_res.returncode == 0 and field_res.stdout.strip():
+                    analysis_report["key_fields"] = field_res.stdout.strip()[:_MAX_SUMMARY_CHARS]
+
+                # Keep a truncated head of the verbose output as context preview
+                analysis_report["packet_summary"] = (
+                    full_output[:_MAX_SUMMARY_CHARS]
+                    + f"\n\n[... TRUNCATED — full output ({len(full_output)} chars) "
+                    f"saved to {log_path}. Use read_file to view in chunks.]"
+                )
+            else:
+                analysis_report["packet_summary"] = full_output
         else:
             analysis_report["packet_summary_error"] = res_packets.stderr.strip()
 

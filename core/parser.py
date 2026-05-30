@@ -86,18 +86,6 @@ _CODE_LANG_EXT = {
 }
 _SKIP_CODE_LANGS = {"json", "tool_call", "markdown", "md", "text", ""}
 
-_REGISTERED_TOOLS = frozenset({
-    "append_note", "find_file", "analyze_pcapng", "host_exec", "run_script",
-    "read_file", "write_file", "sequentialthinking", "capture_packets",
-    "list_network_interfaces", "crack_hash", "system_info", "port_scan",
-    "ping_sweep", "dns_lookup",
-})
-
-_TOOL_NAME_JSON = re.compile(
-    r"\b(" + "|".join(_REGISTERED_TOOLS) + r")\s+(\{.*\})\s*$",
-    re.I | re.DOTALL,
-)
-
 
 def _infer_script_path(code: str, user_context: str, ext: str) -> str:
     """Guess target path from code comments or recent user messages."""
@@ -181,6 +169,21 @@ class AgentOutputParser:
     def __init__(self, tools_registry: dict[str, Any]):
         self.tools_registry = tools_registry
         self._user_context: str = ""
+        # Build registered tools from the registry keys dynamically
+        # Ensure we always have a fallback/default list if tools_registry is empty
+        registered = list(tools_registry.keys()) if tools_registry else []
+        if not registered:
+            registered = [
+                "append_note", "find_file", "analyze_pcapng", "host_exec", "run_script",
+                "read_file", "write_file", "sequentialthinking", "capture_packets",
+                "list_network_interfaces", "crack_hash", "system_info", "port_scan",
+                "ping_sweep", "dns_lookup"
+            ]
+        self.registered_tools = frozenset(registered)
+        self._tool_name_json = re.compile(
+            r"\b(" + "|".join(self.registered_tools) + r")\s+(\{.*\})\s*$",
+            re.I | re.DOTALL,
+        )
 
     def set_user_context(self, user_context: str) -> None:
         self._user_context = user_context or ""
@@ -237,7 +240,7 @@ class AgentOutputParser:
         blocks: list[Any] = []
 
         # Path 2b — tool_name {"arg": "val"} prose (model omits name/arguments wrapper)
-        for m in _TOOL_NAME_JSON.finditer(content):
+        for m in self._tool_name_json.finditer(content):
             tool_name = m.group(1)
             parsed = _try_parse_json(m.group(2).strip())
             if parsed is not None and isinstance(parsed, dict):

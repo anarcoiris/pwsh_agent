@@ -10,7 +10,7 @@ from core.rag import LocalRAG
 def test_loads_frontmatter_tools():
     rag = LocalRAG()
     tool_sets = {tuple(sorted(s.get("tools", []))) for s in rag.sections}
-    assert any("capture_packets" in s for s in rag.sections)
+    assert any("capture_packets" in s.get("tools", []) for s in rag.sections)
 
 
 def test_retrieve_for_tools_capture_packets():
