@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from core.runtime_paths import project_root
+from core.runtime_paths import workspace_root
 
 _SKIP_PARTS = {".venv", "__pycache__", "artifacts/archived"}
 
@@ -14,7 +14,7 @@ _PCAP_SEARCH_DIRS = ("", "workspace", "artifacts/captures")
 
 def resolve_project_file(name: str) -> Path | None:
     """Return first existing path for a filename under known project locations."""
-    root = project_root()
+    root = workspace_root()
     candidate = Path(name)
     if candidate.is_absolute() and candidate.is_file():
         return candidate.resolve()
@@ -39,7 +39,7 @@ def resolve_project_file(name: str) -> Path | None:
 
 def find_file(name: str, search_root: Path | None = None) -> dict:
     """Search project tree for files matching basename (skips .venv and archived backups)."""
-    root = search_root or project_root()
+    root = search_root or workspace_root()
     basename = Path(name).name
     if not basename:
         return {"success": False, "error": "No filename provided.", "matches": []}

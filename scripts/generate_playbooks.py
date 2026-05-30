@@ -11,7 +11,9 @@ import json
 from pathlib import Path
 
 # Setup sys path
-project_root = Path(__file__).resolve().parent.parent
+from core.runtime_paths import app_root
+
+project_root = app_root()
 sys.path.insert(0, str(project_root))
 
 import tools

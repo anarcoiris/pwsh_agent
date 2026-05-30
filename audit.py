@@ -17,10 +17,10 @@ from typing import Any, Optional
 
 logger = logging.getLogger("pwsh_agent.audit")
 
-# Secret key — override via env var AUDIT_HMAC_SECRET
+from core.runtime_paths import workspace_root
+
 _HMAC_SECRET = os.environ.get("AUDIT_HMAC_SECRET", "pulse-default-secret-change-me").encode()
-_PROJECT_ROOT = Path(__file__).resolve().parent
-_AUDIT_DIR = _PROJECT_ROOT / "audit_trail"
+_AUDIT_DIR = workspace_root() / ".pulse" / "audit_trail"
 
 
 @dataclass

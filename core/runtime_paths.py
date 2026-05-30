@@ -5,16 +5,20 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_APP_ROOT = Path(__file__).resolve().parent.parent
 
+def app_root() -> Path:
+    """The directory where the agent's code, configs, and playbooks live."""
+    return _APP_ROOT
 
-def project_root() -> Path:
-    return _PROJECT_ROOT
+def workspace_root() -> Path:
+    """The directory where the console was invoked from, used for sandboxed deliverables."""
+    return Path.cwd()
 
 
 def venv_python() -> str:
     """Prefer .venv/Scripts/python.exe, then py -3.10, then python on PATH."""
-    venv_exe = _PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
+    venv_exe = _APP_ROOT / ".venv" / "Scripts" / "python.exe"
     if venv_exe.is_file():
         return str(venv_exe)
     if shutil.which("py"):

@@ -132,12 +132,16 @@ def run_script(script_path: str, args: list | None = None, timeout: int = 120) -
         args: Optional CLI arguments passed to the script.
         timeout: Maximum execution time in seconds.
     """
-    from core.runtime_paths import project_root, venv_python
+    from core.runtime_paths import app_root, venv_python
+    import os
+
+    # Force search from project root down
+    env = os.environ.copy()
+    root = app_root()
 
     if not script_path:
         return {"exit_code": -1, "stdout": "", "stderr": "No script_path provided.", "duration_ms": 0}
 
-    root = project_root()
     path = Path(script_path)
     if not path.is_absolute():
         path = root / path

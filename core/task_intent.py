@@ -30,13 +30,13 @@ class TaskIntent:
     is_dev_task: bool = False
     forbid_network: bool = False
 
-    def pending_deliverables(self, project_root: Path | None = None) -> list[str]:
+    def pending_deliverables(self, workspace_root: Path | None = None) -> list[str]:
         """Return deliverable paths that do not yet exist on disk."""
         pending: list[str] = []
         for rel in self.deliverables:
             p = Path(rel)
-            if project_root and not p.is_absolute():
-                p = project_root / rel
+            if workspace_root and not p.is_absolute():
+                p = workspace_root / rel
             if not p.exists():
                 pending.append(rel.replace("\\", "/"))
         return pending

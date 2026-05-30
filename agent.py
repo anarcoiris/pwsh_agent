@@ -45,10 +45,9 @@ from core.task_intent import TaskIntent, TaskIntentExtractor
 from core.chat_goals import ChatGoals, ChatGoalGuard, ChatGoalRegistry
 from core.write_guard import WriteGuard
 from core.execution_policy import ExecutionPolicy
+from core.runtime_paths import app_root, workspace_root
 
 logger = logging.getLogger("pwsh_agent.agent")
-
-_PROJECT_ROOT = Path(__file__).resolve().parent
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -156,8 +155,9 @@ class ReActAgent:
     MIN_TOOLS_BEFORE_COMPLETE: int = 2
 
     def __init__(self, session_id: str = "default"):
-        self.project_root = _PROJECT_ROOT
-        self.config       = self._load_config()
+        self.workspace_root = workspace_root()
+        self.app_root       = app_root()
+        self.config         = self._load_config()
 
         ollama_cfg = self.config.get("ollama", {})
         self.base_url      = ollama_cfg.get("base_url", "http://localhost:11435")
@@ -235,7 +235,7 @@ class ReActAgent:
     # ── Configuration ──────────────────────────────────────────────────────
 
     def _load_config(self) -> dict:
-        config_path = self.project_root / "config.yaml"
+        config_path = self.app_root / "config.yaml"
         if config_path.exists():
             try:
                 with open(config_path, "r", encoding="utf-8") as f:
@@ -274,7 +274,7 @@ class ReActAgent:
 
         identity_context = ""
         for fn in ("SOUL.md", "IDENTITY.md", "USER.md"):
-            fp = self.project_root / fn
+            fp = self.app_root / fn
             if fp.exists():
                 try:
                     identity_context += f"\n--- {fn} ---\n{fp.read_text(encoding='utf-8')}\n"
@@ -324,6 +324,7 @@ class ReActAgent:
             "- Do NOT invent facts. Run a tool to verify everything.\n"
             "- Emit only ONE tool call per turn.\n"
             "- DO NOT write Python code (like `run_script(...)`) to execute tools. Use ONLY the <tool_call> XML format.\n"
+            "- If a tool fails (e.g. file not found), DO NOT immediately retry or give up. You MUST use an investigative tool (list_dir, find_file, read_file) to understand the failure.\n"
             "- Never repeat the exact same tool call with identical arguments.\n"
             "- Use finding_create immediately when you discover a significant issue.\n"
             "- Executing direct shell commands via host_exec is a strict LAST RESORT. Always prefer high-level specialized tools (e.g. port_scan, dns_lookup, system_info, analyze_pcapng) whenever they are available to minimize raw shell usage.\n"
@@ -378,7 +379,7 @@ class ReActAgent:
         tool_name, tool_args, redirect_note = ExecutionPolicy.apply(tool_name, tool_args)
 
         pending = (
-            self._active_intent.pending_deliverables(self.project_root)
+            self._active_intent.pending_deliverables(self.workspace_root)
             if self._active_intent else []
         )
         tool_name, tool_args, block_err = WriteGuard.apply(
@@ -831,7 +832,7 @@ class ReActAgent:
                 if chat_goals and not chat_goals.pending(tools_executed_names):
                     break
 
-                pending = self._active_intent.pending_deliverables(self.project_root)
+                pending = self._active_intent.pending_deliverables(self.workspace_root)
                 if pending and deliverable_nudges < 2:
                     deliverable_nudges += 1
                     self.ctx_manager.add_message({
@@ -896,9 +897,9 @@ class ReActAgent:
                     self.ctx_manager.save_state()
                     intent_snapshot = self._active_intent
                     self._active_intent = None
-                    return self._finalize_chat_response(
-                        message, content, tools_executed_names,
-                        paths_written, intent_snapshot, self.project_root,
+                    return self._enforce_deliverables_guard(
+                        paths_written, intent_snapshot, self.workspace_root,
+                        orig_result=content
                     )
                 if step > 0 and not (chat_goals and chat_goals.pending(tools_executed_names)):
                     break
@@ -925,9 +926,9 @@ class ReActAgent:
         self._chat_goals = None
         self._chat_tools_executed = []
 
-        content = self._finalize_chat_response(
-            message, content, tools_executed_names,
-            paths_written, intent_snapshot, self.project_root,
+        content = self._enforce_deliverables_guard(
+            paths_written, intent_snapshot, self.workspace_root,
+            orig_result=content,
         )
 
         if getattr(self, "_last_pcap_summary", None) and "analyze_pcapng" in tools_executed_names:
@@ -989,24 +990,23 @@ class ReActAgent:
 
         return executed
 
-    @staticmethod
-    def _finalize_chat_response(
-        user_message: str,
-        content: str,
-        tools_executed: list[str],
+    def _enforce_deliverables_guard(
+        self,
         paths_written: list[str],
-        intent: TaskIntent | None,
-        project_root: Path,
+        intent_snapshot: TaskIntent,
+        workspace_root: Path,
+        orig_result: str,
     ) -> str:
         """Verify deliverables on disk; warn on hallucinated completion."""
         warnings: list[str] = []
+        content = orig_result
 
         normalized_written = [p.replace("\\", "/") for p in paths_written]
 
-        if intent and intent.deliverables:
-            for rel in intent.deliverables:
+        if intent_snapshot and intent_snapshot.deliverables:
+            for rel in intent_snapshot.deliverables:
                 rel_norm = rel.replace("\\", "/")
-                p = project_root / rel_norm if not Path(rel_norm).is_absolute() else Path(rel_norm)
+                p = workspace_root / rel_norm if not Path(rel_norm).is_absolute() else Path(rel_norm)
                 if p.exists():
                     continue
                 if any(
@@ -1112,8 +1112,36 @@ class ReActAgent:
         if playbook:
             hint_parts.append(f"Playbook Excerpt:\n{playbook}")
 
+        # Dynamic Troubleshooting Playbooks
+        error_msg = str(result.get("error", "")).lower()
+        if "does not exist" in error_msg or "not found" in error_msg or "no such file" in error_msg:
+            hint_parts.append(
+                "TROUBLESHOOTING:\n"
+                "- The file was not found. Do NOT blindly retry with the same path.\n"
+                "- Use `list_dir` on the expected parent directory or `find_file` to locate it.\n"
+                "- If you generated a script that wrote this file, use `read_file` on the script to verify the working directory it used."
+            )
+        elif "not in registry" in error_msg or "not found" in error_msg and tool_name not in [s.get("function", {}).get("name") for s in tools.TOOLS_SCHEMA]:
+            hint_parts.append(
+                "TROUBLESHOOTING:\n"
+                f"- The tool '{tool_name}' does not exist. Do NOT try to call it again.\n"
+                "- Use `host_exec` for shell commands (like `mv`, `cp`, `mkdir`) if a specialized tool doesn't exist, or find an alternative tool."
+            )
+        elif tool_name == "read_file" and ("is a directory" in error_msg or "is not a file" in error_msg):
+            hint_parts.append(
+                "TROUBLESHOOTING:\n"
+                "- You tried to read a directory as a file.\n"
+                "- Use `list_dir` instead to view the contents of a directory."
+            )
+        elif tool_name == "run_script":
+            hint_parts.append(
+                "TROUBLESHOOTING:\n"
+                "- The script execution failed. Ensure the script has the correct extension (e.g. `.py` or `.ps1`).\n"
+                "- If the script threw an error, use `sequentialthinking` to analyze the traceback before retrying."
+            )
+
         hint_parts.append(
-            f"Please review the schema and correct your parameters before calling '{tool_name}' again."
+            f"Please review the schema and use an investigative tool (list_dir, find_file) to troubleshoot before calling '{tool_name}' again."
         )
         return "\n\n".join(hint_parts)
 
