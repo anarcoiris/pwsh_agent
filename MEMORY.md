@@ -106,5 +106,5 @@ All ten must print success lines.
 - **run_script over host_exec for .py**: `ExecutionPolicy` redirects automatically; do not regress.
 
 ## 📊 System Operations & Stats
-- **Last Run**: 2026-05-30 (Session: `default`, Persona: `LEAD`)
+- **Last Run**: 2026-05-30 (Session: `default`, Persona: `NETWORK`)
 - **Total Auditing Days**: 2

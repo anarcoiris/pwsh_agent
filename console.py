@@ -96,9 +96,18 @@ class AgentConsole:
                     if stderr:
                         console.print(f"[bold red]Stderr Output:[/bold red]\n[red]{stderr}[/red]")
                 else:
-                    console.print(f"[bold green]✔ Tool Result ({tool}):[/bold green] Success")
+                    res_str = json.dumps({k: v for k, v in result.items() if k != "success"}, indent=2, default=str)
+                    if len(res_str) > 800:
+                        res_str = res_str[:800] + "\n[dim]... (output truncated) ...[/dim]"
+                    if res_str.strip() == "{}":
+                        console.print(f"[bold green]✔ Tool Result ({tool}):[/bold green] Success")
+                    else:
+                        console.print(f"[bold green]✔ Tool Result ({tool}):[/bold green]\n[dim]{res_str}[/dim]")
             else:
-                console.print(f"[bold green]✔ Tool Result ({tool}):[/bold green] {str(result)}")
+                res_str = str(result)
+                if len(res_str) > 800:
+                    res_str = res_str[:800] + "\n[dim]... (output truncated) ...[/dim]"
+                console.print(f"[bold green]✔ Tool Result ({tool}):[/bold green]\n[dim]{res_str}[/dim]")
 
             if self._active_status:
                 self._active_status.start()

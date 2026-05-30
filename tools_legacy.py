@@ -132,12 +132,12 @@ def run_script(script_path: str, args: list | None = None, timeout: int = 120) -
         args: Optional CLI arguments passed to the script.
         timeout: Maximum execution time in seconds.
     """
-    from core.runtime_paths import app_root, venv_python
+    from core.runtime_paths import workspace_root, venv_python
     import os
 
-    # Force search from project root down
+    # Force search from workspace root down
     env = os.environ.copy()
-    root = app_root()
+    root = workspace_root()
 
     if not script_path:
         return {"exit_code": -1, "stdout": "", "stderr": "No script_path provided.", "duration_ms": 0}
@@ -611,7 +611,8 @@ def analyze_pcapng(
 
             if verbose and len(full_output) > _MAX_SUMMARY_CHARS:
                 # ── Dump full output to log file ────────────────────────
-                log_dir = Path(__file__).resolve().parent / "workspace" / "pcap_logs"
+                from core.runtime_paths import workspace_root
+                log_dir = workspace_root() / ".pulse" / "pcap_logs"
                 log_dir.mkdir(parents=True, exist_ok=True)
                 ts = time.strftime("%Y%m%d_%H%M%S")
                 log_name = f"verbose_{ts}.txt"
@@ -683,27 +684,14 @@ def crack_hash(
     timeout: int = 180
 ) -> dict:
     """
-    Cracks a SHA-256 target hash using the hybrid CPU+GPU hash_pro7.py script.
-    Executes non-interactively using 'py -3.10 hash_pro7.py' to avoid encoding/compatibility issues.
-
-    Uses the confirmed-working script at:
-        C:\\Users\\soyko\\Documents\\MCP_Pentesting\\tools\\hash_crack\\hash_pro7.py
-    CWD is set to that directory so hashcat.exe and its OpenCL/kernel resources resolve correctly.
+    Cracks a SHA-256 target hash using the hybrid CPU+GPU hashpro command.
+    Executes non-interactively to avoid encoding/compatibility issues.
     """
     if not target_hash:
         return {"success": False, "error": "target_hash is required."}
 
-    # Use our workspace duplicate of hash_pro7.py which contains the custom CP1252/OEM decoding fixes.
-    # We still keep the current working directory (cwd) pointing to MCP_Pentesting/tools/hash_crack
-    # so hashcat.exe, OpenCL kernels, rules, and potfiles resolve successfully.
-    HASH_CRACK_DIR = Path(r"C:\Users\soyko\Documents\MCP_Pentesting\tools\hash_crack")
-    WORKSPACE_DIR = Path(__file__).resolve().parent
-    script_path = str(WORKSPACE_DIR / "hash_pro7.py")
-    if not os.path.exists(script_path):
-        return {"success": False, "error": f"Workspace hash_pro7.py was not found at {script_path}."}
-
-    # Pass the global Python UTF-8 override flag (-X utf8) to py -3.10 to prevent standard output unicode errors
-    cmd = ["py", "-3.10", "-X", "utf8", script_path, "--target", target_hash, "--mask", mask]
+    from core.runtime_paths import workspace_root
+    cmd = ["hashpro", "--target", target_hash, "--mask", mask]
     if salt:
         cmd.extend(["--salt", salt])
     if min_len is not None:
@@ -728,8 +716,7 @@ def crack_hash(
     env["TERM"] = "xterm-256color"
 
     try:
-        # Run process non-interactively with cwd set to hash_crack dir so
-        # hashcat.exe can find its OpenCL kernels, potfiles, and other resources.
+        # Run process non-interactively
         result = subprocess.run(
             cmd,
             capture_output=True,
@@ -737,8 +724,8 @@ def crack_hash(
             encoding="utf-8",
             errors="replace",
             env=env,
-            cwd=str(HASH_CRACK_DIR),
-            timeout=timeout
+            cwd=str(workspace_root()),
+            timeout=timeout,
         )
 
         stdout_str = result.stdout or ""

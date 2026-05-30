@@ -282,7 +282,9 @@ class RetryOrchestrator:
             f"Action plan:\n"
             f"  1. Identify the intent expressed in the output.\n"
             f"  2. Map that intent to the closest registered tool (host_exec, dns_lookup, port_scan, etc.).\n"
-            f"  3. Emit the correct tool call in the VERY NEXT turn — no prose, just the tool call."
+            f"  3. Emit the correct tool call in valid JSON format in the VERY NEXT turn. Example:\n"
+            f"     {{\"name\": \"tool_name\", \"arguments\": {{\"param\": \"value\"}}}}\n"
+            f"  4. DO NOT use bash-like syntax like `tool_name arg1 arg2`. You MUST use JSON!"
         )
         return {
             "function": {

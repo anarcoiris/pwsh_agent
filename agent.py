@@ -648,6 +648,14 @@ class ReActAgent:
                     logger.info("Parser reflection triggered (step %d)", step)
                     if step_callback:
                         step_callback("AGENT_THOUGHT", "[Parser reflection — self-correcting…]")
+                    
+                    # Ensure the LLM sees its own faked tool call
+                    last_msg = self.ctx_manager.get_messages()[-1]
+                    if last_msg.get("role") == "assistant":
+                        if "tool_calls" not in last_msg:
+                            last_msg["tool_calls"] = []
+                        last_msg["tool_calls"].append(reflection)
+
                     await self._execute_tool(
                         reflection["function"]["name"],
                         reflection["function"]["arguments"],
@@ -663,6 +671,7 @@ class ReActAgent:
                         "Do NOT produce prose."
                     )
                     self.ctx_manager.add_message({"role": "user", "content": nudge})
+                    break
 
                 # If still conversational after a few empty turns, return early
                 if consecutive_empty >= 3 and step == 0:
@@ -899,12 +908,20 @@ class ReActAgent:
                     self._active_intent = None
                     return self._enforce_deliverables_guard(
                         paths_written, intent_snapshot, self.workspace_root,
-                        orig_result=content
+                        orig_result=content,
+                        tools_executed=tools_executed_names,
                     )
                 if step > 0 and not (chat_goals and chat_goals.pending(tools_executed_names)):
                     break
                 reflection = self.retry_orchestrator.parser_reflection(content, self.parser)
                 if reflection:
+                    # Ensure the LLM sees its own faked tool call
+                    last_msg = self.ctx_manager.get_messages()[-1]
+                    if last_msg.get("role") == "assistant":
+                        if "tool_calls" not in last_msg:
+                            last_msg["tool_calls"] = []
+                        last_msg["tool_calls"].append(reflection)
+
                     rname = reflection["function"]["name"]
                     rargs = reflection["function"]["arguments"]
                     did_exec, _ = await self._execute_tool(
@@ -919,6 +936,7 @@ class ReActAgent:
                         "role":    "user",
                         "content": "Planning phase over. ACT NOW — use write_file for deliverables.",
                     })
+                    break
 
         steps_run = (step + 1) if "step" in locals() else 0
         intent_snapshot = self._active_intent
@@ -929,6 +947,7 @@ class ReActAgent:
         content = self._enforce_deliverables_guard(
             paths_written, intent_snapshot, self.workspace_root,
             orig_result=content,
+            tools_executed=tools_executed_names,
         )
 
         if getattr(self, "_last_pcap_summary", None) and "analyze_pcapng" in tools_executed_names:
@@ -996,6 +1015,7 @@ class ReActAgent:
         intent_snapshot: TaskIntent,
         workspace_root: Path,
         orig_result: str,
+        tools_executed: list[str] = None,
     ) -> str:
         """Verify deliverables on disk; warn on hallucinated completion."""
         warnings: list[str] = []
@@ -1016,12 +1036,12 @@ class ReActAgent:
                     continue
                 warnings.append(f"Deliverable not found on disk: {rel_norm}")
 
-        if intent and intent.is_dev_task:
+        if intent_snapshot and intent_snapshot.is_dev_task:
             deliverable_written = any(
                 Path(p.replace("\\", "/")).suffix in (".py", ".ps1")
                 for p in paths_written
             )
-            if not deliverable_written and intent.deliverables:
+            if not deliverable_written and intent_snapshot.deliverables:
                 if re.search(
                     r"\b(saved|written|created|verified|mission complete|has been saved)\b",
                     content, re.I,
@@ -1031,7 +1051,7 @@ class ReActAgent:
                     )
 
         if re.search(r'\{"name"\s*:', content.strip()):
-            summary = ReActAgent._format_tool_summary(tools_executed, paths_written)
+            summary = ReActAgent._format_tool_summary(tools_executed or self._chat_tools_executed or [], paths_written)
             content = summary if not content.strip().startswith("⚠️") else content
 
         if warnings:

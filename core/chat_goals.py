@@ -253,11 +253,8 @@ def _build_pcap_goal(message: str, session: list[dict] | None) -> ChatGoals | No
                     "NOT encode_decode."
                 ),
             },
-            blocked_tools=["encode_decode", "append_note", "sequentialthinking"],
-            blocked_reason=(
-                "Do NOT use encode_decode on PCAP data. "
-                "Do NOT declare task complete via append_note."
-            ),
+            blocked_tools=["encode_decode", "sequentialthinking"],
+            blocked_reason="Do NOT use encode_decode on PCAP data.",
         )
 
     # ── Direct message path ──────────────────────────────────────────
@@ -281,11 +278,8 @@ def _build_pcap_goal(message: str, session: list[dict] | None) -> ChatGoals | No
             "pcap_path_hint": path_hint or "last_capture.pcapng",
             "filter_expression": _build_pcap_filters(lower),
         },
-        blocked_tools=["encode_decode", "append_note", "sequentialthinking"],
-        blocked_reason=(
-            "Do NOT use encode_decode on PCAP data. "
-            "Do NOT declare task complete via append_note."
-        ),
+        blocked_tools=["encode_decode", "sequentialthinking"],
+        blocked_reason="Do NOT use encode_decode on PCAP data.",
     )
 
 
@@ -306,8 +300,8 @@ def _build_portscan_goal(message: str, session: list[dict] | None) -> ChatGoals 
         required_tools=["port_scan"],
         label="Port scan",
         hints={"target": target} if target else {},
-        blocked_tools=["append_note"],
-        blocked_reason="Complete the port scan before logging notes.",
+        blocked_tools=[],
+        blocked_reason="",
     )
 
 
@@ -326,8 +320,8 @@ def _build_hashcrack_goal(message: str, session: list[dict] | None) -> ChatGoals
         required_tools=["crack_hash"],
         label="Hash cracking",
         hints=hints,
-        blocked_tools=["append_note"],
-        blocked_reason="Complete the hash crack before logging notes.",
+        blocked_tools=[],
+        blocked_reason="",
     )
 
 
