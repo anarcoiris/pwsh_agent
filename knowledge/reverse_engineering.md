@@ -1,3 +1,8 @@
+---
+tools: [host_exec, read_file]
+phase: [re]
+---
+
 # Reverse Engineering & Binary Inspection Reference
 
 Guidelines, utilities, and script strategies for reverse engineering, static inspection, and dynamic debugging of Windows PE binaries natively.

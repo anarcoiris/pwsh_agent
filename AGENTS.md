@@ -34,13 +34,15 @@ The console agent does **not** call `mcp_server.py` for `sequentialthinking`; it
 |------|---------|
 | `write_file` | Code deliverables (`.py`, `.ps1`), reports, any full file body |
 | `append_note` | Progress lines only — `workspace/plan.md`, `workspace/status.md`, `workspace/session_log.md` |
-| `read_file` / `host_exec` | Verification and execution |
+| `read_file` / `run_script` / `host_exec` | Verification and execution (`.py` → `run_script`; PowerShell → `host_exec`) |
 
 **Rules enforced in code (do not bypass):**
 
 1. Parser extracts tool calls from bare JSON and fenced blocks (Ollama rarely emits native `tool_calls`).
 2. `WriteGuard` redirects short `write_file` notes on `workspace/plan.md` → `append_note`.
 3. `WriteGuard` blocks `write_file` to plan.md when user asked for a `.py` deliverable that is not on disk yet.
-4. `chat_turn` ends with disk verification and `⚠️` if deliverable missing.
+4. `ExecutionPolicy` redirects `host_exec` python/`-File *.py` → `run_script` (venv python).
+5. `ContextRouter` injects tool playbooks from `knowledge/` (not prompt essays).
+6. `chat_turn` ends with disk verification; no false warnings for qualified deliverable paths.
 
-Before changing `core/parser.py`, `agent.py`, or `tools_legacy.py`, run all tests listed in `MEMORY.md` → Task Closure.
+Before changing `core/parser.py`, `agent.py`, `core/rag.py`, `core/context_router.py`, or `tools_legacy.py`, run all tests listed in `MEMORY.md` → Task Closure.

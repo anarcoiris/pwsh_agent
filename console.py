@@ -80,7 +80,7 @@ class AgentConsole:
                 success = result.get("success", True)
                 if not success:
                     console.print(f"[bold red]❌ Tool Error ({tool}):[/bold red] {result.get('error', 'Unknown')}")
-                elif tool == "host_exec":
+                elif tool in ("host_exec", "run_script"):
                     exit_code = result.get("exit_code")
                     duration = result.get("duration_ms")
                     color = "green" if exit_code == 0 else "red"

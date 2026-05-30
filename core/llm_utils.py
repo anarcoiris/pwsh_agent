@@ -294,15 +294,47 @@ class DynamicContextBuilder:
         latest = user_msgs[-1] if user_msgs else ""
         latest_lower = latest.lower()
 
+        pcap_task = bool(re.search(
+            r"(\.pcapng|\.pcap\b|\btshark\b|\bwireshark\b|last_capture|decode.*packet|analyze.*packet|http packet|xmlobj|login.*packet)",
+            latest_lower,
+        ))
+
+        # #region agent log
+        try:
+            from core.debug_log import debug_log
+            debug_log(
+                "llm_utils.py:build_context",
+                "phase detection",
+                {"pcap_task": pcap_task, "query_head": latest_lower[:100]},
+                "C",
+            )
+        except Exception:
+            pass
+        # #endregion
+
+        if pcap_task:
+            return (
+                "\n[CURRENT PHASE: PCAP ANALYSIS]\n"
+                "The user wants offline packet capture analysis — NOT live subnet recon.\n"
+                "Use find_file to locate PCAPs, then analyze_pcapng with filter_expression for http/login/xml.\n"
+                "Canonical path: last_capture.pcapng at project root (also workspace/ or artifacts/captures/).\n"
+                "Do NOT run system_info, ping_sweep, or port_scan unless explicitly requested.\n"
+                "Do NOT invent paths like network_logs/ — use find_file first.\n"
+            )
+
         # Development / file tasks — override default recon bias
         skip_network = bool(re.search(
             r"(do not|don't|no)\s+.*(network|recon|scan|port)|focus (?:only )?on|watcher\.py",
             latest_lower,
         ))
         dev_task = bool(re.search(
-            r"\b(write|script|python|\.py|\.ps1|\.md|file|folder|read|review|save|create|implement|code|watcher)\b",
+            r"\b(write|script|python|\.py|\.ps1|\.md|folder|save|create|implement|code|watcher)\b",
             latest_lower,
-        ))
+        )) or (
+            bool(re.search(r"\b(read|review)\b", latest_lower))
+            and not pcap_task
+            and not bool(re.search(r"\bfile named\b", latest_lower))
+        )
         explicit_recon = bool(re.search(
             r"\b(scan|recon|capture|pcap|cve|dns|ping|port_scan|network interface)\b",
             latest_lower,
@@ -312,7 +344,7 @@ class DynamicContextBuilder:
             return (
                 "\n[CURRENT PHASE: DEVELOPMENT / FILE TASK]\n"
                 "The user wants coding, reading, or writing files — NOT network recon.\n"
-                "Use read_file, write_file, and host_exec (for running scripts) only.\n"
+                "Use read_file, write_file, run_script, and host_exec (PowerShell only) — NOT raw python via host_exec for .py files.\n"
                 "Do NOT run port_scan, dns_lookup, ping_sweep, system_info, or http_headers_check "
                 "unless the user explicitly requests network activity.\n"
                 "In chat mode: do NOT declare MISSION_COMPLETE or generate engagement reports.\n"

@@ -32,6 +32,7 @@ from ollama import AsyncClient
 import tools
 from audit import AuditEntry, get_audit
 from core.context import AgentContextManager
+from core.context_router import ContextRouter
 from core.llm_utils import (
     ArgumentNormalizer,
     DynamicContextBuilder,
@@ -41,7 +42,9 @@ from core.llm_utils import (
 )
 from core.parser import AgentOutputParser
 from core.task_intent import TaskIntent, TaskIntentExtractor
+from core.chat_goals import ChatGoals, ChatGoalGuard
 from core.write_guard import WriteGuard
+from core.execution_policy import ExecutionPolicy
 
 logger = logging.getLogger("pwsh_agent.agent")
 
@@ -72,29 +75,13 @@ class OllamaAdapter:
         tools_schema: list[dict[str, Any]] | None = None,
         options: dict | None = None,
         max_retries: int = 3,
+        task_intent: TaskIntent | None = None,
     ) -> dict[str, Any]:
-        # Inject dynamic context hint as a transient system message
-        phase_hint = DynamicContextBuilder.build_context(messages)
-        if phase_hint:
-            messages = messages + [{"role": "system", "content": phase_hint}]
-
-        # Inject RAG reference material based on the user's latest objective
-        user_msgs = [m for m in messages if m.get("role") == "user"]
-        if user_msgs:
-            query = user_msgs[-1].get("content", "")
-            try:
-                from core.rag import get_rag_context
-                rag_context = get_rag_context(query)
-                if rag_context:
-                    rag_hint = (
-                        "### SECURITY AUDIT REFERENCE MATERIAL ###\n"
-                        "Use these native Windows and PowerShell techniques if relevant to your objective:\n"
-                        f"{rag_context}\n"
-                        "#########################################"
-                    )
-                    messages = messages + [{"role": "system", "content": rag_hint}]
-            except Exception as e:
-                logger.warning("RAG context retrieval error: %s", e)
+        try:
+            for injection in ContextRouter.build_injections(messages, task_intent):
+                messages = messages + [injection]
+        except Exception as e:
+            logger.warning("ContextRouter injection error: %s", e)
 
         _options = {"temperature": 0.3, "num_ctx": 16384, "num_predict": 4096}
         if options:
@@ -194,6 +181,8 @@ class ReActAgent:
             "sequentialthinking":     self.thinking_engine.process_thought,
             # System
             "host_exec":              tools.host_exec,
+            "run_script":             tools.run_script,
+            "find_file":              tools.find_file,
             "read_file":              tools.read_file,
             "write_file":             tools.write_file,
             "append_note":            tools.append_note,
@@ -323,7 +312,7 @@ class ReActAgent:
             "</tool_call>\n\n"
 
             "AVAILABLE TOOLS:\n"
-            "— Core — sequentialthinking, host_exec, read_file, write_file, append_note\n"
+            "— Core — sequentialthinking, host_exec, run_script, find_file, read_file, write_file, append_note\n"
             "— Network Capture — list_network_interfaces, capture_packets, analyze_pcapng\n"
             "— Recon — dns_lookup, ping_sweep, port_scan, http_headers_check, ssl_analysis, cve_lookup, system_info\n"
             "— Intel — encode_decode, hash_identify, crack_hash\n"
@@ -384,6 +373,8 @@ class ReActAgent:
         # Normalise args
         tool_args = ArgumentNormalizer.normalize(tool_name, tool_args)
 
+        tool_name, tool_args, redirect_note = ExecutionPolicy.apply(tool_name, tool_args)
+
         pending = (
             self._active_intent.pending_deliverables(self.project_root)
             if self._active_intent else []
@@ -395,6 +386,13 @@ class ReActAgent:
             session_id=self.session_id,
             pending_deliverables=pending,
         )
+        if not block_err:
+            executed_so_far = getattr(self, "_chat_tools_executed", [])
+            tool_name, tool_args, block_err = ChatGoalGuard.apply(
+                tool_name, tool_args,
+                getattr(self, "_chat_goals", None),
+                executed_so_far,
+            )
         if block_err:
             if step_callback:
                 step_callback("AGENT_TOOL_CALL", {"tool": tool_name, "args": tool_args})
@@ -448,6 +446,16 @@ class ReActAgent:
             audit_status = "error"
             audit_error  = f"Tool '{tool_name}' not found"
 
+        if isinstance(result, dict) and redirect_note:
+            result["redirect_note"] = redirect_note
+
+        failure_hint = self._build_failure_playbook_hint(tool_name, result)
+        if failure_hint:
+            self.ctx_manager.add_message({
+                "role":    "user",
+                "content": failure_hint,
+            })
+
         duration_ms = int((time.monotonic() - t_start) * 1000)
         result_str  = json.dumps(result, default=str)
         result_hash = hashlib.sha256(result_str.encode()).hexdigest()
@@ -469,6 +477,16 @@ class ReActAgent:
 
         if step_callback:
             step_callback("AGENT_TOOL_RESULT", {"tool": tool_name, "result": result})
+
+        if tool_name == "analyze_pcapng" and isinstance(result, dict) and result.get("success"):
+            analysis = result.get("analysis", {})
+            parts = []
+            for key in ("packet_summary", "potential_plaintext_credentials", "protocol_hierarchy"):
+                val = analysis.get(key)
+                if val:
+                    parts.append(f"### {key}\n{val[:1500]}")
+            if parts:
+                self._last_pcap_summary = "\n\n".join(parts)
 
         self.ctx_manager.add_message({
             "role":    "tool",
@@ -524,6 +542,7 @@ class ReActAgent:
                 response = await self.adapter.chat(
                     messages=self.ctx_manager.get_messages(),
                     tools_schema=tools.TOOLS_SCHEMA,
+                    task_intent=self._active_intent,
                 )
             except Exception as e:
                 err = f"Ollama error: {e}"
@@ -691,20 +710,58 @@ class ReActAgent:
             "Do NOT declare MISSION_COMPLETE or generate engagement/final reports. "
             "Do NOT run network recon tools unless explicitly requested. "
             "Use append_note for workspace/plan.md progress — never write_file for status lines. "
+            "sequentialthinking is optional in chat (max one planning thought); prefer action tools. "
+            "Complete the user's task before stopping — append_note alone is not completion. "
             f"{deliverable_hint}\n"
         )
         self.ctx_manager.add_message({"role": "user", "content": chat_directive + message})
+
+        chat_goals = ChatGoals.from_message(message)
+        if not chat_goals:
+            chat_goals = ChatGoals.from_session(
+                self.ctx_manager.get_messages(), message
+            )
+        self._chat_goals = chat_goals
+        self._last_pcap_summary: str | None = None
+
+        if chat_goals and chat_goals.context_directive():
+            self.ctx_manager.add_message({
+                "role": "user",
+                "content": chat_goals.context_directive(),
+            })
+
+        goal_nudges = 0
+        max_goal_nudges = 4
+
+        # #region agent log
+        try:
+            from core.debug_log import debug_log
+            debug_log(
+                "agent.py:chat_turn",
+                "chat goals",
+                {
+                    "goals": chat_goals.label if chat_goals else None,
+                    "required": chat_goals.required_tools if chat_goals else [],
+                },
+                "F",
+            )
+        except Exception:
+            pass
+        # #endregion
 
         tools_called: set = set()
         tools_executed_names: list[str] = []
         paths_written: list[str] = []
         deliverable_nudges = 0
+        self._chat_tools_executed: list[str] = []
 
         for step in range(10):
+            self._chat_tools_executed = list(tools_executed_names)
             self.ctx_manager.trim_context()
             response = await self.adapter.chat(
                 messages=self.ctx_manager.get_messages(),
                 tools_schema=tools.TOOLS_SCHEMA,
+                task_intent=self._active_intent,
             )
 
             msg     = response.get("message", {})
@@ -739,6 +796,11 @@ class ReActAgent:
                         if name == "write_file" and args.get("path"):
                             paths_written.append(str(args["path"]).replace("\\", "/"))
 
+                self._chat_tools_executed = list(tools_executed_names)
+
+                if chat_goals and not chat_goals.pending(tools_executed_names):
+                    break
+
                 pending = self._active_intent.pending_deliverables(self.project_root)
                 if pending and deliverable_nudges < 2:
                     deliverable_nudges += 1
@@ -751,17 +813,53 @@ class ReActAgent:
                     })
             else:
                 salvage = self.parser.salvage_tool_call(content, user_context=message)
+                pending_goals = chat_goals.pending(tools_executed_names) if chat_goals else []
+
                 if salvage and salvage["function"]["name"] != "sequentialthinking":
                     sname = salvage["function"]["name"]
-                    sargs = salvage["function"]["arguments"]
-                    did_exec, _ = await self._execute_tool(
-                        sname, sargs, tools_called, step_callback
-                    )
-                    if did_exec:
-                        tools_executed_names.append(sname)
-                        if sname == "write_file" and sargs.get("path"):
-                            paths_written.append(str(sargs["path"]).replace("\\", "/"))
-                    continue
+                    if pending_goals and sname == "append_note" and "analyze_pcapng" in pending_goals:
+                        salvage = None
+                    else:
+                        sargs = salvage["function"]["arguments"]
+                        did_exec, _ = await self._execute_tool(
+                            sname, sargs, tools_called, step_callback
+                        )
+                        if did_exec:
+                            tools_executed_names.append(sname)
+                            if sname == "write_file" and sargs.get("path"):
+                                paths_written.append(str(sargs["path"]).replace("\\", "/"))
+                        self._chat_tools_executed = list(tools_executed_names)
+                        continue
+
+                if pending_goals and goal_nudges < max_goal_nudges:
+                    goal_nudges += 1
+                    # #region agent log
+                    try:
+                        from core.debug_log import debug_log
+                        debug_log(
+                            "agent.py:chat_turn",
+                            "goal nudge",
+                            {"step": step, "pending": pending_goals, "nudge": goal_nudges},
+                            "F",
+                        )
+                    except Exception:
+                        pass
+                    # #endregion
+                    if goal_nudges >= max_goal_nudges and "analyze_pcapng" in pending_goals:
+                        boot = await self._bootstrap_pcap_analysis(
+                            chat_goals, tools_called, step_callback
+                        )
+                        if boot:
+                            tools_executed_names.extend(boot)
+                            pending_goals = chat_goals.pending(tools_executed_names)
+                    if chat_goals.pending(tools_executed_names):
+                        self.ctx_manager.add_message({
+                            "role": "user",
+                            "content": chat_goals.nudge_text(
+                                chat_goals.pending(tools_executed_names)
+                            ),
+                        })
+                        continue
 
                 if content and ("?" in content or "¿" in content):
                     log_chat_mem(content, step + 1)
@@ -772,7 +870,7 @@ class ReActAgent:
                         message, content, tools_executed_names,
                         paths_written, intent_snapshot, self.project_root,
                     )
-                if step > 0:
+                if step > 0 and not (chat_goals and chat_goals.pending(tools_executed_names)):
                     break
                 reflection = self.retry_orchestrator.parser_reflection(content, self.parser)
                 if reflection:
@@ -794,13 +892,72 @@ class ReActAgent:
         steps_run = (step + 1) if "step" in locals() else 0
         intent_snapshot = self._active_intent
         self._active_intent = None
+        self._chat_goals = None
+        self._chat_tools_executed = []
+
         content = self._finalize_chat_response(
             message, content, tools_executed_names,
             paths_written, intent_snapshot, self.project_root,
         )
+
+        if getattr(self, "_last_pcap_summary", None) and "analyze_pcapng" in tools_executed_names:
+            if not content.strip() or "Completed this turn" in content:
+                warnings_part = ""
+                if content.startswith("⚠️"):
+                    parts = content.split("\n\n", 1)
+                    if len(parts) > 1 and "Completed this turn" in parts[1]:
+                        warnings_part = parts[0] + "\n\n"
+                content = warnings_part + self._last_pcap_summary
+
         log_chat_mem(content, steps_run)
         self.ctx_manager.save_state()
         return content
+
+    async def _bootstrap_pcap_analysis(
+        self,
+        goals: ChatGoals,
+        tools_called: set,
+        step_callback=None,
+    ) -> list[str]:
+        """Deterministic fallback when model stalls on PCAP tasks."""
+        executed: list[str] = []
+        ff = tools.find_file(goals.pcap_path_hint or "last_capture.pcapng")
+        path = ff.get("recommended") or goals.pcap_path_hint or "last_capture.pcapng"
+
+        # #region agent log
+        try:
+            from core.debug_log import debug_log
+            debug_log(
+                "agent.py:_bootstrap_pcap_analysis",
+                "bootstrap",
+                {"path": path, "find_file": ff},
+                "F",
+            )
+        except Exception:
+            pass
+        # #endregion
+
+        if step_callback:
+            step_callback("AGENT_TOOL_CALL", {"tool": "find_file", "args": {"name": goals.pcap_path_hint}})
+        did, _ = await self._execute_tool(
+            "find_file", {"name": goals.pcap_path_hint or "last_capture.pcapng"}, tools_called, step_callback
+        )
+        if did:
+            executed.append("find_file")
+
+        analyze_args = {
+            "file_path": path,
+            "filter_expression": goals.filter_expression or "http",
+            "limit": 50,
+            "verbose": goals.verbose,
+        }
+        if step_callback:
+            step_callback("AGENT_TOOL_CALL", {"tool": "analyze_pcapng", "args": analyze_args})
+        did, _ = await self._execute_tool("analyze_pcapng", analyze_args, tools_called, step_callback)
+        if did:
+            executed.append("analyze_pcapng")
+
+        return executed
 
     @staticmethod
     def _finalize_chat_response(
@@ -814,11 +971,20 @@ class ReActAgent:
         """Verify deliverables on disk; warn on hallucinated completion."""
         warnings: list[str] = []
 
+        normalized_written = [p.replace("\\", "/") for p in paths_written]
+
         if intent and intent.deliverables:
             for rel in intent.deliverables:
-                p = project_root / rel if not Path(rel).is_absolute() else Path(rel)
-                if not p.exists():
-                    warnings.append(f"Deliverable not found on disk: {rel}")
+                rel_norm = rel.replace("\\", "/")
+                p = project_root / rel_norm if not Path(rel_norm).is_absolute() else Path(rel_norm)
+                if p.exists():
+                    continue
+                if any(
+                    w == rel_norm or w.endswith("/" + rel_norm) or w.endswith(rel_norm)
+                    for w in normalized_written
+                ):
+                    continue
+                warnings.append(f"Deliverable not found on disk: {rel_norm}")
 
         if intent and intent.is_dev_task:
             deliverable_written = any(
@@ -844,6 +1010,36 @@ class ReActAgent:
                 content = prefix + content
 
         return content
+
+    @staticmethod
+    def _build_failure_playbook_hint(tool_name: str, result: Any) -> str | None:
+        """Inject a corrective playbook excerpt after host_exec/run_script failures."""
+        if tool_name not in ("host_exec", "run_script") or not isinstance(result, dict):
+            return None
+        failed = (
+            result.get("success") is False
+            or result.get("exit_code", 0) not in (0, None)
+        )
+        if not failed:
+            return None
+        stderr = str(result.get("stderr", "") or result.get("error", ""))
+        patterns = (
+            r"ModuleNotFoundError",
+            r"No module named",
+            r"extensi.*\.ps1",
+            r"\.py'",
+            r"not found",
+        )
+        if not any(re.search(p, stderr, re.I) for p in patterns):
+            return None
+        try:
+            from core.rag import get_rag_context_for_tools
+            excerpt = get_rag_context_for_tools(["run_script", "host_exec"], stderr, max_chars=600)
+        except Exception:
+            return None
+        if not excerpt:
+            return None
+        return f"[SYSTEM] Tool failure — follow this playbook excerpt:\n{excerpt}"
 
     @staticmethod
     def _format_tool_summary(tools_executed: list[str], paths_written: list[str]) -> str:

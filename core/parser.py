@@ -86,6 +86,18 @@ _CODE_LANG_EXT = {
 }
 _SKIP_CODE_LANGS = {"json", "tool_call", "markdown", "md", "text", ""}
 
+_REGISTERED_TOOLS = frozenset({
+    "append_note", "find_file", "analyze_pcapng", "host_exec", "run_script",
+    "read_file", "write_file", "sequentialthinking", "capture_packets",
+    "list_network_interfaces", "crack_hash", "system_info", "port_scan",
+    "ping_sweep", "dns_lookup",
+})
+
+_TOOL_NAME_JSON = re.compile(
+    r"\b(" + "|".join(_REGISTERED_TOOLS) + r")\s+(\{.*\})\s*$",
+    re.I | re.DOTALL,
+)
+
 
 def _infer_script_path(code: str, user_context: str, ext: str) -> str:
     """Guess target path from code comments or recent user messages."""
@@ -141,8 +153,9 @@ def _pick_best_tool_calls(calls: list[dict], limit: int = 1) -> list[dict]:
     if not calls:
         return []
     priority = {
-        "write_file": 0, "read_file": 1, "host_exec": 2,
-        "finding_create": 3, "report_generate": 4,
+        "write_file": 0, "read_file": 1, "find_file": 2, "run_script": 3,
+        "analyze_pcapng": 4, "host_exec": 5,
+        "finding_create": 6, "report_generate": 7,
         "sequentialthinking": 50,
     }
 
@@ -222,6 +235,13 @@ class AgentOutputParser:
         self, content: str, user_context: str = ""
     ) -> list[dict]:
         blocks: list[Any] = []
+
+        # Path 2b — tool_name {"arg": "val"} prose (model omits name/arguments wrapper)
+        for m in _TOOL_NAME_JSON.finditer(content):
+            tool_name = m.group(1)
+            parsed = _try_parse_json(m.group(2).strip())
+            if parsed is not None and isinstance(parsed, dict):
+                blocks.append({"name": tool_name, "arguments": parsed})
 
         # Path 2 — <tool_call>…</tool_call> tags
         for raw in re.findall(

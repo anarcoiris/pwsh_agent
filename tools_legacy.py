@@ -123,6 +123,90 @@ def host_exec(command: str, timeout: int = 120) -> dict:
         }
 
 
+def run_script(script_path: str, args: list | None = None, timeout: int = 120) -> dict:
+    """
+    Run a Python script using the project venv interpreter (preferred over host_exec for .py files).
+
+    Args:
+        script_path: Relative or absolute path to a .py file.
+        args: Optional CLI arguments passed to the script.
+        timeout: Maximum execution time in seconds.
+    """
+    from core.runtime_paths import project_root, venv_python
+
+    if not script_path:
+        return {"exit_code": -1, "stdout": "", "stderr": "No script_path provided.", "duration_ms": 0}
+
+    root = project_root()
+    path = Path(script_path)
+    if not path.is_absolute():
+        path = root / path
+    path = path.resolve()
+
+    if path.suffix.lower() != ".py":
+        return {
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": f"run_script only supports .py files (got '{path.suffix}'). Use host_exec for PowerShell.",
+            "duration_ms": 0,
+        }
+    if not path.is_file():
+        return {
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": f"Script not found: {path}",
+            "duration_ms": 0,
+        }
+
+    py = venv_python()
+    cmd_args = [py, str(path)]
+    if py.startswith("py "):
+        cmd_args = py.split() + [str(path)]
+    if args:
+        cmd_args.extend(str(a) for a in args)
+
+    start_time = time.time()
+    try:
+        result = subprocess.run(
+            cmd_args,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=str(root),
+        )
+        duration = int((time.time() - start_time) * 1000)
+        out: dict = {
+            "exit_code": result.returncode,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "duration_ms": duration,
+            "interpreter": py,
+            "script": str(path),
+        }
+        mod_match = re.search(r"No module named '([^']+)'", result.stderr or "")
+        if mod_match:
+            out["missing_module"] = mod_match.group(1)
+        return out
+    except subprocess.TimeoutExpired as e:
+        duration = int((time.time() - start_time) * 1000)
+        stdout_str = e.stdout if isinstance(e.stdout, str) else (e.stdout.decode() if e.stdout else "")
+        stderr_str = e.stderr if isinstance(e.stderr, str) else (e.stderr.decode() if e.stderr else "")
+        return {
+            "exit_code": -1,
+            "stdout": stdout_str,
+            "stderr": f"Error: Script timed out after {timeout} seconds. {stderr_str}",
+            "duration_ms": duration,
+        }
+    except Exception as e:
+        duration = int((time.time() - start_time) * 1000)
+        return {
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": str(e),
+            "duration_ms": duration,
+        }
+
+
 # ==========================================
 # 3. Simple Filesystem Tools
 # ==========================================
@@ -237,7 +321,7 @@ def write_file(path: str, content: str) -> dict:
 
 
 _ALLOWED_NOTE_FILES = frozenset({
-    "plan.md", "status.md", "session_log.md", "scratchpad.md",
+    "plan.md", "status.md", "session_log.md",
 })
 
 
@@ -319,6 +403,15 @@ def find_tshark() -> str:
             return p
 
     return ""
+
+
+def find_file(name: str) -> dict:
+    """
+    Locate a file by name under the project tree.
+    Returns all matches plus a recommended path (canonical location first).
+    """
+    from core.artifacts import find_file as _find
+    return _find(name)
 
 
 def list_network_interfaces() -> dict:
@@ -414,6 +507,8 @@ def analyze_pcapng(
     network conversations, potential plaintext passwords, and custom filtered logs.
     Supports individual packet decodes with verbose and raw byte dumps.
     """
+    from core.artifacts import resolve_project_file
+
     tshark_path = find_tshark()
     if not tshark_path:
         return {
@@ -421,7 +516,25 @@ def analyze_pcapng(
             "error": "tshark.exe not found on system. Please install Wireshark or specify TSHARK_PATH."
         }
 
-    pcap_path = Path(file_path).resolve()
+    pcap_path = resolve_project_file(file_path)
+    if pcap_path is None:
+        pcap_path = Path(file_path).resolve()
+    else:
+        pcap_path = pcap_path.resolve()
+
+    # #region agent log
+    try:
+        from core.debug_log import debug_log
+        debug_log(
+            "tools_legacy.py:analyze_pcapng",
+            "path resolution",
+            {"input": file_path, "resolved": str(pcap_path), "exists": pcap_path.exists()},
+            "D",
+        )
+    except Exception:
+        pass
+    # #endregion
+
     if not pcap_path.exists():
         return {"success": False, "error": f"File '{file_path}' does not exist."}
 
@@ -627,6 +740,26 @@ TOOLS_SCHEMA = [
     {
         "type": "function",
         "function": {
+            "name": "run_script",
+            "description": "Preferred way to run Python deliverables and tests. Uses the project .venv interpreter directly (not PowerShell).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "script_path": {"type": "string", "description": "Path to a .py file (e.g. watcher/watcher.py)."},
+                    "args": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional CLI arguments for the script.",
+                    },
+                    "timeout": {"type": "integer", "description": "Maximum execution time in seconds. Defaults to 120."},
+                },
+                "required": ["script_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "read_file",
             "description": "Reads the text contents of a local file from the system. Supports reading files by line chunking for large files.",
             "parameters": {
@@ -681,6 +814,20 @@ TOOLS_SCHEMA = [
                     },
                 },
                 "required": ["path", "line"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_file",
+            "description": "Search the project tree for a file by name. Returns matches and a recommended path. Use before analyze_pcapng when the user names a PCAP or script file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Filename to search for (e.g. last_capture.pcapng)."},
+                },
+                "required": ["name"],
             },
         },
     },

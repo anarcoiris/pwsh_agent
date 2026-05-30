@@ -85,13 +85,13 @@ if ($network -match '^(\\d+\\.\\d+\\.\\d+)\\.\\d+/24$') {{
     $hosts = @($network)
 }}
 
-$results = $hosts | ForEach-Object -ThrottleLimit 50 -Parallel {{
-    $ip = $_
+$results = @()
+foreach ($ip in $hosts) {{
     $ping = New-Object System.Net.NetworkInformation.Ping
     try {{
         $reply = $ping.Send($ip, {timeout_ms})
         if ($reply.Status -eq 'Success') {{
-            [PSCustomObject]@{{ IP = $ip; Status = 'up'; RTT = $reply.RoundtripTime }}
+            $results += [PSCustomObject]@{{ IP = $ip; Status = 'up'; RTT = $reply.RoundtripTime }}
         }}
     }} catch {{ }}
 }}

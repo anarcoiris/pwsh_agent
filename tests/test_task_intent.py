@@ -15,6 +15,7 @@ MSG = (
 def test_extracts_watcher_deliverable():
     intent = TaskIntentExtractor.parse(MSG)
     assert "watcher/watcher.py" in intent.deliverables
+    assert "watcher.py" not in intent.deliverables
     assert intent.is_dev_task
     assert intent.forbid_network
 

@@ -84,7 +84,22 @@ class TaskIntentExtractor:
             if path not in found:
                 found.append(path)
 
-        return found
+        return cls._dedupe_deliverables(found)
+
+    @staticmethod
+    def _dedupe_deliverables(found: list[str]) -> list[str]:
+        """Drop bare filenames when a qualified path with the same basename exists."""
+        normalized = [p.replace("\\", "/") for p in found]
+        qualified_basenames = {
+            Path(p).name for p in normalized if "/" in p or "\\" in p
+        }
+        result: list[str] = []
+        for path in normalized:
+            if "/" not in path and path in qualified_basenames:
+                continue
+            if path not in result:
+                result.append(path)
+        return result
 
     @staticmethod
     def is_workspace_meta_path(path: str) -> bool:

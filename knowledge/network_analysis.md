@@ -1,6 +1,29 @@
+---
+tools: [list_network_interfaces, capture_packets, analyze_pcapng, find_tshark, find_file]
+phase: [network, recon]
+---
+
 # Network Packet Analysis & Wireshark / TShark Reference
 
 This reference covers the detection, capture, and offline analysis of network traffic on Windows systems using native tools and standard Wireshark/TShark utilities.
+
+## Prefer Registered Tools First
+
+**Use tool `list_network_interfaces`** — then **`capture_packets`** for live capture and **`analyze_pcapng`** for offline PCAP analysis. Do not call raw tshark via `host_exec` unless those tools return `success: false`.
+
+Example flow:
+1. `find_file(name="last_capture.pcapng")` → use `recommended` path
+2. `analyze_pcapng(file_path="last_capture.pcapng", filter_expression="http")`
+
+## Known Artifact Paths (post-cleanup)
+
+| File | Canonical locations (search order) |
+|------|-----------------------------------|
+| `last_capture.pcapng` | repo root, `workspace/`, `artifacts/captures/` |
+
+There is **no** `network_logs/` directory. Use `find_file` — do not guess paths.
+
+Raw tshark CLI below is **fallback reference only** for debugging or when Wireshark tools are unavailable.
 
 ## Finding Wireshark and TShark on Windows
 Wireshark is typically installed in default location paths. To programmatically locate it via PowerShell:

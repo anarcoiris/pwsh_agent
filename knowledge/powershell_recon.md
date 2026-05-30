@@ -1,3 +1,8 @@
+---
+tools: [dns_lookup, ping_sweep, port_scan, host_exec, system_info]
+phase: [recon]
+---
+
 # PowerShell Reconnaissance & Local Discovery Reference
 
 This document provides a set of highly optimized, native PowerShell command patterns and logic for performing local system discovery, active reconnaissance, and information gathering on Windows hosts.
