@@ -36,6 +36,17 @@ def test_normalizes_pip_install():
     assert note is not None
 
 
+def test_normalizes_relative_dotvenv_pip():
+    name, args, note = ExecutionPolicy.apply(
+        "host_exec",
+        {"command": '& ".venv/Scripts/python.exe" -m pip install requests'},
+    )
+    assert name == "host_exec"
+    assert ".venv" in args["command"] or "python.exe" in args["command"]
+    assert "install requests" in args["command"]
+    assert note is not None
+
+
 def test_passthrough_unrelated_host_exec():
     name, args, note = ExecutionPolicy.apply(
         "host_exec",
@@ -46,4 +57,9 @@ def test_passthrough_unrelated_host_exec():
     assert note is None
 
 
-print("All execution_policy tests passed.")
+if __name__ == "__main__":
+    test_redirects_powershell_file_py_to_run_script()
+    test_redirects_python_script_to_run_script()
+    test_normalizes_pip_install()
+    test_passthrough_unrelated_host_exec()
+    print("All execution_policy tests passed.")

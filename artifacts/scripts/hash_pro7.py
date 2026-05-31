@@ -435,7 +435,8 @@ CHARSETS: Dict[str, str] = {
     "A": "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
     "L": "abcdefghijklmnopqrstuvwxyz",
     "U": "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
-    "!": '!$%&"/',
+    # "!" = punctuation slot (NOT literal "!" every time); includes common symbols + !
+    "!": "!$%&\"/@#._-",
     "H": "0123456789abcdef",
     "?": "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!$%&/",
 }
@@ -499,6 +500,7 @@ class Config:
     wordlist:       Optional[str]
     checkpoint:     Optional[str]
     gpu_enabled:    bool  = True
+    use_hashcat:    bool  = True
     cpu_gpu_ratio:  float = 0.3
 
 # =============================================================================
@@ -898,7 +900,8 @@ class HybridSearcher:
         self.using_hashcat  = False
         self.resume_pass    = 1          # [F10] siempre inicializado
 
-        if config.gpu_enabled:
+        use_hashcat = config.gpu_enabled and getattr(config, "use_hashcat", True)
+        if use_hashcat:
             try:
                 hc_path      = find_hashcat_binary()
                 self.hashcat = HashcatEngine(hc_path)
@@ -911,6 +914,9 @@ class HybridSearcher:
                     f"[yellow]Hashcat no disponible ({e}), usando CuPy/CPU[/yellow]"
                 )
                 self.gpu = GPUEngine(config)
+        elif config.gpu_enabled:
+            self.console.print("[cyan]Hashcat desactivado — modo CuPy/CPU[/cyan]")
+            self.gpu = GPUEngine(config)
 
         self.cpu_checked = 0
         self.gpu_checked = 0
@@ -1119,6 +1125,8 @@ class HybridSearcher:
 
         cmd.extend(["--session", f"hc_v7_pass{pass_num}", hash_file, hc_mask])
 
+        self._last_hashcat_lines: list[str] = []
+
         with Progress(
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
@@ -1153,6 +1161,9 @@ class HybridSearcher:
                 if process.stdout is not None:
                     for line in process.stdout:
                         line = line.strip()
+                        self._last_hashcat_lines.append(line)
+                        if len(self._last_hashcat_lines) > 40:
+                            self._last_hashcat_lines.pop(0)
 
                         # Parsear progreso real de hashcat
                         # Formato: Progress.........: 123456/297825000000 (0.04%)
@@ -1212,6 +1223,9 @@ class HybridSearcher:
             if line:
                 return line.split(":", 2)[-1]
 
+        for hint in getattr(self, "_last_hashcat_lines", [])[-8:]:
+            if any(k in hint for k in ("Status", "Progress", "ERROR", "Token", "Rejected")):
+                self.console.print(f"[dim]{hint}[/dim]")
         return None
 
     # ── pass dispatcher ───────────────────────────────────────────────────────
@@ -1382,6 +1396,11 @@ class HybridSearcher:
                 f"máscara=[cyan]{submask}[/cyan]  "
                 f"espacio=[yellow]{space:,}[/yellow]"
             )
+            if space > 5_000_000_000_000 and not self.config.end_idx:
+                console.print(
+                    "[yellow]⚠ Keyspace > 5T — use 'Terminar en índice' / --end-idx for slices, "
+                    "or confirm mask ('!' = punctuation charset, not literal '!!').[/yellow]"
+                )
 
             if i != resume_pass:
                 self.next_idx = 0
@@ -1452,6 +1471,7 @@ def main():
             wordlist       = args.wordlist,
             checkpoint     = args.checkpoint,
             gpu_enabled    = not args.no_gpu,
+            use_hashcat    = not args.no_hashcat,
         )
 
     result = HybridSearcher(config).run()

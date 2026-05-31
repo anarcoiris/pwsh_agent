@@ -20,7 +20,7 @@ from typing import Any
 
 logger = logging.getLogger("pwsh_agent.core.context")
 
-from core.runtime_paths import workspace_root
+from core.runtime_paths import workspace_root, app_root
 
 
 class DateTimeEncoder(json.JSONEncoder):
@@ -76,7 +76,7 @@ class ContextCompactor:
                 summaries.append(f"- {tool_name}: OK ({len(content)} chars)")
 
         # Write dump file
-        dump_dir = workspace_root() / ".pulse" / "state" / "sessions" / session_id
+        dump_dir = app_root() / "state" / "sessions" / session_id
         dump_dir.mkdir(parents=True, exist_ok=True)
         dump_path = dump_dir / "context_dump.md"
         try:
@@ -123,8 +123,7 @@ class AgentContextManager:
             self.state_path = Path(state_path)
         else:
             self.state_path = (
-                workspace_root()
-                / ".pulse"
+                app_root()
                 / "state"
                 / "sessions"
                 / session_id

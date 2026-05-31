@@ -1,9 +1,8 @@
 import asyncio
-import sys
-from pathlib import Path
 
-# Ensure local imports work from repo root when run as scripts/verify.py
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from repo_bootstrap import bootstrap
+
+bootstrap()
 
 import tools
 import agent

@@ -158,7 +158,14 @@ class ResultCompactor:
             # Priority order for compaction: preserve key_fields and
             # verbose_log_file metadata at full fidelity (they're already
             # compact).  Truncate the large text blobs proportionally.
-            _PRIORITY_KEYS = ["key_fields", "potential_plaintext_credentials"]
+            _PRIORITY_KEYS = [
+                "key_fields",
+                "potential_plaintext_credentials",
+                "http_forms",
+                "http_index",
+                "extracted_secrets",
+                "extracted_keywords",
+            ]
             _LARGE_KEYS = ["packet_summary", "protocol_hierarchy", "ip_conversations"]
             _META_KEYS = ["verbose_log_file", "verbose_log_lines", "verbose_log_bytes",
                           "packet_summary_error"]
@@ -326,10 +333,19 @@ class DynamicContextBuilder:
         latest = user_msgs[-1] if user_msgs else ""
         latest_lower = latest.lower()
 
-        pcap_task = bool(re.search(
-            r"(\.pcapng|\.pcap\b|\btshark\b|\bwireshark\b|last_capture|decode.*packet|analyze.*packet|http packet|xmlobj|login.*packet)",
+        hash_task = bool(re.search(
+            r"(crack.*(?:sha-?)?256|(?:sha-?)?256.*hash|hash.*crack|brute.*force|\bcrack_hash\b|"
+            r"\bhaspro\b|\bhashpro\b)",
             latest_lower,
         ))
+        pcap_task = (
+            not hash_task
+            and bool(re.search(
+                r"(\.pcapng|\.pcap\b|\btshark\b|\bwireshark\b|last_capture|decode.*packet|"
+                r"analyze.*packet|http packet|login.*packet)",
+                latest_lower,
+            ))
+        )
 
         # #region agent log
         try:
@@ -337,21 +353,31 @@ class DynamicContextBuilder:
             debug_log(
                 "llm_utils.py:build_context",
                 "phase detection",
-                {"pcap_task": pcap_task, "query_head": latest_lower[:100]},
+                {"pcap_task": pcap_task, "hash_task": hash_task, "query_head": latest_lower[:100]},
                 "C",
             )
         except Exception:
             pass
         # #endregion
 
+        if hash_task:
+            from core.tool_hints import parse_hash_crack_hints, hash_planning_directive
+
+            hints = parse_hash_crack_hints(latest)
+            return (
+                "\n[CURRENT PHASE: HASH CRACKING]\n"
+                + hash_planning_directive(hints)
+                + "\n"
+            )
+
         if pcap_task:
+            from core.tool_hints import parse_pcap_analysis_hints, pcap_planning_directive
+
+            pcap_hints = parse_pcap_analysis_hints(latest)
             return (
                 "\n[CURRENT PHASE: PCAP ANALYSIS]\n"
-                "The user wants offline packet capture analysis — NOT live subnet recon.\n"
-                "Use find_file to locate PCAPs, then analyze_pcapng with filter_expression for http/login/xml.\n"
-                "Canonical path: last_capture.pcapng at project root (also workspace/ or artifacts/captures/).\n"
-                "Do NOT run system_info, ping_sweep, or port_scan unless explicitly requested.\n"
-                "Do NOT invent paths like network_logs/ — use find_file first.\n"
+                + pcap_planning_directive(pcap_hints)
+                + "\n"
             )
 
         # Development / file tasks — override default recon bias

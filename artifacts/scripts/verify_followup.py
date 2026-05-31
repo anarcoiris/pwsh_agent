@@ -1,9 +1,8 @@
 """Verify follow-up PCAP decode routing."""
 import json
-import sys
-from pathlib import Path
+from repo_bootstrap import bootstrap
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+bootstrap()
 
 from core.chat_goals import ChatGoals, ChatGoalGuard
 from core.debug_log import debug_log

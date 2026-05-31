@@ -1,9 +1,8 @@
 """Simulate chat_turn stall scenario for PCAP goals."""
 import asyncio
-import sys
-from pathlib import Path
+from repo_bootstrap import bootstrap
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+bootstrap()
 
 from core.chat_goals import ChatGoals
 from core.debug_log import debug_log

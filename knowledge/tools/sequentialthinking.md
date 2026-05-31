@@ -5,36 +5,67 @@ phase: [general]
 
 # sequentialthinking Tool Playbook
 
-## Description
-A stateful tool for dynamic and reflective problem-solving through thoughts.
+## When to Use
 
-## Example Invocation
+**Use tool `sequentialthinking`** for explicit planning steps before complex multi-tool workflows — hash cracking plans, PCAP analysis strategy, recon sequencing. It is local Python state; not a substitute for executing real tools.
+
+## Good Use Cases
+
+- State crack_hash mask/salt plan before running
+- Outline PCAP filter refinement passes (broad → narrow → verbose)
+- Revise approach when a tool returns unexpected results (`isRevision: true`)
+
+## Example Invocations
+
+**Plan hash crack (then call crack_hash):**
 ```json
-{
-  "name": "sequentialthinking",
-  "arguments": {
-    "thought": "<thought>",
-    "nextThoughtNeeded": false,
-    "thoughtNumber": 10,
-    "totalThoughts": 10,
-    "isRevision": false,
-    "revisesThought": 10
-  }
-}
+{"name": "sequentialthinking", "arguments": {
+  "thought": "Hash is SHA-256 (64 hex). User said salt xmlObj 55077791 and mask 6 digits + 2 letters + !. Will call crack_hash with known_prefix=xmlObj, salt=55077791, mask=NNNNNNAA!.",
+  "thoughtNumber": 1,
+  "totalThoughts": 2,
+  "nextThoughtNeeded": true
+}}
+```
+
+**Final thought — proceed to action:**
+```json
+{"name": "sequentialthinking", "arguments": {
+  "thought": "Plan confirmed. Executing crack_hash now.",
+  "thoughtNumber": 2,
+  "totalThoughts": 2,
+  "nextThoughtNeeded": false
+}}
+```
+
+**Revise after tool failure:**
+```json
+{"name": "sequentialthinking", "arguments": {
+  "thought": "port_scan range failed — nmap not installed. Will retry with comma-separated common ports instead.",
+  "thoughtNumber": 3,
+  "totalThoughts": 4,
+  "nextThoughtNeeded": true,
+  "isRevision": true,
+  "revisesThought": 2
+}}
 ```
 
 ## Parameters
 
-| Parameter | Type | Required | Description |
-|---|---|---|---|
-| `thought` | `string` | **Yes** | Your current detailed thinking step. |
-| `nextThoughtNeeded` | `boolean` | **Yes** | Whether another sequential thought step is needed. |
-| `thoughtNumber` | `integer` | **Yes** | Current thought step index (1-based). |
-| `totalThoughts` | `integer` | **Yes** | Current estimate of total thought steps needed. |
-| `isRevision` | `boolean` | No | True if this thought revises a previous thinking step. |
-| `revisesThought` | `integer` | No | The thought index that is being revised. |
+- **thought** — Current reasoning step (required).
+- **thoughtNumber** / **totalThoughts** — 1-based progress (required).
+- **nextThoughtNeeded** — `false` on last thought before tool execution (required).
+- **isRevision** / **revisesThought** — When correcting earlier plan.
 
-## Usage Notes
-- Make sure to review the parameters carefully.
-- Only call this tool when explicitly required by the task or when appropriate for the active general phase.
-- Summarize the execution results back to the user in plain, concise markdown.
+## Do Not Use sequentialthinking For
+
+- Pretending a tool ran successfully — always call the real tool
+- Replacing `append_note` progress logs
+- Long chains without follow-up tool calls — plan then act
+
+## Common Mistakes
+
+| Mistake | Fix |
+|---------|-----|
+| Only thinking, never executing | End with `nextThoughtNeeded: false` then call the tool |
+| Meta-thought after parser salvage | Real tool calls take priority over new thoughts |
+| 10+ thoughts on simple tasks | One plan thought + one action is enough |

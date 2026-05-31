@@ -10,9 +10,10 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
-_MEMORY_DIR = _PROJECT_ROOT / "memory"
-_MEMORY_FILE = _PROJECT_ROOT / "MEMORY.md"
+from core.runtime_paths import app_root
+
+_MEMORY_DIR = app_root() / "state" / "memory"
+_MEMORY_FILE = app_root() / "state" / "MEMORY.md"
 
 
 def log_daily_execution(

@@ -17,10 +17,10 @@ from typing import Any, Optional
 
 logger = logging.getLogger("pwsh_agent.audit")
 
-from core.runtime_paths import workspace_root
+from core.runtime_paths import app_root
 
 _HMAC_SECRET = os.environ.get("AUDIT_HMAC_SECRET", "pulse-default-secret-change-me").encode()
-_AUDIT_DIR = workspace_root() / ".pulse" / "audit_trail"
+_AUDIT_DIR = app_root() / "state" / "audit_trail"
 
 
 @dataclass

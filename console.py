@@ -139,18 +139,21 @@ class AgentConsole:
             
             try:
                 # Prompt for exact options like the father repo Console
-                cmd = Prompt.ask(prompt_text, choices=["mission", "chat", "specialist", "toggle", "audit", "cancel", "status", "clear", "help", "exit"])
+                cmd = Prompt.ask(prompt_text, choices=["mission", "chat", "specialist", "toggle", "audit", "cancel", "status", "new", "help", "exit"])
                 
                 if cmd == "exit":
                     self.is_running = False
                     console.print("[yellow]Exiting Pulse Console. Goodbye![/yellow]")
                     break
                 
-                elif cmd == "clear":
-                    self.agent.clear_history()
+                elif cmd == "new":
+                    new_id = self.agent.new_session()
                     console.clear()
                     self.display_banner()
-                    console.print("[bold green]✔ Conversational memory cleared. Starting fresh.[/bold green]\n")
+                    console.print(
+                        f"[bold green]✔ New session started: {new_id}[/bold green] "
+                        "[dim](prior sessions preserved under workspace/sessions/)[/dim]\n"
+                    )
                     
                 elif cmd == "status":
                     self.show_status()
@@ -309,8 +312,8 @@ class AgentConsole:
         help_table.add_row("toggle",     "Toggle safety badge ([SANDBOX] vs [HOST]).")
         help_table.add_row("cancel",     "Signal a running mission to stop after the current step.")
         help_table.add_row("audit",      "View today's HMAC-signed audit trail and verify integrity.")
+        help_table.add_row("new",        "Start a new session (preserves prior session state and workspace files).")
         help_table.add_row("status",     "Show configuration, thought budget, and audit metrics.")
-        help_table.add_row("clear",      "Wipe session history and reset to a fresh context.")
         help_table.add_row("exit",       "Terminate the session safely.")
         console.print(help_table)
 

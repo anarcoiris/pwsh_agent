@@ -5,28 +5,55 @@ phase: [recon]
 
 # dns_lookup Tool Playbook
 
-## Description
-Resolve DNS records for a hostname using native PowerShell Resolve-DnsName.
+## When to Use
 
-## Example Invocation
+**Use tool `dns_lookup`** as the first step when the user gives a hostname or domain. Resolve before `port_scan`, `ssl_analysis`, or `http_headers_check`.
+
+## Recon Workflow
+
+| Step | Tool | Purpose |
+|------|------|---------|
+| 1 | `dns_lookup(hostname=…, record_type="A")` | Resolve IP addresses |
+| 2 | `dns_lookup(hostname=…, record_type="MX")` | Mail servers |
+| 3 | `dns_lookup(hostname=…, record_type="TXT")` | SPF, DKIM, verification records |
+| 4 | `port_scan(target=<resolved IP>)` | Scan services on resolved host |
+
+## Example Invocations
+
+**A record (default):**
 ```json
-{
-  "name": "dns_lookup",
-  "arguments": {
-    "hostname": "<hostname>",
-    "record_type": "<record_type>"
-  }
-}
+{"name": "dns_lookup", "arguments": {"hostname": "example.com"}}
 ```
 
-## Parameters
+**MX records:**
+```json
+{"name": "dns_lookup", "arguments": {"hostname": "example.com", "record_type": "MX"}}
+```
 
-| Parameter | Type | Required | Description |
-|---|---|---|---|
-| `hostname` | `string` | **Yes** | The target hostname or domain to resolve. |
-| `record_type` | `string` | No | DNS record type — A, AAAA, MX, NS, TXT, CNAME, SOA (default: A). |
+**TXT / SPF:**
+```json
+{"name": "dns_lookup", "arguments": {"hostname": "example.com", "record_type": "TXT"}}
+```
 
-## Usage Notes
-- Make sure to review the parameters carefully.
-- Only call this tool when explicitly required by the task or when appropriate for the active recon phase.
-- Summarize the execution results back to the user in plain, concise markdown.
+**Subdomain enumeration follow-up:**
+```json
+{"name": "dns_lookup", "arguments": {"hostname": "api.example.com", "record_type": "CNAME"}}
+```
+
+## Supported Record Types
+
+`A`, `AAAA`, `MX`, `NS`, `TXT`, `CNAME`, `SOA` — pass via `record_type`.
+
+## Do Not Use dns_lookup For
+
+- Port scanning → use **`port_scan`**
+- Live host discovery on a subnet → use **`ping_sweep`**
+- HTTP header analysis → use **`http_headers_check`**
+
+## Common Mistakes
+
+| Mistake | Fix |
+|---------|-----|
+| Scanning before resolving | Run `dns_lookup` first to get the IP |
+| Using `host_exec nslookup` | Use the dedicated tool |
+| Omitting record type for mail/SPF questions | Pass `record_type="MX"` or `"TXT"` |

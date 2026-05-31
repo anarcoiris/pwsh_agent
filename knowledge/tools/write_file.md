@@ -5,7 +5,13 @@ phase: [development]
 
 # write_file Tool Playbook
 
-## Code Deliverables
+## Routing
+
+- Use for: code/document deliverables that must exist on disk.
+- Not for: progress logs (use `append_note`).
+- Typical next tool: `run_script` or `read_file`.
+
+## When to Use
 
 **Use tool `write_file`** for user-requested source files (`.py`, `.ps1`, reports).
 

@@ -1,3 +1,7 @@
+from repo_bootstrap import bootstrap
+
+bootstrap()
+
 import json
 import tools_legacy
 

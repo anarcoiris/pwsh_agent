@@ -11,8 +11,9 @@ import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
-_DB_PATH = _PROJECT_ROOT / "state" / "findings.db"
+from core.runtime_paths import app_root
+
+_DB_PATH = app_root() / "state" / "findings.db"
 
 
 # ──────────────────────────────────────────────
@@ -256,7 +257,7 @@ def report_generate(output_format: str = "markdown", title: str = "Pulse Agent E
         now = datetime.now(timezone.utc)
         date_str = now.strftime("%Y-%m-%d %H:%M UTC")
 
-        report_dir = _PROJECT_ROOT / "output"
+        report_dir = app_root() / "output"
         report_dir.mkdir(parents=True, exist_ok=True)
         fname = f"report_{now.strftime('%Y%m%d_%H%M%S')}.md"
         report_path = report_dir / fname

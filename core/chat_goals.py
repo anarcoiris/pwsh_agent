@@ -15,6 +15,13 @@ from dataclasses import dataclass, field, InitVar
 from typing import Any, Callable
 
 from core.task_intent import TaskIntentExtractor
+from core.tool_hints import (
+    format_crack_hash_call,
+    hash_planning_directive,
+    parse_hash_crack_hints,
+    parse_pcap_analysis_hints,
+    pcap_planning_directive,
+)
 
 
 class class_or_instance_method:
@@ -43,6 +50,9 @@ class ChatGoals:
 
     # Tool-specific hints (e.g. pcap_path_hint, filter_expression)
     hints: dict[str, Any] = field(default_factory=dict)
+
+    # Tools that may run multiple times with different arguments (dedup blocks exact repeats).
+    iterative_tools: list[str] = field(default_factory=list)
 
     # Tools that should be blocked while this goal's required_tools
     # haven't completed yet (prevents model from going off-track).
@@ -85,6 +95,43 @@ class ChatGoals:
         done = set(executed)
         return [t for t in self.required_tools if t not in done]
 
+    def is_pcap_goal(self) -> bool:
+        return "pcap" in self.label.lower()
+
+    def allows_iterative(self, tool_name: str) -> bool:
+        return tool_name in self.iterative_tools
+
+    def is_workflow_complete(self, executed: list[str], objective_met: bool = False) -> bool:
+        """
+        PCAP workflows need multiple analyze_pcapng/read_file passes with different
+        filters — do not treat the first analyze_pcapng as turn-complete.
+        """
+        if self.is_pcap_goal():
+            if "analyze_pcapng" not in executed:
+                return False
+            return bool(objective_met)
+        return not self.pending(executed)
+
+    def may_end_turn(
+        self,
+        executed: list[str],
+        step: int,
+        objective_met: bool = False,
+        min_steps: int = 2,
+    ) -> bool:
+        """Gate turn completion so the agent gets multiple ReAct iterations."""
+        if not self.is_workflow_complete(executed, objective_met):
+            return False
+        if self.is_pcap_goal():
+            if step < 2:
+                return False
+            if not objective_met:
+                return False
+            # Require at least two substantive PCAP passes (e.g. index + decode/read).
+            pcap_depth = sum(1 for t in executed if t in ("analyze_pcapng", "read_file"))
+            return pcap_depth >= 2
+        return step >= min_steps
+
     def nudge_text(self, pending: list[str]) -> str:
         if not pending:
             return ""
@@ -110,16 +157,14 @@ class ChatGoals:
                 f'Example: port_scan target="{target}"'
             )
         elif "crack_hash" in pending:
-            parts.append(
-                'Example: crack_hash target_hash="HASH_VALUE"'
-            )
+            parts.append(f"Example: {format_crack_hash_call(self.hints)}")
+            if self.hints.get("salt"):
+                parts.append("You MUST pass salt= (appended to password before hashing).")
 
         return " ".join(parts)
 
     def context_directive(self) -> str:
-        if not self.from_session:
-            return ""
-        return self.hints.get("context_directive", "")
+        return str(self.hints.get("context_directive", "") or "")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -179,38 +224,33 @@ class ChatGoalRegistry:
 
 _PCAP_RE = re.compile(
     r"(\.pcapng|\.pcap\b|\btshark\b|\bwireshark\b|last_capture|decode.*packet|"
-    r"analyze.*packet|http packet|xmlobj|login.*packet|locate.*pcap)",
+    r"analyze.*packet|http packet|login.*packet|locate.*pcap)",
+    re.I,
+)
+
+_HASH_CRACK_RE = re.compile(
+    r"(crack.*(?:sha-?)?256|(?:sha-?)?256.*hash|hash.*crack|brute.*force|\bcrack_hash\b|"
+    r"\bhaspro\b|\bhashpro\b|\bhash_pro7\b)",
     re.I,
 )
 
 _FOLLOWUP_DECODE_RE = re.compile(
-    r"\b(decode|extract|parse|key\s*values?|look for|find|contents|xmlobj|login|xml)\b",
+    r"\b(decode|extract|parse|key\s*values?|look for|find|contents|login)\b",
     re.I,
 )
 
 
 def _build_pcap_filters(lower: str) -> str:
     """Build tshark display filter from user message keywords."""
-    filters: list[str] = []
-    if "http" in lower:
-        filters.append("http")
-    if "login" in lower:
-        filters.append("http contains login or ftp.request.command == \"USER\" or smtp")
-    if "xml" in lower or "xmlobj" in lower:
-        filters.append("http contains xml or frame contains xml or xml")
-
-    if not filters and _FOLLOWUP_DECODE_RE.search(lower):
-        filters = [
-            "http",
-            "http contains login or ftp or smtp",
-            "http contains xml or frame contains xml",
-        ]
-    return " or ".join(f"({f})" for f in filters) if filters else "http"
+    return parse_pcap_analysis_hints(lower).get("filter_expression", "http")
 
 
 def _build_pcap_goal(message: str, session: list[dict] | None) -> ChatGoals | None:
     """Build a PCAP analysis goal from message (or session follow-up)."""
     lower = (message or "").lower()
+
+    if _HASH_CRACK_RE.search(lower):
+        return None
 
     is_followup = _FOLLOWUP_DECODE_RE.search(lower) and not _PCAP_RE.search(lower)
 
@@ -240,6 +280,7 @@ def _build_pcap_goal(message: str, session: list[dict] | None) -> ChatGoals | No
         verb = True
         return ChatGoals(
             required_tools=["analyze_pcapng"],
+            iterative_tools=["analyze_pcapng", "read_file", "find_file"],
             label="PCAP decode follow-up",
             verbose=verb,
             is_from_session=True,
@@ -269,14 +310,18 @@ def _build_pcap_goal(message: str, session: list[dict] | None) -> ChatGoals | No
         path_hint = "last_capture.pcapng"
 
     decode_followup = is_followup
+    pcap_hints = parse_pcap_analysis_hints(message)
+    path = path_hint or "last_capture.pcapng"
 
     return ChatGoals(
         required_tools=["analyze_pcapng"],
+        iterative_tools=["analyze_pcapng", "read_file", "find_file"],
         label="PCAP decode follow-up" if decode_followup else "PCAP analysis",
-        verbose=decode_followup or "decode" in lower,
+        verbose=pcap_hints.get("verbose", decode_followup or "decode" in lower),
         hints={
-            "pcap_path_hint": path_hint or "last_capture.pcapng",
-            "filter_expression": _build_pcap_filters(lower),
+            "pcap_path_hint": path,
+            "filter_expression": pcap_hints.get("filter_expression", "http"),
+            "context_directive": pcap_planning_directive(pcap_hints, path),
         },
         blocked_tools=["encode_decode", "sequentialthinking"],
         blocked_reason="Do NOT use encode_decode on PCAP data.",
@@ -310,18 +355,37 @@ def _build_portscan_goal(message: str, session: list[dict] | None) -> ChatGoals 
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _build_hashcrack_goal(message: str, session: list[dict] | None) -> ChatGoals | None:
+    hints = parse_hash_crack_hints(message)
     lower = (message or "").lower()
-    hash_m = re.search(r"\b([a-f0-9]{64})\b", lower)
-    hints: dict[str, Any] = {}
-    if hash_m:
-        hints["target_hash"] = hash_m.group(1)
+    if not hints.get("target_hash") and not re.search(
+        r"(crack|hash|sha-?256|hashpro|haspro)", (message or ""), re.I
+    ):
+        return None
+
+    hints["context_directive"] = hash_planning_directive(hints)
+
+    # Multi-step: extract from PCAP/reports → pwd.txt → crack_hash
+    if re.search(r"\b(pwd\.txt|save.*values|extract.*pcap|read.*report|read.*plan)\b", lower):
+        hints["context_directive"] = (
+            hints.get("context_directive", "")
+            + "\n[ROADMAP] 1) read_file reports/plan/pcap logs 2) extract REAL user/password/xmlObj/salt "
+            "3) write_file pwd.txt with extracted values (NO placeholders) 4) crack_hash."
+        )
+        return ChatGoals(
+            required_tools=["read_file", "analyze_pcapng", "write_file", "crack_hash"],
+            iterative_tools=["read_file", "analyze_pcapng", "write_file"],
+            label="Extract credentials and crack hash",
+            hints=hints,
+            blocked_tools=["encode_decode"],
+            blocked_reason="Use read_file/analyze_pcapng for real values — not encode_decode.",
+        )
 
     return ChatGoals(
         required_tools=["crack_hash"],
         label="Hash cracking",
         hints=hints,
-        blocked_tools=[],
-        blocked_reason="",
+        blocked_tools=["analyze_pcapng", "encode_decode"],
+        blocked_reason="Hash task — plan salt+mask, then crack_hash only.",
     )
 
 
@@ -332,7 +396,7 @@ def _build_hashcrack_goal(message: str, session: list[dict] | None) -> ChatGoals
 # PCAP — priority 10 (most specific, many regex patterns)
 ChatGoalRegistry.register(
     r"(\.pcapng|\.pcap\b|\btshark\b|\bwireshark\b|last_capture|decode.*packet|"
-    r"analyze.*packet|http packet|xmlobj|login.*packet|locate.*pcap|"
+    r"analyze.*packet|http packet|login.*packet|locate.*pcap|"
     r"\b(?:decode|extract|parse|key\s*values?|look for|contents)\b)",
     _build_pcap_goal,
     priority=10,
@@ -345,11 +409,12 @@ ChatGoalRegistry.register(
     priority=30,
 )
 
-# Hash crack — priority 30
+# Hash crack — priority 5 (beats PCAP false-positives on xml/login tokens in salts)
 ChatGoalRegistry.register(
-    r"(crack.*hash|hash.*crack|brute.*force|password.*hash|\bcrack_hash\b)",
+    r"(crack.*hash|hash.*crack|brute.*force|password.*hash|\bcrack_hash\b|"
+    r"crack.*sha-?256|sha-?256.*crack|\bhaspro\b|\bhashpro\b)",
     _build_hashcrack_goal,
-    priority=30,
+    priority=5,
 )
 
 
@@ -367,6 +432,8 @@ class ChatGoalGuard:
         args: dict[str, Any],
         goals: ChatGoals | None,
         executed: list[str],
+        *,
+        strategy_note: bool = False,
     ) -> tuple[str, dict[str, Any], str | None]:
         if not goals:
             return tool_name, args, None
@@ -374,6 +441,18 @@ class ChatGoalGuard:
         pending = goals.pending(executed)
 
         if pending:
+            if tool_name == "append_note":
+                if strategy_note:
+                    return tool_name, args, None
+                return tool_name, args, (
+                    f"Blocked: {goals.label} still pending ({', '.join(pending)}). "
+                    f"Run {pending[0]} before writing progress notes."
+                )
+            if tool_name == "crack_hash" and goals.hints.get("salt") and not args.get("salt"):
+                return tool_name, args, (
+                    f"Blocked: user specified salt '{goals.hints['salt']}' — "
+                    "pass salt= in crack_hash (concatenated to password before SHA-256)."
+                )
             # Block tools that are in the goal's blocked list
             if tool_name in goals.blocked_tools:
                 reason = goals.blocked_reason or f"Blocked: complete {goals.label} first."
@@ -384,18 +463,41 @@ class ChatGoalGuard:
                     )
                 return tool_name, args, reason
         else:
-            # Goals completed — block post-completion tool spam
-            if tool_name in goals.required_tools:
+            # #region agent log
+            if tool_name == "analyze_pcapng":
+                try:
+                    from core.debug_log import debug_log
+                    debug_log(
+                        "chat_goals.py:ChatGoalGuard",
+                        "post-minimum tool check",
+                        {
+                            "tool": tool_name,
+                            "allows_iterative": goals.allows_iterative(tool_name),
+                            "pending": pending,
+                            "executed": executed,
+                        },
+                        "G",
+                        "run1",
+                    )
+                except Exception:
+                    pass
+            # #endregion
+            # Goals minimum met — allow iterative PCAP tools with different args (dedup handles exact repeats)
+            if tool_name in goals.required_tools and not goals.allows_iterative(tool_name):
                 return tool_name, args, (
                     f"Blocked: {goals.label} already completed this turn. "
                     "Summarize findings in plain text — do not re-run tools."
                 )
-            if tool_name in ("sequentialthinking", "find_file"):
-                if tool_name in goals.blocked_tools or tool_name == "sequentialthinking":
-                    return tool_name, args, (
-                        f"Blocked: {goals.label} already completed this turn. "
-                        "Summarize findings in plain text — do not re-run tools."
-                    )
+            if tool_name == "sequentialthinking":
+                return tool_name, args, (
+                    f"Blocked: {goals.label} already completed this turn. "
+                    "Summarize findings in plain text — do not re-run tools."
+                )
+            if tool_name == "find_file" and not goals.allows_iterative(tool_name):
+                return tool_name, args, (
+                    f"Blocked: {goals.label} already completed this turn. "
+                    "Summarize findings in plain text — do not re-run tools."
+                )
             if tool_name == "append_note":
                 line = str(args.get("line", "")).lower()
                 if any(w in line for w in ("task completed", "no valid", "failed", "decoding failed")):
@@ -405,10 +507,11 @@ class ChatGoalGuard:
 
         # General append_note path restriction (regardless of goal)
         if tool_name == "append_note":
+            from core.session_paths import is_session_note_path
             path = str(args.get("path", "")).replace("\\", "/")
-            if not TaskIntentExtractor.is_workspace_meta_path(path):
+            if not TaskIntentExtractor.is_workspace_meta_path(path) and not is_session_note_path(path):
                 return tool_name, args, (
-                    "Blocked: append_note only on workspace/plan.md, status.md, or session_log.md."
+                    "Blocked: append_note only on session plan/status/log or scratchpads/*.md."
                 )
 
         return tool_name, args, None

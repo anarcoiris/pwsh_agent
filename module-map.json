@@ -1,0 +1,41 @@
+{
+  "modules": [
+    {
+      "name": "core",
+      "owner": "system",
+      "path": "core",
+      "publicSurface": ["agent", "context", "llm_utils", "parser", "execution_policy", "write_guard"],
+      "contractTypes": ["AgentOutputParser", "AgentContextManager", "SequentialThinkingEngine", "TaskIntent"],
+      "dependencies": {
+        "internal": ["tools", "audit"],
+        "external": ["ollama", "httpx"]
+      }
+    },
+    {
+      "name": "tools",
+      "owner": "system",
+      "path": "tools",
+      "publicSurface": ["__init__", "intel", "recon", "tools_legacy"],
+      "dependencies": {
+        "internal": [],
+        "external": ["sqlite3", "base64", "urllib"]
+      }
+    },
+    {
+      "name": "interfaces",
+      "owner": "user",
+      "path": ".",
+      "publicSurface": ["agent", "console", "audit", "mcp_server"],
+      "dependencies": {
+        "internal": ["core", "tools"],
+        "external": ["rich", "prompt_toolkit", "pyfiglet"]
+      }
+    },
+    {
+      "name": "state",
+      "owner": "system",
+      "path": "state",
+      "description": "Stateful outputs, sessions, memories, and identity files."
+    }
+  ]
+}

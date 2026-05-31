@@ -5,7 +5,13 @@ phase: [development, recon]
 
 # host_exec Tool Playbook
 
-## When to Use host_exec
+## Routing
+
+- Use for: PowerShell one-liners and native Windows cmdlets.
+- Not for: tasks covered by specialized tools (`port_scan`, `run_script`, etc.).
+- Typical next tool: specialized tool on retry.
+
+## When to Use
 
 **Use tool `host_exec`** for PowerShell one-liners and native Windows cmdlets. It is a **last resort** for tasks covered by specialized tools (`port_scan`, `analyze_pcapng`, `run_script`, etc.).
 
@@ -15,7 +21,7 @@ phase: [development, recon]
 {"name": "host_exec", "arguments": {"command": "powershell -ExecutionPolicy Bypass -File script.ps1"}}
 ```
 
-## Never Use host_exec For
+## Do Not Use host_exec For
 
 - Running `.py` files → use **`run_script`**
 - PCAP capture → use **`capture_packets`**

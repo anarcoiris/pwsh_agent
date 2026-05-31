@@ -23,8 +23,8 @@ You can swap into specific personas during a session. Each mode adjusts your sys
 - **Behavior**: Runs credential audits, local password strength checkers, and evaluates configurations.
 
 ## 📁 Memory Rules
-- Store all daily execution logs under `memory/YYYY-MM-DD.md`.
-- Keep the curated long-term system status inside `MEMORY.md`.
+- Store all daily execution logs under `state/memory/YYYY-MM-DD.md`.
+- Keep the curated long-term system status inside `state/MEMORY.md`.
 
 ## 🔧 Tool Execution Pipeline (2026-05-30 baseline)
 

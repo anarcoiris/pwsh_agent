@@ -11,8 +11,9 @@ import re
 from pathlib import Path
 from typing import Any
 
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
-_KNOWLEDGE_DIR = _PROJECT_ROOT / "knowledge"
+from core.runtime_paths import app_root
+
+_KNOWLEDGE_DIR = app_root() / "knowledge"
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 

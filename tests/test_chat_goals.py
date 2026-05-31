@@ -70,4 +70,45 @@ def test_parser_tool_name_json():
     assert calls[0]["function"]["name"] == "append_note"
 
 
+def test_goal_guard_allows_iterative_analyze_pcap_after_first():
+    goals = ChatGoals(
+        required_tools=["analyze_pcapng"],
+        iterative_tools=["analyze_pcapng", "read_file"],
+        label="PCAP analysis",
+    )
+    _, _, err = ChatGoalGuard.apply(
+        "analyze_pcapng",
+        {"file_path": "last_capture.pcapng", "filter_expression": 'http contains "login"'},
+        goals,
+        ["analyze_pcapng"],
+    )
+    assert err is None
+
+
+def test_pcap_workflow_not_complete_until_objective_met():
+    goals = ChatGoals(
+        required_tools=["analyze_pcapng"],
+        iterative_tools=["analyze_pcapng", "read_file"],
+        label="PCAP analysis",
+    )
+    assert goals.is_workflow_complete(["analyze_pcapng"], objective_met=False) is False
+    assert goals.is_workflow_complete(["analyze_pcapng", "read_file"], objective_met=True) is True
+
+
+def test_goal_guard_blocks_append_note_when_pcap_pending():
+    goals = ChatGoals(
+        required_tools=["analyze_pcapng"],
+        pcap_path_hint="last_capture.pcapng",
+        label="PCAP analysis",
+    )
+    _, _, err = ChatGoalGuard.apply(
+        "append_note",
+        {"path": "workspace/status.md", "line": "PCAP file search initiated"},
+        goals,
+        [],
+    )
+    assert err is not None
+    assert "analyze_pcapng" in err
+
+
 print("All chat_goals tests passed.")

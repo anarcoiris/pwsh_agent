@@ -1,21 +1,18 @@
 """
-scripts/generate_playbooks.py
+artifacts/scripts/generate_playbooks.py
 
 Auto-generates markdown playbooks for tools defined in tools.TOOLS_SCHEMA
 that do not already have playbooks in knowledge/tools/.
 """
 
-import os
-import sys
 import json
-from pathlib import Path
+import os
 
-# Setup sys path
+from repo_bootstrap import bootstrap
+
+project_root = bootstrap()
+
 from core.runtime_paths import app_root
-
-project_root = app_root()
-sys.path.insert(0, str(project_root))
-
 import tools
 
 def get_suggested_phase(name: str) -> str:

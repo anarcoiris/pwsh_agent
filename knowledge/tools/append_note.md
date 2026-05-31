@@ -5,7 +5,13 @@ phase: [development]
 
 # append_note Tool Playbook
 
-## Progress Logs Only
+## Routing
+
+- Use for: timestamped one-line progress in workspace note files.
+- Not for: source code or full-file overwrites (use `write_file`).
+- Typical next tool: continue mission tools after logging progress.
+
+## When to Use
 
 **Use tool `append_note`** for timestamped one-line progress on:
 

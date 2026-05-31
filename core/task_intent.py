@@ -12,6 +12,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+def _pwd_file_is_placeholder(path: Path) -> bool:
+    try:
+        if not path.exists() or not path.is_file():
+            return False
+        from core.task_plan import _looks_like_placeholder_file
+        return _looks_like_placeholder_file(path.read_text(encoding="utf-8", errors="replace")[:500])
+    except OSError:
+        return False
+
+
 _WORKSPACE_META = frozenset({
     "workspace/plan.md",
     "workspace/status.md",
@@ -34,11 +44,30 @@ class TaskIntent:
         """Return deliverable paths that do not yet exist on disk."""
         pending: list[str] = []
         for rel in self.deliverables:
-            p = Path(rel)
-            if workspace_root and not p.is_absolute():
-                p = workspace_root / rel
-            if not p.exists():
-                pending.append(rel.replace("\\", "/"))
+            rel_norm = rel.replace("\\", "/")
+            candidates: list[Path] = [Path(rel_norm)]
+            if workspace_root and not Path(rel_norm).is_absolute():
+                candidates.extend([
+                    workspace_root / rel_norm,
+                    workspace_root / "workspace" / Path(rel_norm).name,
+                    workspace_root.parent / rel_norm if workspace_root.name == "workspace" else workspace_root / rel_norm,
+                ])
+            # Also check app-relative workspace/ prefix
+            candidates.append(Path("workspace") / Path(rel_norm).name)
+
+            found = False
+            for p in candidates:
+                try:
+                    if p.exists() and p.is_file() and p.stat().st_size > 0:
+                        if "pwd.txt" in rel_norm.lower() and _pwd_file_is_placeholder(p):
+                            found = False
+                            break
+                        found = True
+                        break
+                except OSError:
+                    continue
+            if not found:
+                pending.append(rel_norm)
         return pending
 
 
@@ -103,8 +132,11 @@ class TaskIntentExtractor:
 
     @staticmethod
     def is_workspace_meta_path(path: str) -> bool:
+        from core.session_paths import is_session_note_path
         normalized = path.replace("\\", "/").lower()
         if normalized in _WORKSPACE_META:
+            return True
+        if is_session_note_path(path):
             return True
         return normalized.startswith("workspace/") and normalized.endswith(
             ("plan.md", "status.md", "session_log.md")
