@@ -6,7 +6,7 @@ import os
 import time
 from pathlib import Path
 
-_SESSION_ID = os.environ.get("DEBUG_SESSION_ID", "d63d0c")
+_SESSION_ID = os.environ.get("DEBUG_SESSION_ID", "d21bac")
 _LOG = Path(__file__).resolve().parent.parent / f"debug-{_SESSION_ID}.log"
 _DEBUG_ENABLED = os.environ.get("PULSE_DEBUG", "1") == "1"
 

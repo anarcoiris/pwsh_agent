@@ -27,7 +27,7 @@ def test_retrieval_mission_still_requires_evidence():
 
 def test_chat_may_end_turn_requires_min_steps():
     goals = ChatGoals(required_tools=["port_scan"], label="Port scan")
-    executed = ["port_scan"]
+    executed = [{"name": "port_scan", "success": True}]
     assert goals.is_workflow_complete(executed) is True
     assert goals.may_end_turn(executed, step=0) is False
     assert goals.may_end_turn(executed, step=2) is True
@@ -40,9 +40,12 @@ def test_pcap_may_end_turn_requires_objective_and_depth():
         hints={"pcap_path_hint": "last_capture.pcapng"},
         iterative_tools=["analyze_pcapng", "read_file"],
     )
-    executed = ["analyze_pcapng"]
+    executed = [{"name": "analyze_pcapng", "success": True}]
     assert goals.may_end_turn(executed, step=3, objective_met=True) is False
-    executed2 = ["analyze_pcapng", "read_file"]
+    executed2 = [
+        {"name": "analyze_pcapng", "success": True},
+        {"name": "read_file", "success": True},
+    ]
     assert goals.may_end_turn(executed2, step=3, objective_met=True) is True
     assert goals.may_end_turn(executed2, step=1, objective_met=True) is False
 

@@ -22,6 +22,8 @@ read_file               = _legacy.read_file
 write_file              = _legacy.write_file
 append_note             = _legacy.append_note
 find_file               = _legacy.find_file
+grep_file               = _legacy.grep_file
+find_and_grep           = _legacy.find_and_grep
 list_network_interfaces = _legacy.list_network_interfaces
 capture_packets         = _legacy.capture_packets
 analyze_pcapng          = _legacy.analyze_pcapng
@@ -232,7 +234,7 @@ TOOLS_SCHEMA += [
 
 __all__ = [
     "SequentialThinkingEngine",
-    "host_exec", "run_script", "read_file", "write_file", "append_note", "find_file",
+    "host_exec", "run_script", "read_file", "write_file", "append_note", "find_file", "grep_file", "find_and_grep",
     "list_network_interfaces", "capture_packets", "analyze_pcapng",
     "crack_hash", "find_tshark",
     "dns_lookup", "ping_sweep", "port_scan",

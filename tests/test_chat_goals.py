@@ -19,6 +19,15 @@ def test_chat_goals_pcap():
     assert goals.pending([]) == ["analyze_pcapng"]
 
 
+def test_pending_requires_success_events():
+    goals = ChatGoals(required_tools=["read_file", "analyze_pcapng"], label="X")
+    executed = [
+        {"name": "read_file", "success": True},
+        {"name": "analyze_pcapng", "success": False},
+    ]
+    assert goals.pending(executed) == ["analyze_pcapng"]
+
+
 def test_followup_from_session():
     messages = [
         {"role": "tool", "name": "find_file", "content": json.dumps({"recommended": "last_capture.pcapng"})},
@@ -109,6 +118,21 @@ def test_goal_guard_blocks_append_note_when_pcap_pending():
     )
     assert err is not None
     assert "analyze_pcapng" in err
+
+
+def test_strategy_note_bypass_when_pending():
+    goals = ChatGoals(
+        required_tools=["write_file", "crack_hash"],
+        label="Extract credentials and crack hash",
+    )
+    _, _, err = ChatGoalGuard.apply(
+        "append_note",
+        {"path": "workspace/plan.md", "line": "Strategy change: use verbose log"},
+        goals,
+        [{"name": "read_file", "success": True}],
+        strategy_note=True,
+    )
+    assert err is None
 
 
 print("All chat_goals tests passed.")

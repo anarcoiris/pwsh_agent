@@ -38,9 +38,13 @@ class WriteGuard:
         if not TaskIntentExtractor.is_workspace_meta_path(path):
             return tool_name, args, None
 
-        pending = pending_deliverables or (
-            intent.pending_deliverables() if intent else []
-        )
+        # Distinguish "not provided" (None) from "explicitly empty" ([]): an
+        # empty list means the caller asserts there are no pending deliverables
+        # and must not silently fall back to the intent-derived list.
+        if pending_deliverables is not None:
+            pending = pending_deliverables
+        else:
+            pending = intent.pending_deliverables() if intent else []
 
         if intent and intent.is_dev_task and pending:
             if TaskIntentExtractor.is_progress_note(content):

@@ -2,14 +2,54 @@
 
 from __future__ import annotations
 
+import fnmatch
 from pathlib import Path
 
-from core.runtime_paths import search_roots, workspace_root
+from core import runtime_paths as _runtime_paths
 
 _SKIP_PARTS = {".venv", "__pycache__", "artifacts/archived"}
 
 # Canonical relative locations (under each search root)
 _PCAP_SEARCH_DIRS = ("", "workspace", "artifacts/captures")
+
+
+def _score_match(rel_path: str, query_name: str) -> int:
+    """Higher score means better recommendation ranking."""
+    rel = rel_path.replace("\\", "/")
+    lower = rel.lower()
+    name = (query_name or "").strip().lower()
+    score = 0
+
+    # Prefer operational artifacts over playbooks/docs.
+    if lower.startswith("output/") and "report_" in lower:
+        score += 80
+    if lower.startswith(".pulse/pcap_logs/") or "/.pulse/pcap_logs/" in lower:
+        score += 70
+    if lower.startswith("workspace/"):
+        score += 50
+    if lower.startswith("artifacts/captures/"):
+        score += 40
+    if lower.startswith("knowledge/"):
+        score -= 40
+    if lower.startswith("docs/"):
+        score -= 30
+
+    # Exact basename > wildcard/partial.
+    basename = Path(lower).name
+    pattern = Path(name).name if name else ""
+    if pattern and not any(ch in pattern for ch in "*?[]"):
+        if basename == pattern:
+            score += 25
+    elif pattern and fnmatch.fnmatch(basename, pattern):
+        score += 20
+    elif pattern and pattern in basename:
+        score += 10
+
+    # Fresh report filenames (timestamped) likely more useful.
+    if "report_" in basename:
+        score += 5
+
+    return score
 
 
 def resolve_project_file(name: str) -> Path | None:
@@ -21,7 +61,7 @@ def resolve_project_file(name: str) -> Path | None:
     basename = candidate.name if candidate.name else name
     rel_parts = candidate.parts
 
-    for root in search_roots():
+    for root in _runtime_paths.search_roots():
         if len(rel_parts) > 1:
             direct = (root / Path(*rel_parts)).resolve()
             if direct.is_file():
@@ -63,10 +103,11 @@ def resolve_project_file(name: str) -> Path | None:
 
 def find_file(name: str, search_root: Path | None = None) -> dict:
     """Search project tree for files matching basename (skips .venv and archived backups)."""
-    roots = (search_root.resolve(),) if search_root else search_roots()
+    roots = (search_root.resolve(),) if search_root else _runtime_paths.search_roots()
     basename = Path(name).name
     if not basename:
         return {"success": False, "error": "No filename provided.", "matches": []}
+    pattern = basename
 
     known = resolve_project_file(basename)
     matches: list[str] = []
@@ -84,8 +125,12 @@ def find_file(name: str, search_root: Path | None = None) -> dict:
             matches.append(str(known).replace("\\", "/"))
 
     for root in roots:
-        for path in root.rglob(basename):
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
             if any(skip in str(path) for skip in (".venv", "artifacts\\archived", "artifacts/archived")):
+                continue
+            if not fnmatch.fnmatch(path.name, pattern):
                 continue
             try:
                 rel = str(path.relative_to(root)).replace("\\", "/")
@@ -94,8 +139,35 @@ def find_file(name: str, search_root: Path | None = None) -> dict:
             if rel not in matches:
                 matches.append(rel)
 
+    # Rank recommendations: keep full match list for visibility, but suggest best operational path.
+    ranked = sorted(matches, key=lambda p: _score_match(p, pattern), reverse=True)
+    recommended = ranked[0] if ranked else None
+
+    if not matches:
+        err = f"No files matching pattern '{pattern}'."
+        if any(ch in pattern for ch in "*?[]"):
+            err += (
+                " find_file matches filenames only — not packet/XML field content. "
+                "Use find_file('verbose_*.txt') then grep_file(path=<recommended>, pattern='xmlObj') "
+                "or grep_file('.pulse/pcap_logs/verbose_*.txt', pattern='xml') "
+                "or read_file on verbose_log_file from analyze_pcapng."
+            )
+        # #region agent log
+        try:
+            from core.debug_log import debug_log
+            debug_log(
+                "core/artifacts.py:find_file",
+                "no matches",
+                {"pattern": pattern, "wildcard": any(ch in pattern for ch in "*?[]")},
+                "H1",
+            )
+        except Exception:
+            pass
+        # #endregion
+        return {"success": False, "error": err, "matches": [], "recommended": None}
+
     return {
-        "success": bool(matches),
+        "success": True,
         "matches": matches[:20],
-        "recommended": matches[0] if matches else None,
+        "recommended": recommended,
     }

@@ -63,6 +63,22 @@ def session_workspace_dir(session_id: str) -> Path:
     return sessions_workspace_root() / session_id
 
 
+def session_artifacts_dir(session_id: str) -> Path:
+    return session_state_dir(session_id) / "artifacts"
+
+
+def facts_file(session_id: str) -> Path:
+    return session_state_dir(session_id) / "facts.json"
+
+
+def plan_state_file(session_id: str) -> Path:
+    return session_state_dir(session_id) / "plan_state.json"
+
+
+def facts_rel(session_id: str) -> str:
+    return _rel(facts_file(session_id))
+
+
 def plan_file(session_id: str) -> Path:
     return session_workspace_dir(session_id) / f"plan_{session_id}.md"
 
@@ -113,6 +129,7 @@ def ensure_session_layout(session_id: str) -> dict[str, str]:
     ws.mkdir(parents=True, exist_ok=True)
     scratchpads_dir(session_id).mkdir(parents=True, exist_ok=True)
     session_state_dir(session_id).mkdir(parents=True, exist_ok=True)
+    session_artifacts_dir(session_id).mkdir(parents=True, exist_ok=True)
 
     paths = {
         "plan": plan_note_rel(session_id),

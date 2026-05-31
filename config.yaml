@@ -3,16 +3,30 @@
 ollama:
   # Base URL for the local Ollama instance (same port 11435)
   base_url: "http://localhost:11435"
-  
+
   # Default model used for coding, reasoning, and tool calling
   default_model: "qwen2.5-coder:7b-openclaw"
-  
+
   # Conversational/translation model if needed
   conversational_model: "chat-analyzer"
+
+  # Context window — ensure the model is loaded with >= this context (Modelfile / OLLAMA_CONTEXT_LENGTH)
+  num_ctx: 24576
+  num_predict: 3072
+  num_predict_synthesis: 4096
 
 agent:
   # Maximum steps in a single autonomous ReAct loop
   max_steps: 30
-  
+
   # Thought budget limit for the sequentialthinking tool
   max_thoughts: 30
+
+  # Trimmed persisted history budget (chars); leaves room for ~8k injection overhead at 24k ctx
+  max_context_chars: 47000
+  max_context_tokens: 18000
+  reserve_generation_tokens: 3072
+  reserve_injection_tokens: 2048
+  max_total_messages: 80
+  max_tool_result_chars: 22000
+  injection_budget_chars: 8000

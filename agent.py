@@ -33,6 +33,7 @@ import tools
 from audit import AuditEntry, get_audit
 from core.context import AgentContextManager
 from core.context_router import ContextRouter
+from core.query_anchor import resolve_anchor_query
 from core.llm_utils import (
     ArgumentNormalizer,
     DynamicContextBuilder,
@@ -41,8 +42,15 @@ from core.llm_utils import (
     SequentialThinkingEngine,
 )
 from core.parser import AgentOutputParser
-from core.task_intent import TaskIntent, TaskIntentExtractor
-from core.task_plan import TaskPlanTracker, load_session_context_snippets, _looks_like_placeholder_file
+from core.task_intent import TaskIntent, TaskIntentExtractor, _is_credential_deliverable
+from core.task_plan import (
+    TaskPlanTracker,
+    load_session_context_snippets,
+    load_plan_state,
+    save_plan_state,
+    clear_plan_state,
+    _looks_like_placeholder_file,
+)
 from core.session_paths import (
     ensure_session_layout,
     generate_session_id,
@@ -53,6 +61,8 @@ from core.session_paths import (
     status_note_rel,
     session_log_rel,
 )
+from core.spill import maybe_spill_text
+from core.facts_store import summarize_facts, update_from_tool
 from core.chat_goals import ChatGoals, ChatGoalGuard, ChatGoalRegistry
 from core.write_guard import WriteGuard
 from core.execution_policy import ExecutionPolicy, set_pip_near
@@ -75,10 +85,22 @@ class OllamaAdapter:
     - Parser fallback for missed tool calls
     """
 
-    def __init__(self, host: str, model: str, parser: AgentOutputParser):
-        self.host   = host
-        self.model  = model
+    def __init__(
+        self,
+        host: str,
+        model: str,
+        parser: AgentOutputParser,
+        *,
+        num_ctx: int = 24576,
+        num_predict: int = 3072,
+        injection_budget_chars: int = 8000,
+    ):
+        self.host = host
+        self.model = model
         self.parser = parser
+        self.num_ctx = num_ctx
+        self.num_predict = num_predict
+        self.injection_budget_chars = injection_budget_chars
         self.client = AsyncClient(host=host, timeout=httpx.Timeout(300.0))
 
     async def chat(
@@ -88,20 +110,34 @@ class OllamaAdapter:
         options: dict | None = None,
         max_retries: int = 3,
         task_intent: TaskIntent | None = None,
+        anchor_query: str | None = None,
+        session_snippet: str | None = None,
+        plan_block: str | None = None,
     ) -> dict[str, Any]:
         try:
-            for injection in ContextRouter.build_injections(messages, task_intent):
+            for injection in ContextRouter.build_injections(
+                messages,
+                task_intent,
+                anchor_query=anchor_query,
+                session_snippet=session_snippet,
+                plan_block=plan_block,
+                injection_budget_chars=self.injection_budget_chars,
+            ):
                 messages = messages + [injection]
         except Exception as e:
             logger.warning("ContextRouter injection error: %s", e)
 
-        _options = {"temperature": 0.3, "num_ctx": 16384, "num_predict": 4096}
+        _options = {
+            "temperature": 0.3,
+            "num_ctx": self.num_ctx,
+            "num_predict": self.num_predict,
+        }
         if options:
             _options.update(options)
 
-        user_msgs = [m for m in messages if m.get("role") == "user"]
-        latest_user = user_msgs[-1].get("content", "") if user_msgs else ""
-        self.parser.set_user_context(latest_user)
+        anchor = (anchor_query or "").strip() or resolve_anchor_query(messages)
+        self.parser.set_user_context(anchor)
+        latest_user = anchor
 
         for attempt in range(1, max_retries + 1):
             try:
@@ -178,10 +214,26 @@ class ReActAgent:
         self.default_model = ollama_cfg.get("default_model", "qwen2.5-coder:7b")
         self.conversational_model = ollama_cfg.get("conversational_model")
         self.evaluator_temperature = float(ollama_cfg.get("evaluator_temperature", 0.1))
+        self.num_ctx = int(ollama_cfg.get("num_ctx", 24576))
+        self.num_predict = int(ollama_cfg.get("num_predict", 3072))
+        self.num_predict_synthesis = int(ollama_cfg.get("num_predict_synthesis", 4096))
 
-        agent_cfg        = self.config.get("agent", {})
-        self.max_steps   = agent_cfg.get("max_steps", 15)
+        agent_cfg = self.config.get("agent", {})
+        self.max_steps = agent_cfg.get("max_steps", 15)
         self.max_thoughts = agent_cfg.get("max_thoughts", 15)
+        self.max_context_chars = int(agent_cfg.get("max_context_chars", 47_000))
+        self.max_total_messages = int(agent_cfg.get("max_total_messages", 80))
+        self.max_tool_result_chars = int(agent_cfg.get("max_tool_result_chars", 22_000))
+        self.injection_budget_chars = int(agent_cfg.get("injection_budget_chars", 8000))
+        self.max_context_tokens = int(agent_cfg.get("max_context_tokens", 0))
+        self.reserve_generation_tokens = int(
+            agent_cfg.get("reserve_generation_tokens", self.num_predict)
+        )
+        self.reserve_injection_tokens = int(
+            agent_cfg.get("reserve_injection_tokens", max(1024, self.injection_budget_chars // 4))
+        )
+
+        ResultCompactor.configure_max_chars(self.max_tool_result_chars)
 
         # ── Specialist & safety state ──────────────────────────────────────
         self.active_specialist: str = "lead"
@@ -204,6 +256,9 @@ class ReActAgent:
             host=self.base_url,
             model=self.default_model,
             parser=self.parser,
+            num_ctx=self.num_ctx,
+            num_predict=self.num_predict,
+            injection_budget_chars=self.injection_budget_chars,
         )
         self.mission_evaluator: MissionEvaluator | None = None
         if self.conversational_model:
@@ -220,17 +275,24 @@ class ReActAgent:
         self.ctx_manager = AgentContextManager(
             mode="autonomous",
             session_id=self.session_id,
-            max_total_context=100,
+            max_total_context=self.max_total_messages,
+            max_context_chars=self.max_context_chars,
+            max_tool_result_chars=self.max_tool_result_chars,
+            max_context_tokens=self.max_context_tokens,
+            reserve_generation_tokens=self.reserve_generation_tokens,
+            reserve_injection_tokens=self.reserve_injection_tokens,
         )
 
         # Cancellation
         self._cancel_event = asyncio.Event()
+        self._anchor_query: str = ""
         self._active_intent: TaskIntent | None = None
         self._mission_goals: ChatGoals | None = None
         self._mission_tools_executed: list[str] = []
         self._mission_tracker: MissionProgressTracker | None = None
         self._pending_script_failure: dict[str, Any] | None = None
         self._last_script_path: str | None = None
+        self._chat_tool_events: list[dict[str, Any]] = []
 
         # Initialise system prompt if fresh session
         if not self.ctx_manager.has_system():
@@ -359,8 +421,14 @@ class ReActAgent:
         self.ctx_manager = AgentContextManager(
             mode="autonomous",
             session_id=self.session_id,
-            max_total_context=100,
+            max_total_context=self.max_total_messages,
+            max_context_chars=self.max_context_chars,
+            max_tool_result_chars=self.max_tool_result_chars,
+            max_context_tokens=self.max_context_tokens,
+            reserve_generation_tokens=self.reserve_generation_tokens,
+            reserve_injection_tokens=self.reserve_injection_tokens,
         )
+        self._anchor_query = ""
         self.thinking_engine.reset()
         self.retry_orchestrator.reset()
         self._init_system_prompt()
@@ -436,18 +504,25 @@ class ReActAgent:
                 })
                 return False, 0
 
+        pending = (
+            self._active_intent.pending_deliverables(self.workspace_root)
+            if self._active_intent else []
+        )
+
         if tool_name == "append_note" and "path" in tool_args:
             from core.session_paths import normalize_note_path
             tool_args = dict(tool_args)
             tool_args["path"] = normalize_note_path(str(tool_args["path"]), self.session_id)
             tool_args.setdefault("session_id", self.session_id)
 
+        if tool_name == "write_file" and "path" in tool_args:
+            tool_args = dict(tool_args)
+            tool_args.setdefault("session_id", self.session_id)
+            if pending:
+                tool_args.setdefault("deliverables", pending)
+
         tool_name, tool_args, redirect_note = ExecutionPolicy.apply(tool_name, tool_args)
 
-        pending = (
-            self._active_intent.pending_deliverables(self.workspace_root)
-            if self._active_intent else []
-        )
         tool_name, tool_args, block_err = WriteGuard.apply(
             tool_name,
             tool_args,
@@ -493,13 +568,25 @@ class ReActAgent:
         if tool_name == "write_file":
             content = str(tool_args.get("content", ""))
             path = str(tool_args.get("path", "")).replace("\\", "/")
-            if "pwd.txt" in path.lower() and _looks_like_placeholder_file(content):
+            if _is_credential_deliverable(path) and _looks_like_placeholder_file(content):
                 block_err = (
-                    "Blocked: pwd.txt must contain REAL values extracted from PCAP/reports "
+                    f"Blocked: {path} must contain REAL values extracted from PCAP/reports "
                     "(not empty, not placeholders like user:password or xmlObj:salt). "
-                    "Use credential fields from the last analyze_pcapng result, or "
-                    "find_file / read_file on .pulse/pcap_logs/verbose_*.txt."
+                    "Use credential fields from analyze_pcapng, grep_file on "
+                    ".pulse/pcap_logs/verbose_*.txt for xml/salt, or read_file reports."
                 )
+                # #region agent log
+                try:
+                    from core.debug_log import debug_log
+                    debug_log(
+                        "agent.py:_execute_tool",
+                        "blocked placeholder credential file",
+                        {"path": path, "content_head": content[:120]},
+                        "H3",
+                    )
+                except Exception:
+                    pass
+                # #endregion
                 if step_callback:
                     step_callback("AGENT_TOOL_CALL", {"tool": tool_name, "args": tool_args})
                     step_callback("AGENT_TOOL_RESULT", {
@@ -564,6 +651,38 @@ class ReActAgent:
         if isinstance(result, dict) and redirect_note:
             result["redirect_note"] = redirect_note
 
+        # Auto-recover missing PCAP path in chat hash/extract workflow.
+        if (
+            tool_name == "analyze_pcapng"
+            and isinstance(result, dict)
+            and result.get("success") is False
+            and "does not exist" in str(result.get("error", "")).lower()
+            and getattr(self, "_chat_goals", None) is not None
+        ):
+            ff_res = tools.find_file("last_capture.pcapng")
+            rec = str(ff_res.get("recommended") or "").strip()
+            if rec:
+                recover_args = dict(tool_args)
+                recover_args["file_path"] = rec
+                if step_callback:
+                    step_callback("AGENT_TOOL_CALL", {"tool": "analyze_pcapng", "args": recover_args})
+                recover = await asyncio.to_thread(tools.analyze_pcapng, **recover_args)
+                if step_callback:
+                    step_callback("AGENT_TOOL_RESULT", {"tool": "analyze_pcapng", "result": recover})
+                if isinstance(recover, dict) and recover.get("success"):
+                    result = recover
+
+        # Track per-chat tool success for goal completion semantics.
+        if getattr(self, "_chat_goals", None) is not None:
+            success_flag = True
+            if isinstance(result, dict) and result.get("success") is False:
+                success_flag = False
+            self._chat_tool_events.append({
+                "name": tool_name,
+                "success": success_flag,
+                "args": dict(tool_args),
+            })
+
         script_hint = self._build_script_failure_hint(tool_name, result, tool_args)
         if script_hint:
             self.ctx_manager.add_message({"role": "user", "content": script_hint})
@@ -598,11 +717,58 @@ class ReActAgent:
 
         duration_ms = int((time.monotonic() - t_start) * 1000)
         result_str  = json.dumps(result, default=str)
+        spill_meta = maybe_spill_text(
+            self.session_id,
+            tool_name,
+            result_str,
+            threshold_chars=max(16_000, int(self.max_tool_result_chars * 0.75)),
+            preview_chars=1800,
+        )
+        if spill_meta and isinstance(result, dict):
+            result["_artifact"] = {
+                "artifact_file": spill_meta["artifact_file"],
+                "artifact_bytes": spill_meta["artifact_bytes"],
+                "artifact_lines": spill_meta["artifact_lines"],
+            }
+            result["_artifact_note"] = spill_meta["artifact_note"]
+            result_str = json.dumps(result, default=str)
         result_hash = hashlib.sha256(result_str.encode()).hexdigest()
 
         _raw_len = len(result_str)
-        # Compact large results
         result_str = ResultCompactor.compact(tool_name, result_str)
+
+        if tool_name == "analyze_pcapng" and isinstance(result, dict) and result.get("success"):
+            analysis = result.get("analysis") or {}
+            low = result_str.lower()
+            if not any(k in low for k in ("login", "password", "xmlobj", "credential")):
+                digest_parts: list[str] = []
+                kf = analysis.get("key_fields")
+                if kf:
+                    digest_parts.append(f"key_fields:\n{str(kf)[:4000]}")
+                for key in ("potential_plaintext_credentials", "http_forms"):
+                    val = analysis.get(key)
+                    if val:
+                        digest_parts.append(f"{key}:\n{str(val)[:4000]}")
+                if digest_parts:
+                    result_str = (
+                        result_str[:16_000]
+                        + "\n\n[CREDENTIAL DIGEST]\n"
+                        + "\n\n".join(digest_parts)
+                    )[:ResultCompactor.MAX_CHARS]
+        elif spill_meta and isinstance(result, dict):
+            # Pointer-first compaction for large non-PCAP outputs.
+            result_str = json.dumps(
+                {
+                    "success": result.get("success", True),
+                    "artifact_file": spill_meta["artifact_file"],
+                    "artifact_bytes": spill_meta["artifact_bytes"],
+                    "artifact_lines": spill_meta["artifact_lines"],
+                    "artifact_preview": spill_meta["artifact_preview"],
+                    "note": spill_meta["artifact_note"],
+                },
+                default=str,
+                indent=2,
+            )
 
         # #region agent log
         if tool_name == "analyze_pcapng":
@@ -641,6 +807,37 @@ class ReActAgent:
 
         if tool_name == "analyze_pcapng" and isinstance(result, dict) and result.get("success"):
             analysis = result.get("analysis", {})
+            try:
+                from core.credential_extract import build_login_forms_draft, has_login_evidence
+                if has_login_evidence(analysis):
+                    self._pcap_objective_met = True
+                    draft = build_login_forms_draft(analysis)
+                    if draft:
+                        deliverable = "login_forms.txt"
+                        if self._active_intent and self._active_intent.deliverables:
+                            deliverable = self._active_intent.deliverables[0]
+                        self.ctx_manager.add_message({
+                            "role": "user",
+                            "content": (
+                                f"[SYSTEM] Draft for write_file(path='{deliverable}') "
+                                "from analyze_pcapng — verify xmlObj/salt, edit if needed:\n"
+                                f"{draft}"
+                            ),
+                        })
+                        # #region agent log
+                        try:
+                            from core.debug_log import debug_log
+                            debug_log(
+                                "agent.py:_execute_tool",
+                                "login_forms draft injected",
+                                {"deliverable": deliverable, "draft_len": len(draft)},
+                                "H4",
+                            )
+                        except Exception:
+                            pass
+                        # #endregion
+            except Exception:
+                pass
             if analysis.get("extracted_secrets"):
                 self._pcap_objective_met = True
             creds = str(analysis.get("potential_plaintext_credentials", ""))
@@ -687,12 +884,26 @@ class ReActAgent:
             "content": result_str,
         })
 
+        # Persist facts from successful recon/pcap tools.
+        try:
+            if isinstance(result, dict):
+                update_from_tool(self.session_id, tool_name, result, tool_args)
+        except Exception:
+            pass
+
         if self._mission_tracker:
             self._mission_tracker.register(tool_name, result, True, False)
 
         plan = getattr(self, "_task_plan", None)
         if plan and plan.steps:
             plan.register_tool(tool_name, result, tool_args)
+            try:
+                if plan.all_done:
+                    clear_plan_state(self.session_id)
+                else:
+                    save_plan_state(self.session_id, plan)
+            except Exception:
+                pass
             if plan.needs_readaptation():
                 note = plan.last_failure or "step failed"
                 plan.record_strategy(note)
@@ -707,20 +918,23 @@ class ReActAgent:
         if tool_name == "analyze_pcapng" and isinstance(result, dict) and result.get("success"):
             analysis = result.get("analysis") or {}
             if analysis.get("http_forms") or analysis.get("potential_plaintext_credentials"):
-                self.ctx_manager.add_message({
-                    "role": "user",
-                    "content": (
+                if "[CREDENTIAL DIGEST]" not in result_str:
+                    self.ctx_manager.add_message({
+                        "role": "user",
+                        "content": (
                         "[SYSTEM] PCAP credential fields are in the analyze_pcapng result above "
                         "(http_forms / potential_plaintext_credentials). Extract Username, Password, "
-                        "hash, and xmlObj/salt from those tables — then write_file pwd.txt and crack_hash."
-                    ),
-                })
+                        "hash, and xmlObj/salt — use grep_file on verbose_log for xml keys if missing. "
+                        "write_file the user-requested deliverable (e.g. login_forms.txt), then crack_hash."
+                        ),
+                    })
 
         if tool_name == "read_file" and isinstance(result, dict) and result.get("success"):
             if re.search(r"(login|password|xmlobj)", str(result.get("content", "")), re.I):
                 self._pcap_objective_met = True
 
-        return True, 1
+        success_exec = not (isinstance(result, dict) and result.get("success") is False)
+        return success_exec, (1 if success_exec else 0)
 
     # ── Mission loop ───────────────────────────────────────────────────────
 
@@ -741,6 +955,7 @@ class ReActAgent:
             self._init_system_prompt()
 
         self._cancel_event.clear()
+        self._anchor_query = user_prompt
         self._active_intent = TaskIntentExtractor.parse(user_prompt)
         self.ctx_manager.add_message({"role": "user", "content": user_prompt})
         self._mission_goals = ChatGoalRegistry.match_message(user_prompt)
@@ -780,6 +995,7 @@ class ReActAgent:
                     messages=self.ctx_manager.get_messages(),
                     tools_schema=tools.TOOLS_SCHEMA,
                     task_intent=self._active_intent,
+                    anchor_query=self._anchor_query,
                 )
             except Exception as e:
                 err = f"Ollama error: {e}"
@@ -951,10 +1167,11 @@ class ReActAgent:
                 reflection = self.retry_orchestrator.parser_reflection(content, self.parser)
 
                 if reflection:
+                    consecutive_empty = 0
                     logger.info("Parser reflection triggered (step %d)", step)
                     if step_callback:
                         step_callback("AGENT_THOUGHT", "[Parser reflection — self-correcting…]")
-                    
+
                     # Ensure the LLM sees its own faked tool call
                     last_msg = self.ctx_manager.get_messages()[-1]
                     if last_msg.get("role") == "assistant":
@@ -1041,6 +1258,7 @@ class ReActAgent:
 
         self.ctx_manager.save_state()
         self._active_intent = None
+        self._anchor_query = ""
         self._mission_goals = None
         self._mission_tools_executed = []
         self._mission_tracker = None
@@ -1071,14 +1289,17 @@ class ReActAgent:
             except Exception:
                 pass
 
+        raw_message = message
         # Detect confirmation phrases and add execution directive
         if any(w in message.lower() for w in
                ["yes", "ok", "do it", "go ahead", "execute", "proceed", "run it"]):
             message += "\n\n[SYSTEM DIRECTIVE: User confirmed. Execute the tool NOW. No prose.]"
 
         self.retry_orchestrator.reset()
-        self.parser.set_user_context(message)
+        self._anchor_query = raw_message
+        self.parser.set_user_context(raw_message)
         self._active_intent = TaskIntentExtractor.parse(message)
+        self._chat_tool_events = []
 
         deliverable_hint = ""
         if self._active_intent.deliverables:
@@ -1106,19 +1327,25 @@ class ReActAgent:
         self._chat_goals = chat_goals
         self._last_pcap_summary: str | None = None
         self._pcap_objective_met: bool = False
-        self._task_plan = TaskPlanTracker(message)
+        self._task_plan = load_plan_state(self.session_id) or TaskPlanTracker(message)
 
-        session_ctx = load_session_context_snippets(
+        session_snippet = load_session_context_snippets(
             self.app_root, self.workspace_root, session_id=self.session_id,
         )
-        if session_ctx:
-            self.ctx_manager.add_message({"role": "system", "content": session_ctx})
-
-        if self._task_plan.steps:
-            self.ctx_manager.add_message({
-                "role": "system",
-                "content": self._task_plan.status_block(),
-            })
+        from core.path_catalog import deliverable_hint_block
+        path_block = deliverable_hint_block(
+            self.session_id,
+            self._active_intent.deliverables if self._active_intent else [],
+        )
+        session_snippet = (
+            f"{session_snippet}\n\n{path_block}" if session_snippet else path_block
+        )
+        facts_hint = summarize_facts(self.session_id, max_chars=600)
+        if facts_hint:
+            if session_snippet:
+                session_snippet = f"{session_snippet}\n\n{facts_hint}"
+            else:
+                session_snippet = facts_hint
 
         if chat_goals and chat_goals.context_directive():
             self.ctx_manager.add_message({
@@ -1157,11 +1384,7 @@ class ReActAgent:
         for step in range(12):
             self._chat_tools_executed = list(tools_executed_names)
 
-            if self._task_plan.steps:
-                block = self._task_plan.status_block()
-                recent = self.ctx_manager.get_messages()[-3:]
-                if not any(block in str(m.get("content", "")) for m in recent):
-                    self.ctx_manager.add_message({"role": "system", "content": block})
+            plan_block = self._task_plan.status_block() if self._task_plan.steps else None
 
             self.ctx_manager.trim_context()
             # #region agent log
@@ -1173,7 +1396,7 @@ class ReActAgent:
                     {
                         "step": step,
                         "tools": list(tools_executed_names),
-                        "pending_goals": chat_goals.pending(tools_executed_names) if chat_goals else [],
+                        "pending_goals": chat_goals.pending(self._chat_tool_events) if chat_goals else [],
                         "task_done": self._task_plan.all_done if self._task_plan.steps else None,
                         "needs_readapt": self._task_plan.needs_readaptation() if self._task_plan.steps else False,
                     },
@@ -1186,6 +1409,9 @@ class ReActAgent:
                 messages=self.ctx_manager.get_messages(),
                 tools_schema=tools.TOOLS_SCHEMA,
                 task_intent=self._active_intent,
+                anchor_query=self._anchor_query,
+                session_snippet=session_snippet or None,
+                plan_block=plan_block,
             )
 
             msg     = response.get("message", {})
@@ -1237,7 +1463,7 @@ class ReActAgent:
                         ),
                     })
 
-                pending_goals = chat_goals.pending(tools_executed_names) if chat_goals else []
+                pending_goals = chat_goals.pending(self._chat_tool_events) if chat_goals else []
                 if pending_goals and goal_nudges < max_goal_nudges:
                     goal_nudges += 1
                     self.ctx_manager.add_message({
@@ -1277,7 +1503,7 @@ class ReActAgent:
             else:
                 consecutive_no_tool += 1
                 salvage = self.parser.salvage_tool_call(content, user_context=message)
-                pending_goals = chat_goals.pending(tools_executed_names) if chat_goals else []
+                pending_goals = chat_goals.pending(self._chat_tool_events) if chat_goals else []
 
                 if salvage and salvage["function"]["name"] != "sequentialthinking":
                     sname = salvage["function"]["name"]
@@ -1315,12 +1541,12 @@ class ReActAgent:
                         )
                         if boot:
                             tools_executed_names.extend(boot)
-                            pending_goals = chat_goals.pending(tools_executed_names)
-                    if chat_goals.pending(tools_executed_names):
+                            pending_goals = chat_goals.pending(self._chat_tool_events)
+                    if chat_goals.pending(self._chat_tool_events):
                         self.ctx_manager.add_message({
                             "role": "user",
                             "content": chat_goals.nudge_text(
-                                chat_goals.pending(tools_executed_names)
+                                chat_goals.pending(self._chat_tool_events)
                             ),
                         })
                         continue
@@ -1381,7 +1607,7 @@ class ReActAgent:
                         continue
 
                 if chat_goals and chat_goals.may_end_turn(
-                    tools_executed_names,
+                    self._chat_tool_events,
                     step,
                     objective_met=getattr(self, "_pcap_objective_met", False),
                 ) and self._task_plan.may_complete_turn(tools_executed_names, step):
@@ -1393,7 +1619,7 @@ class ReActAgent:
                             step=step,
                             tools_executed=len(tools_executed_names),
                             chat_goals_label=chat_goals.label,
-                            pending_goals=chat_goals.pending(tools_executed_names),
+                            pending_goals=chat_goals.pending(self._chat_tool_events),
                             hypothesis_id="A",
                         )
                     except Exception:
@@ -1422,7 +1648,7 @@ class ReActAgent:
                         if rname == "write_file" and rargs.get("path"):
                             paths_written.append(str(rargs["path"]).replace("\\", "/"))
                 else:
-                    pending_now = chat_goals.pending(tools_executed_names) if chat_goals else []
+                    pending_now = chat_goals.pending(self._chat_tool_events) if chat_goals else []
                     if pending_now and goal_nudges < max_goal_nudges:
                         self.ctx_manager.add_message({
                             "role": "user",
@@ -1473,6 +1699,7 @@ class ReActAgent:
         steps_run = (step + 1) if "step" in locals() else 0
         intent_snapshot = self._active_intent
         self._active_intent = None
+        self._anchor_query = ""
         self._chat_goals = None
         self._chat_tools_executed = []
         self._pcap_objective_met = False
@@ -1786,7 +2013,11 @@ class ReActAgent:
             response = await self.adapter.chat(
                 messages=self.ctx_manager.get_messages(),
                 tools_schema=None,
-                options={"temperature": 0.2},
+                options={
+                    "temperature": 0.2,
+                    "num_predict": self.num_predict_synthesis,
+                },
+                anchor_query=self._anchor_query,
             )
             final = response.get("message", {}).get("content", "Mission complete.")
         except Exception:

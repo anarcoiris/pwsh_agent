@@ -54,6 +54,7 @@ class TaskPlanTracker:
     steps: list[TaskStep] = field(default_factory=list)
     strategy_notes: list[str] = field(default_factory=list)
     last_failure: str = ""
+    evidence_seen: set[str] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         if not self.steps:
@@ -78,10 +79,13 @@ class TaskPlanTracker:
                 "analyze_pcapng|read_file",
             ))
 
-        if re.search(r"\b(pwd\.txt|save.*file|write.*file)\b", lower):
+        if re.search(r"\b(pwd\.txt|login_forms\.txt|save.*file|write.*file|file\s+named)\b", lower):
+            from core.task_intent import TaskIntentExtractor
+            dels = TaskIntentExtractor._extract_deliverables(prompt)
+            target = next((d for d in dels if d.endswith(".txt")), "pwd.txt")
             steps.append(TaskStep(
-                "write_pwd",
-                "Write extracted values to pwd.txt (no placeholders)",
+                "write_deliverable",
+                f"Write extracted values to {target} (no placeholders)",
                 "write_file",
             ))
 
@@ -122,6 +126,7 @@ class TaskPlanTracker:
         cur = self.current_step
         if cur and cur.status == StepStatus.PENDING:
             cur.status = StepStatus.IN_PROGRESS
+        evidence: set[str] = set()
 
         if tool_name == "write_file" and isinstance(result, dict) and result.get("success"):
             content = str((args or {}).get("content", ""))
@@ -132,7 +137,7 @@ class TaskPlanTracker:
                     "from PCAP/reports before writing."
                 )
                 for s in self.steps:
-                    if s.id == "write_pwd":
+                    if s.id == "write_deliverable":
                         s.status = StepStatus.FAILED
                         s.note = self.last_failure
                 if self.steps and self.steps[0].id == "extract_secrets":
@@ -149,11 +154,14 @@ class TaskPlanTracker:
                 return
 
         if tool_name in ("read_file", "analyze_pcapng") and isinstance(result, dict) and result.get("success"):
-            for s in self.steps:
-                if s.status == StepStatus.FAILED and s.id in ("extract_secrets", "read_context", "write_pwd"):
-                    s.status = StepStatus.PENDING
-                    s.note = ""
-            self.last_failure = ""
+            evidence = self._extract_evidence_markers(tool_name, result)
+            if evidence:
+                self.evidence_seen.update(evidence)
+                for s in self.steps:
+                    if s.status == StepStatus.FAILED and s.id in ("extract_secrets", "read_context", "write_deliverable"):
+                        s.status = StepStatus.PENDING
+                        s.note = ""
+                self.last_failure = ""
 
         for s in self.steps:
             if s.status in (StepStatus.DONE, StepStatus.SKIPPED):
@@ -165,11 +173,47 @@ class TaskPlanTracker:
                     s.note = str(result.get("error", "tool failed"))[:200]
                     self.last_failure = s.note
                 else:
-                    s.status = StepStatus.DONE
+                    if (
+                        s.id == "extract_secrets"
+                        and tool_name in ("read_file", "analyze_pcapng")
+                        and "cred_text" not in evidence
+                    ):
+                        s.status = StepStatus.FAILED
+                        s.note = "No credential/salt evidence in read/analyze output"
+                        self.last_failure = s.note
+                    else:
+                        s.status = StepStatus.DONE
                 break
 
     def needs_readaptation(self) -> bool:
         return any(s.status == StepStatus.FAILED for s in self.steps)
+
+    @staticmethod
+    def _extract_evidence_markers(tool_name: str, result: dict[str, Any]) -> set[str]:
+        markers: set[str] = set()
+        if tool_name == "read_file":
+            text = str(result.get("content", "")).lower()
+            if any(k in text for k in ("xmlobj", "password", "username", "login_entry", "_sessiontoken")):
+                markers.add("cred_text")
+            if re.search(r"\b[a-f0-9]{64}\b", text):
+                markers.add("sha256")
+            return markers
+
+        if tool_name == "analyze_pcapng":
+            analysis = result.get("analysis") if isinstance(result.get("analysis"), dict) else {}
+            blob = "\n".join(
+                str(analysis.get(k, ""))
+                for k in ("key_fields", "potential_plaintext_credentials", "http_forms", "packet_summary")
+            ).lower()
+            if any(k in blob for k in ("xmlobj", "password", "username", "login_entry")):
+                markers.add("cred_text")
+            if re.search(r"\b[a-f0-9]{64}\b", blob):
+                markers.add("sha256")
+            if analysis.get("verbose_log_file"):
+                markers.add("verbose_log")
+            return markers
+
+        return markers
 
     def record_strategy(self, note: str) -> None:
         line = note.strip()
@@ -218,6 +262,8 @@ class TaskPlanTracker:
             "A roadmap step failed or produced invalid output. Do NOT repeat the same action.",
             self.status_block(),
         ]
+        if self.evidence_seen:
+            parts.append(f"EVIDENCE SEEN: {', '.join(sorted(self.evidence_seen))}")
         if self.last_failure:
             parts.append(f"LAST FAILURE: {self.last_failure}")
         parts.append(
@@ -225,8 +271,10 @@ class TaskPlanTracker:
             "1) append_note a one-line strategy change to the session plan file.\n"
             "2) If analyze_pcapng already ran, parse credential fields from that tool result "
             "(http_forms, potential_plaintext_credentials) — do NOT guess report paths.\n"
-            "3) find_file report_*.md or read_file .pulse/pcap_logs/verbose_*.txt if values still missing.\n"
-            "4) write_file pwd.txt with REAL extracted values, then crack_hash."
+            "3) find_file('report_*.md') then read_file(path=<recommended>) — or read_file('report_*.md') directly.\n"
+            "4) find_file('verbose_*.txt') then grep_file(path=<recommended>, pattern='xmlObj|salt') "
+            "— or grep_file('.pulse/pcap_logs/verbose_*.txt', pattern=...) — or use pcap.verbose_log_file from SESSION FACTS.\n"
+            "5) write_file the user deliverable with REAL values from http_forms/key_fields, then crack_hash."
         )
         return "\n".join(p for p in parts if p)
 
@@ -241,56 +289,27 @@ class TaskPlanTracker:
 
 
 def load_session_context_snippets(
-    app_root: Path,
-    workspace_root: Path,
+    app_root_path: Path,
+    workspace_root_path: Path,
     session_id: str | None = None,
     max_chars: int = 1500,
 ) -> str:
-    """Load current session plan/status plus discoverable reports and PCAP logs."""
-    from core.session_paths import (
-        load_active_session_id,
-        plan_file,
-        status_file,
-        session_workspace_dir,
-        list_prior_artifact_snippets,
-    )
+    """Load session-scoped notes, reports, and PCAP logs (excludes legacy workspace/plan.md)."""
+    from core.path_catalog import session_context_paths, rel_path
+    from core.session_paths import load_active_session_id, list_prior_artifact_snippets
 
     sid = session_id or load_active_session_id()
     parts: list[str] = []
 
-    candidates: list[Path] = [
-        plan_file(sid),
-        status_file(sid),
-        session_workspace_dir(sid) / "pwd.txt",
-        workspace_root / "pwd.txt",
-        app_root / "workspace" / "pwd.txt",
-        workspace_root / "plan.md",
-        app_root / "workspace" / "plan.md",
-    ]
-
-    for root in (app_root, workspace_root):
-        for sub in ("output", "reports", "workspace/reports"):
-            d = root / sub
-            if d.is_dir():
-                candidates.extend(sorted(d.glob("report_*.md"), reverse=True)[:2])
-
-    pcap_dir = app_root / ".pulse" / "pcap_logs"
-    if pcap_dir.is_dir():
-        logs = sorted(pcap_dir.glob("verbose_*.txt"), reverse=True)
-        candidates.extend(logs[:1])
-
-    for path in candidates:
-        if not path.exists() or not path.is_file():
+    for label, path in session_context_paths(sid):
+        if not path.is_file():
             continue
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        try:
-            rel = path.resolve().relative_to(app_root.resolve()).as_posix()
-        except ValueError:
-            rel = path.name
-        parts.append(f"--- {rel} (head) ---\n{text[:400]}")
+        head = 350 if label.startswith("session_") else 400
+        parts.append(f"--- {label}: {rel_path(path)} ---\n{text[:head]}")
         if sum(len(p) for p in parts) > max_chars:
             break
 
@@ -301,3 +320,88 @@ def load_session_context_snippets(
     if not parts:
         return ""
     return "[SESSION CONTEXT — artifacts on disk]\n" + "\n\n".join(parts)[:max_chars]
+
+
+def _tracker_to_dict(tracker: TaskPlanTracker) -> dict[str, Any]:
+    return {
+        "prompt": tracker.prompt,
+        "steps": [
+            {
+                "id": s.id,
+                "label": s.label,
+                "tool_hint": s.tool_hint,
+                "status": s.status.value,
+                "note": s.note,
+            }
+            for s in tracker.steps
+        ],
+        "strategy_notes": list(tracker.strategy_notes),
+        "last_failure": tracker.last_failure,
+        "evidence_seen": sorted(tracker.evidence_seen),
+    }
+
+
+def _tracker_from_dict(data: dict[str, Any]) -> TaskPlanTracker:
+    tracker = TaskPlanTracker(data.get("prompt", ""))
+    tracker.steps = []
+    for raw in data.get("steps", []):
+        if not isinstance(raw, dict):
+            continue
+        status_raw = str(raw.get("status", StepStatus.PENDING.value))
+        try:
+            status = StepStatus(status_raw)
+        except ValueError:
+            status = StepStatus.PENDING
+        tracker.steps.append(TaskStep(
+            id=str(raw.get("id", "")),
+            label=str(raw.get("label", "")),
+            tool_hint=str(raw.get("tool_hint", "")),
+            status=status,
+            note=str(raw.get("note", "")),
+        ))
+    tracker.strategy_notes = list(data.get("strategy_notes", []))
+    tracker.last_failure = str(data.get("last_failure", ""))
+    tracker.evidence_seen = set(data.get("evidence_seen", []))
+    return tracker
+
+
+def save_plan_state(session_id: str, tracker: TaskPlanTracker) -> Path | None:
+    """Persist in-progress roadmap across turns."""
+    if not tracker.steps:
+        return None
+    from core.session_paths import plan_state_file
+
+    path = plan_state_file(session_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(_tracker_to_dict(tracker), indent=2), encoding="utf-8")
+    return path
+
+
+def load_plan_state(session_id: str) -> TaskPlanTracker | None:
+    """Load persisted roadmap if present and not fully complete."""
+    from core.session_paths import plan_state_file
+
+    path = plan_state_file(session_id)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return None
+        tracker = _tracker_from_dict(data)
+        if tracker.all_done:
+            return None
+        return tracker
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def clear_plan_state(session_id: str) -> None:
+    from core.session_paths import plan_state_file
+
+    path = plan_state_file(session_id)
+    try:
+        if path.is_file():
+            path.unlink()
+    except OSError:
+        pass

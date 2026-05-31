@@ -27,6 +27,23 @@ def test_find_file_tool():
     assert "last_capture.pcapng" in res["recommended"]
 
 
+def test_find_file_no_match_returns_error():
+    res = find_file("*xml*")
+    assert not res["success"]
+    assert res.get("error")
+    assert "Unknown" not in res["error"]
+    assert "grep_file" in res["error"].lower() or "verbose" in res["error"].lower()
+
+
+def test_find_file_prefers_output_reports():
+    res = find_file("report_*.md")
+    assert res["success"]
+    assert res["recommended"] is not None
+    assert "knowledge/tools/report_generate.md" in res["matches"]
+    # recommended should prefer actual report artifacts over playbook docs
+    assert res["recommended"].startswith("output/")
+
+
 def test_analyze_pcapng_resolves_basename():
     res = tools.analyze_pcapng("last_capture.pcapng", limit=2)
     assert res.get("success"), res.get("error", res)

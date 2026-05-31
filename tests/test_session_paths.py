@@ -9,6 +9,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.session_paths import (
     ensure_session_layout,
+    facts_file,
+    facts_rel,
     generate_session_id,
     normalize_note_path,
     plan_note_rel,
@@ -42,3 +44,9 @@ def test_generate_session_id_format():
     sid = generate_session_id()
     assert len(sid) == 15
     assert sid[8] == "_"
+
+
+def test_facts_paths():
+    sid = "20260531_120000"
+    assert facts_file(sid).name == "facts.json"
+    assert facts_rel(sid).endswith("/facts.json")

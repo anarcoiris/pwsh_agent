@@ -75,7 +75,11 @@ class ArgumentNormalizer:
 class ResultCompactor:
     """Intelligently compresses tool outputs while preserving semantic value."""
 
-    MAX_CHARS: int = 50_000
+    MAX_CHARS: int = 22_000
+
+    @classmethod
+    def configure_max_chars(cls, max_chars: int) -> None:
+        cls.MAX_CHARS = max(8_000, int(max_chars))
 
     @classmethod
     def compact(cls, tool_name: str, result: str) -> str:
@@ -326,26 +330,16 @@ class DynamicContextBuilder:
     _REPORT_TOOLS = {"finding_create", "finding_list"}
 
     @classmethod
-    def build_context(cls, messages: list) -> str:
-        user_msgs = [
-            m.get("content", "") for m in messages if m.get("role") == "user"
-        ]
-        latest = user_msgs[-1] if user_msgs else ""
-        latest_lower = latest.lower()
+    def build_context(cls, messages: list, anchor_query: str | None = None) -> str:
+        from core.query_anchor import resolve_anchor_query
+        from core.task_intent import detect_mission_kind
 
-        hash_task = bool(re.search(
-            r"(crack.*(?:sha-?)?256|(?:sha-?)?256.*hash|hash.*crack|brute.*force|\bcrack_hash\b|"
-            r"\bhaspro\b|\bhashpro\b)",
-            latest_lower,
-        ))
-        pcap_task = (
-            not hash_task
-            and bool(re.search(
-                r"(\.pcapng|\.pcap\b|\btshark\b|\bwireshark\b|last_capture|decode.*packet|"
-                r"analyze.*packet|http packet|login.*packet)",
-                latest_lower,
-            ))
-        )
+        latest = (anchor_query or "").strip() or resolve_anchor_query(messages)
+        latest_lower = latest.lower()
+        kind = detect_mission_kind(latest)
+
+        hash_task = kind == "hash"
+        pcap_task = kind == "pcap"
 
         # #region agent log
         try:
@@ -381,24 +375,7 @@ class DynamicContextBuilder:
             )
 
         # Development / file tasks — override default recon bias
-        skip_network = bool(re.search(
-            r"(do not|don't|no)\s+.*(network|recon|scan|port)|focus (?:only )?on|watcher\.py",
-            latest_lower,
-        ))
-        dev_task = bool(re.search(
-            r"\b(write|script|python|\.py|\.ps1|\.md|folder|save|create|implement|code|watcher)\b",
-            latest_lower,
-        )) or (
-            bool(re.search(r"\b(read|review)\b", latest_lower))
-            and not pcap_task
-            and not bool(re.search(r"\bfile named\b", latest_lower))
-        )
-        explicit_recon = bool(re.search(
-            r"\b(scan|recon|capture|pcap|cve|dns|ping|port_scan|network interface)\b",
-            latest_lower,
-        ))
-
-        if (skip_network or dev_task) and not explicit_recon:
+        if kind == "dev":
             return (
                 "\n[CURRENT PHASE: DEVELOPMENT / FILE TASK]\n"
                 "The user wants coding, reading, or writing files — NOT network recon.\n"

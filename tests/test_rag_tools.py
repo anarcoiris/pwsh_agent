@@ -35,6 +35,12 @@ def test_retrieve_for_tools_run_script():
     assert "run_script" in result.lower() or ".py" in result.lower()
 
 
+def test_rag_results_include_anchor_reference():
+    rag = LocalRAG()
+    result = rag.retrieve_for_tools(["analyze_pcapng"], "pcap login xmlobj", max_chars=2000)
+    assert "#" in result
+
+
 def test_recursive_tools_directory():
     rag = LocalRAG()
     files = {s["file"] for s in rag.sections}

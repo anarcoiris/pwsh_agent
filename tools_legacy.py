@@ -12,9 +12,14 @@ _WIN_SUBPROCESS_FLAGS = (
 
 
 def _subprocess_run_kwargs() -> dict:
+    # stdin=DEVNULL: under pytest (or any host that replaces std handles with
+    # non-inheritable objects) a child that inherits an invalid stdin handle
+    # fails on Windows with "[WinError 6] The handle is invalid". Non-interactive
+    # tools (tshark, helper scripts) never read stdin, so DEVNULL is always safe.
+    kwargs: dict = {"stdin": subprocess.DEVNULL}
     if _WIN_SUBPROCESS_FLAGS:
-        return {"creationflags": _WIN_SUBPROCESS_FLAGS}
-    return {}
+        kwargs["creationflags"] = _WIN_SUBPROCESS_FLAGS
+    return kwargs
 
 # ==========================================
 # 1. Sequential Thinking Engine
@@ -327,7 +332,12 @@ def read_file(path: str, line_start: int = 1, line_count: int = None) -> dict:
         line_count: Number of lines to read from the file. If None, reads the entire file.
     """
     try:
-        file_path = Path(path).resolve()
+        from core.path_catalog import resolve_read_target
+
+        resolved, resolve_err = resolve_read_target(path)
+        if resolve_err:
+            return {"success": False, "error": resolve_err}
+        file_path = resolved if resolved else Path(path).resolve()
         if not file_path.exists():
             return {"success": False, "error": f"File '{path}' does not exist."}
         if not file_path.is_file():
@@ -385,17 +395,144 @@ def read_file(path: str, line_start: int = 1, line_count: int = None) -> dict:
         return {"success": False, "error": str(e)}
 
 
-def write_file(path: str, content: str) -> dict:
+def grep_file(
+    path: str,
+    pattern: str,
+    max_matches: int = 50,
+    context_lines: int = 0,
+    case_insensitive: bool = False,
+) -> dict:
+    """
+    Search a file for matching lines and return compact, line-numbered matches.
+    Useful for verbose logs/artifacts when read_file chunking is too broad.
+    """
+    try:
+        from core.path_catalog import resolve_read_target
+
+        resolved, resolve_err = resolve_read_target(path)
+        if resolve_err:
+            return {"success": False, "error": resolve_err}
+        file_path = resolved if resolved else Path(path).resolve()
+        if not file_path.exists():
+            return {"success": False, "error": f"File '{path}' does not exist."}
+        if not file_path.is_file():
+            return {"success": False, "error": f"'{path}' is not a file."}
+        if not pattern:
+            return {"success": False, "error": "pattern is required."}
+        max_matches = max(1, min(int(max_matches), 500))
+        context_lines = max(0, min(int(context_lines), 20))
+
+        flags = re.IGNORECASE if case_insensitive else 0
+        rx = re.compile(pattern, flags)
+        lines = file_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        out: list[dict] = []
+        for idx, line in enumerate(lines, start=1):
+            if not rx.search(line):
+                continue
+            start = max(1, idx - context_lines)
+            end = min(len(lines), idx + context_lines)
+            ctx = [
+                {"line": ln, "text": lines[ln - 1]}
+                for ln in range(start, end + 1)
+            ]
+            out.append({"line": idx, "text": line, "context": ctx})
+            if len(out) >= max_matches:
+                break
+
+        return {
+            "success": True,
+            "path": str(file_path),
+            "pattern": pattern,
+            "matches": out,
+            "truncated": len(out) >= max_matches,
+            "match_count": len(out),
+            "total_lines": len(lines),
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def find_and_grep(
+    pattern: str,
+    path_glob: str = ".pulse/pcap_logs/verbose_*.txt",
+    max_files: int = 5,
+    max_matches_per_file: int = 20,
+    context_lines: int = 0,
+    case_insensitive: bool = False,
+) -> dict:
+    """
+    Search multiple files matched by a filename glob for regex matches.
+    Combines find_file ranking with grep_file per matched file.
+    """
+    try:
+        if not pattern:
+            return {"success": False, "error": "pattern is required."}
+        max_files = max(1, min(int(max_files), 20))
+        max_matches_per_file = max(1, min(int(max_matches_per_file), 200))
+
+        res = find_file(path_glob)
+        if not res.get("success"):
+            return {
+                "success": False,
+                "error": res.get("error") or f"No files matched '{path_glob}'.",
+                "files_searched": [],
+            }
+
+        ranked = res.get("matches") or []
+        if res.get("recommended") and res["recommended"] in ranked:
+            ranked = [res["recommended"]] + [m for m in ranked if m != res["recommended"]]
+        elif res.get("recommended"):
+            ranked = [res["recommended"]] + ranked
+
+        file_results: list[dict] = []
+        total_matches = 0
+        for rel in ranked[:max_files]:
+            hit = grep_file(
+                rel,
+                pattern,
+                max_matches=max_matches_per_file,
+                context_lines=context_lines,
+                case_insensitive=case_insensitive,
+            )
+            if hit.get("success") and hit.get("match_count", 0) > 0:
+                file_results.append({
+                    "path": rel,
+                    "match_count": hit.get("match_count", 0),
+                    "matches": hit.get("matches", []),
+                    "truncated": hit.get("truncated", False),
+                })
+                total_matches += hit.get("match_count", 0)
+
+        return {
+            "success": True,
+            "pattern": pattern,
+            "path_glob": path_glob,
+            "files_searched": ranked[:max_files],
+            "files_with_matches": len(file_results),
+            "total_matches": total_matches,
+            "results": file_results,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def write_file(path: str, content: str, session_id: str | None = None, deliverables: list[str] | None = None) -> dict:
     """
     Writes or overwrites a local file with the specified content.
     
     Args:
         path: Path to the file.
         content: The text content to write to the file.
+        session_id: Active session (bare deliverable names route to session workspace).
+        deliverables: Optional deliverable filenames from task intent.
     """
     try:
-        file_path = Path(path).resolve()
-        # Create directories if they do not exist
+        from core.path_catalog import resolve_write_target
+        from core.session_paths import load_active_session_id, ensure_session_layout
+
+        sid = session_id or load_active_session_id()
+        ensure_session_layout(sid)
+        file_path = resolve_write_target(path, sid, deliverables)
         file_path.parent.mkdir(parents=True, exist_ok=True)
 
         original_len = len(content)
@@ -404,7 +541,7 @@ def write_file(path: str, content: str) -> dict:
             content, sanitize_changes = _sanitize_powershell_content(content)
 
         file_path.write_text(content, encoding="utf-8")
-        msg = f"Successfully wrote to file '{path}'"
+        msg = f"Successfully wrote to file '{file_path}'"
         if sanitize_changes:
             msg += f" (PowerShell sanitizer applied {sanitize_changes} fix(es))"
         return {"success": True, "message": msg, "sanitize_changes": sanitize_changes}
@@ -1266,6 +1403,55 @@ TOOLS_SCHEMA = [
                     "name": {"type": "string", "description": "Filename to search for (e.g. last_capture.pcapng)."},
                 },
                 "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "grep_file",
+            "description": (
+                "Search a local file for regex/text matches with optional context lines. "
+                "Use for targeted retrieval from verbose logs/artifacts instead of broad read_file chunks."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path to search."},
+                    "pattern": {"type": "string", "description": "Regex pattern to match."},
+                    "max_matches": {"type": "integer", "description": "Maximum matches to return (default 50)."},
+                    "context_lines": {"type": "integer", "description": "Lines of context around each match (default 0)."},
+                    "case_insensitive": {"type": "boolean", "description": "Enable case-insensitive matching."},
+                },
+                "required": ["path", "pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_and_grep",
+            "description": (
+                "Search multiple files matched by a filename glob for regex matches. "
+                "Use when xmlObj/credentials may appear in any verbose log under .pulse/pcap_logs/."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Regex pattern to match."},
+                    "path_glob": {
+                        "type": "string",
+                        "description": "Filename glob (default .pulse/pcap_logs/verbose_*.txt).",
+                    },
+                    "max_files": {"type": "integer", "description": "Max files to search (default 5)."},
+                    "max_matches_per_file": {
+                        "type": "integer",
+                        "description": "Max matches per file (default 20).",
+                    },
+                    "context_lines": {"type": "integer", "description": "Context lines per match (default 0)."},
+                    "case_insensitive": {"type": "boolean", "description": "Case-insensitive matching."},
+                },
+                "required": ["pattern"],
             },
         },
     },

@@ -78,6 +78,7 @@ class LocalRAG:
                 parts = re.split(r"(?=(?:^|\n)#+\s+)", content)
                 doc_title = path.stem.replace("_", " ").title()
                 rel = path.relative_to(self.knowledge_dir)
+                rel_norm = str(rel).replace("\\", "/")
 
                 for part in parts:
                     part = part.strip()
@@ -85,16 +86,25 @@ class LocalRAG:
                         continue
                     title_match = re.match(r"^#+\s+(.+)", part)
                     sec_title = title_match.group(1).strip() if title_match else "General Reference"
-                    tokens = self._tokenize(part)
-                    self.sections.append({
-                        "file": str(rel).replace("\\", "/"),
-                        "doc_title": doc_title,
-                        "section_title": sec_title,
-                        "content": part,
-                        "tokens": tokens,
-                        "tools": list(file_tools),
-                        "phase": list(file_phase),
-                    })
+                    section_slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", sec_title.lower()).strip("-") or "section"
+                    paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", part) if p.strip()]
+                    if not paragraphs:
+                        paragraphs = [part]
+                    for idx, para in enumerate(paragraphs, start=1):
+                        chunk = para
+                        tokens = self._tokenize(chunk)
+                        anchor = f"{rel_norm}#{section_slug}-{idx}"
+                        self.sections.append({
+                            "file": rel_norm,
+                            "doc_title": doc_title,
+                            "section_title": sec_title,
+                            "anchor": anchor,
+                            "paragraph_index": idx,
+                            "content": chunk,
+                            "tokens": tokens,
+                            "tools": list(file_tools),
+                            "phase": list(file_phase),
+                        })
             except Exception:
                 pass
 
@@ -148,7 +158,7 @@ class LocalRAG:
         total_len = 0
         for _score, sec in scored:
             formatted = (
-                f"--- REFERENCE: {sec['doc_title']} -> {sec['section_title']} ---\n"
+                f"--- REFERENCE: {sec['doc_title']} -> {sec['section_title']} ({sec.get('anchor', sec.get('file', ''))}) ---\n"
                 f"{sec['content']}\n"
             )
             if total_len + len(formatted) > max_chars:

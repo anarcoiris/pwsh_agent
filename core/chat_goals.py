@@ -91,8 +91,29 @@ class ChatGoals:
 
     # ── Core API ─────────────────────────────────────────────────────────
 
-    def pending(self, executed: list[str]) -> list[str]:
-        done = set(executed)
+    @staticmethod
+    def _successful_names(executed: list[Any]) -> set[str]:
+        """
+        Normalize executed-tool tracking into a set of successful tool names.
+        Accepts:
+        - ["read_file", "analyze_pcapng"]
+        - [{"name": "read_file", "success": True}, ...]
+        """
+        done: set[str] = set()
+        for item in executed or []:
+            if isinstance(item, str):
+                done.add(item)
+                continue
+            if isinstance(item, dict):
+                name = str(item.get("name", "")).strip()
+                if not name:
+                    continue
+                if item.get("success", True):
+                    done.add(name)
+        return done
+
+    def pending(self, executed: list[Any]) -> list[str]:
+        done = self._successful_names(executed)
         return [t for t in self.required_tools if t not in done]
 
     def is_pcap_goal(self) -> bool:
@@ -101,20 +122,21 @@ class ChatGoals:
     def allows_iterative(self, tool_name: str) -> bool:
         return tool_name in self.iterative_tools
 
-    def is_workflow_complete(self, executed: list[str], objective_met: bool = False) -> bool:
+    def is_workflow_complete(self, executed: list[Any], objective_met: bool = False) -> bool:
         """
         PCAP workflows need multiple analyze_pcapng/read_file passes with different
         filters — do not treat the first analyze_pcapng as turn-complete.
         """
         if self.is_pcap_goal():
-            if "analyze_pcapng" not in executed:
+            done = self._successful_names(executed)
+            if "analyze_pcapng" not in done:
                 return False
             return bool(objective_met)
         return not self.pending(executed)
 
     def may_end_turn(
         self,
-        executed: list[str],
+        executed: list[Any],
         step: int,
         objective_met: bool = False,
         min_steps: int = 2,
@@ -128,7 +150,8 @@ class ChatGoals:
             if not objective_met:
                 return False
             # Require at least two substantive PCAP passes (e.g. index + decode/read).
-            pcap_depth = sum(1 for t in executed if t in ("analyze_pcapng", "read_file"))
+            done = self._successful_names(executed)
+            pcap_depth = sum(1 for t in done if t in ("analyze_pcapng", "read_file"))
             return pcap_depth >= 2
         return step >= min_steps
 
@@ -364,20 +387,59 @@ def _build_hashcrack_goal(message: str, session: list[dict] | None) -> ChatGoals
 
     hints["context_directive"] = hash_planning_directive(hints)
 
-    # Multi-step: extract from PCAP/reports → pwd.txt → crack_hash
-    if re.search(r"\b(pwd\.txt|save.*values|extract.*pcap|read.*report|read.*plan)\b", lower):
+    # Multi-step: extract from PCAP/reports → deliverable file → crack_hash
+    if re.search(
+        r"\b(pwd\.txt|login_forms\.txt|save.*values|extract.*pcap|read.*report|read.*plan|find.*report)\b",
+        lower,
+    ):
+        deliverables = TaskIntentExtractor._extract_deliverables(message)
+        out_path = "pwd.txt"
+        for d in deliverables:
+            if "login_forms" in d.lower():
+                out_path = d
+                break
+        else:
+            for d in deliverables:
+                if d.endswith(".txt"):
+                    out_path = d
+                    break
+        hints["deliverable_path"] = out_path
+        xml_hint = ""
+        if re.search(r"\bxml\b|xmlobj|salt", lower):
+            xml_hint = (
+                " For XML/salt: find_file('verbose_*.txt') then grep_file(path=<recommended>, pattern='xmlObj|salt') "
+                "or grep_file('.pulse/pcap_logs/verbose_*.txt', pattern='xmlObj|salt'). "
+                "find_file matches filenames only — use grep_file for packet/XML content."
+            )
         hints["context_directive"] = (
             hints.get("context_directive", "")
-            + "\n[ROADMAP] 1) read_file reports/plan/pcap logs 2) extract REAL user/password/xmlObj/salt "
-            "3) write_file pwd.txt with extracted values (NO placeholders) 4) crack_hash."
+            + f"\n[ROADMAP] 1) find_file('report_*.md') + read_file, or analyze_pcapng on last_capture.pcapng (verbose=true, http filter) "
+            f"2) grep_file on verbose log for xmlObj/salt if needed "
+            f"3) write_file path='{out_path}' with REAL user/password/xmlObj/salt (NO placeholders) "
+            f"4) crack_hash.{xml_hint}"
         )
+        # #region agent log
+        try:
+            from core.debug_log import debug_log
+            debug_log(
+                "chat_goals.py:_build_hashcrack_goal",
+                "multi-step hash goal",
+                {"out_path": out_path, "deliverables": deliverables},
+                "H3",
+            )
+        except Exception:
+            pass
+        # #endregion
+        iterative = ["read_file", "analyze_pcapng", "write_file", "find_file"]
+        if re.search(r"\bxml\b|xmlobj|salt", lower):
+            iterative.append("grep_file")
         return ChatGoals(
             required_tools=["read_file", "analyze_pcapng", "write_file", "crack_hash"],
-            iterative_tools=["read_file", "analyze_pcapng", "write_file"],
+            iterative_tools=iterative,
             label="Extract credentials and crack hash",
             hints=hints,
             blocked_tools=["encode_decode"],
-            blocked_reason="Use read_file/analyze_pcapng for real values — not encode_decode.",
+            blocked_reason="Use read_file/analyze_pcapng/grep_file for real values — not encode_decode.",
         )
 
     return ChatGoals(
@@ -442,6 +504,14 @@ class ChatGoalGuard:
 
         if pending:
             if tool_name == "append_note":
+                if "write_file" in pending:
+                    deliverable = goals.hints.get("deliverable_path", "login_forms.txt")
+                    return tool_name, args, (
+                        f"Blocked: deliverable '{deliverable}' not written yet. "
+                        "Parse http_forms from the last analyze_pcapng result and "
+                        f"write_file(path='{deliverable}', content=<REAL values>) — "
+                        "no more strategy append_note until the file exists."
+                    )
                 if strategy_note:
                     return tool_name, args, None
                 return tool_name, args, (

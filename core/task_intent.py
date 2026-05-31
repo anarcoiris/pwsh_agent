@@ -10,6 +10,17 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
+
+MissionKind = Literal["hash", "pcap", "dev", "recon", "general"]
+
+
+def _is_credential_deliverable(rel_path: str) -> bool:
+    lower = rel_path.replace("\\", "/").lower()
+    return any(
+        k in lower
+        for k in ("pwd.txt", "login_forms.txt", "login_forms", "credentials.txt")
+    )
 
 
 def _pwd_file_is_placeholder(path: Path) -> bool:
@@ -34,11 +45,49 @@ _CODE_MARKERS = re.compile(
 )
 
 
+def detect_mission_kind(text: str) -> MissionKind:
+    """Classify mission from user text (shared with DynamicContextBuilder)."""
+    lower = (text or "").lower()
+    if re.search(
+        r"(crack.*(?:sha-?)?256|(?:sha-?)?256.*hash|hash.*crack|brute.*force|\bcrack_hash\b|"
+        r"\bhaspro\b|\bhashpro\b)",
+        lower,
+    ):
+        return "hash"
+    if re.search(
+        r"(\.pcapng|\.pcap\b|\btshark\b|\bwireshark\b|last_capture|decode.*packet|"
+        r"analyze.*packet|http packet|login.*packet)",
+        lower,
+    ):
+        return "pcap"
+    skip_network = bool(re.search(
+        r"(do not|don't|no)\s+.*(network|recon|scan|port)|focus (?:only )?on|watcher\.py",
+        lower,
+    ))
+    dev_task = bool(re.search(
+        r"\b(write|script|python|\.py|\.ps1|\.md|folder|save|create|implement|code|watcher)\b",
+        lower,
+    )) or (
+        bool(re.search(r"\b(read|review)\b", lower))
+        and not bool(re.search(r"\bfile named\b", lower))
+    )
+    explicit_recon = bool(re.search(
+        r"\b(scan|recon|capture|pcap|cve|dns|ping|port_scan|network interface)\b",
+        lower,
+    ))
+    if (skip_network or dev_task) and not explicit_recon:
+        return "dev"
+    if explicit_recon:
+        return "recon"
+    return "general"
+
+
 @dataclass
 class TaskIntent:
     deliverables: list[str] = field(default_factory=list)
     is_dev_task: bool = False
     forbid_network: bool = False
+    mission_kind: MissionKind = "general"
 
     def pending_deliverables(self, workspace_root: Path | None = None) -> list[str]:
         """Return deliverable paths that do not yet exist on disk."""
@@ -59,7 +108,7 @@ class TaskIntent:
             for p in candidates:
                 try:
                     if p.exists() and p.is_file() and p.stat().st_size > 0:
-                        if "pwd.txt" in rel_norm.lower() and _pwd_file_is_placeholder(p):
+                        if _is_credential_deliverable(rel_norm) and _pwd_file_is_placeholder(p):
                             found = False
                             break
                         found = True
@@ -93,6 +142,7 @@ class TaskIntentExtractor:
             deliverables=deliverables,
             is_dev_task=is_dev,
             forbid_network=forbid_network,
+            mission_kind=detect_mission_kind(msg),
         )
 
     @classmethod
@@ -105,6 +155,14 @@ class TaskIntentExtractor:
 
         if folder_m and script_m:
             found.append(f"{folder_m.group(1)}/{script_m.group(1)}")
+
+        named_m = re.search(
+            r"file\s+named\s+['\"]?([^'\"]+\.(?:txt|md|py|ps1))['\"]?",
+            message,
+            re.I,
+        )
+        if named_m:
+            found.append(named_m.group(1).replace("\\", "/"))
 
         for m in re.finditer(r"([\w./\\-]+\.(?:py|ps1|md|txt))", message, re.I):
             path = m.group(1).replace("\\", "/")
