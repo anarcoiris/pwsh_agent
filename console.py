@@ -22,6 +22,8 @@ class AgentConsole:
         self.agent = agent.ReActAgent()
         self.is_running = True
         self._active_status = None
+        console_cfg = self.agent.config.get("console", {})
+        self.submit_binding = console_cfg.get("submit_binding", "ctrl-enter")
 
     def display_banner(self):
         """Displays a beautiful, hacker-style retro ANSI banner."""
@@ -124,10 +126,39 @@ class AgentConsole:
             if self._active_status:
                 self._active_status.start()
 
+    def _build_prompt_session(self) -> tuple[PromptSession, bool, str]:
+        """Configure the prompt session from the console submit_binding setting.
+
+        Returns (session, multiline, submit_hint).
+        """
+        from prompt_toolkit.key_binding import KeyBindings
+
+        binding = (self.submit_binding or "ctrl-enter").lower()
+
+        if binding == "enter":
+            # Single-line submit on Enter — no multiline buffer.
+            return PromptSession(), False, "Press Enter to submit"
+
+        if binding == "ctrl-enter":
+            kb = KeyBindings()
+            try:
+                @kb.add("c-j")  # Ctrl+Enter sends c-j in most terminals
+                def _submit(event):
+                    event.current_buffer.validate_and_handle()
+                return PromptSession(key_bindings=kb), True, "Press Ctrl+Enter to submit"
+            except Exception:
+                console.print(
+                    "[yellow]⚠ Ctrl+Enter binding not supported — using Esc then Enter.[/yellow]"
+                )
+                return PromptSession(), True, "Press Esc then Enter to submit"
+
+        # "esc-enter" (and any unknown value) → prompt_toolkit multiline default.
+        return PromptSession(), True, "Press Esc then Enter to submit"
+
     async def run_repl(self):
         """Active menu and command-driven console loop."""
         self.display_banner()
-        prompt_session = PromptSession()
+        prompt_session, multiline_mode, submit_hint = self._build_prompt_session()
         
         while self.is_running:
             # Build colorized badges for active settings
@@ -192,8 +223,8 @@ class AgentConsole:
                     console.print(f"[bold green]✔ Persona shifted successfully to: {active_spec.upper()}[/bold green]\n")
                     
                 elif cmd == "mission":
-                    console.print("[bold green]Enter mission objective[/bold green] [dim](Press Esc then Enter to submit)[/dim]")
-                    objective = await prompt_session.prompt_async(">>> ", multiline=True)
+                    console.print(f"[bold green]Enter mission objective[/bold green] [dim]({submit_hint})[/dim]")
+                    objective = await prompt_session.prompt_async(">>> ", multiline=multiline_mode)
                     if not objective.strip():
                         continue
                     
@@ -217,8 +248,8 @@ class AgentConsole:
                     console.print()
 
                 elif cmd == "chat":
-                    console.print("[bold green]Chat with Agent[/bold green] [dim](Press Esc then Enter to submit)[/dim]")
-                    message = await prompt_session.prompt_async(">>> ", multiline=True)
+                    console.print(f"[bold green]Chat with Agent[/bold green] [dim]({submit_hint})[/dim]")
+                    message = await prompt_session.prompt_async(">>> ", multiline=multiline_mode)
                     if not message.strip():
                         continue
 

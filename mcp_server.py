@@ -85,7 +85,7 @@ def crack_hash(
     wordlist: str = None,
     cpu_workers: int = None,
     no_gpu: bool = False,
-    timeout: int = 180
+    timeout: int = 1200
 ) -> dict:
     """
     Cracks a SHA-256 target hash using the high-performance CPU+GPU hash_pro7.py tool via a robust non-interactive runner.

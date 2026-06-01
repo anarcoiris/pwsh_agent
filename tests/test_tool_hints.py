@@ -19,6 +19,13 @@ def test_parse_salt_and_prefix():
     assert "salt=" in format_crack_hash_call(h)
 
 
+def test_parse_complex_mask():
+    msg = "crack this password which represents 1 upper, 7 lower, 2 digits, and 2 punctuation characters"
+    h = parse_hash_crack_hints(msg)
+    assert h.get("mask") == "ULLLLLLLNN!!"
+
+
+
 def test_pcap_login_xml_filter():
     h = parse_pcap_analysis_hints("decode http packets with login and xmlobj")
     assert "http" in h["filter_expression"]
@@ -32,6 +39,7 @@ def test_pcap_frame_number():
 
 if __name__ == "__main__":
     test_parse_salt_and_prefix()
+    test_parse_complex_mask()
     test_pcap_login_xml_filter()
     test_pcap_frame_number()
     print("All tool_hints tests passed.")

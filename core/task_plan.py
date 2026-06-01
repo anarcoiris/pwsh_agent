@@ -16,6 +16,7 @@ class StepStatus(str, Enum):
     DONE = "done"
     FAILED = "failed"
     SKIPPED = "skipped"
+    PARTIAL = "partial"  # bounded terminal (e.g. search space exhausted)
 
 
 @dataclass
@@ -190,7 +191,15 @@ class TaskPlanTracker:
                 return
 
         if tool_name == "crack_hash" and isinstance(result, dict):
-            if result.get("success") is False or result.get("status") == "exhausted":
+            if result.get("status") == "exhausted":
+                # Search space fully explored — bounded terminal, not a failure
+                for s in self.steps:
+                    if s.id == "crack_hash":
+                        s.status = StepStatus.PARTIAL
+                        s.note = "Search space exhausted without match"
+                return
+            if result.get("success") is False:
+                # Genuine tool error (bad args, launcher missing)
                 self.last_failure = str(result.get("error") or result.get("stderr") or "crack_hash failed")
                 for s in self.steps:
                     if s.id == "crack_hash":
@@ -231,6 +240,7 @@ class TaskPlanTracker:
                 break
 
     def needs_readaptation(self) -> bool:
+        # PARTIAL is intentionally excluded — it is a valid terminal outcome.
         return any(s.status == StepStatus.FAILED for s in self.steps)
 
     @staticmethod
@@ -288,6 +298,7 @@ class TaskPlanTracker:
                 StepStatus.DONE: "[x]",
                 StepStatus.FAILED: "[!]",
                 StepStatus.SKIPPED: "[-]",
+                StepStatus.PARTIAL: "[≈]",
             }[s.status]
             line = f"{mark} {s.label} (tool: {s.tool_hint})"
             if s.note:
@@ -350,7 +361,8 @@ class TaskPlanTracker:
             return step_index >= min_steps
         if self.needs_readaptation():
             return False
-        if not self.all_done:
+        terminal = {StepStatus.DONE, StepStatus.PARTIAL, StepStatus.SKIPPED}
+        if not all(s.status in terminal for s in self.steps):
             return False
         return step_index >= min_steps
 

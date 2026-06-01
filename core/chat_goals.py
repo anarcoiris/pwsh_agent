@@ -490,12 +490,26 @@ def _build_hashcrack_goal(message: str, session: list[dict] | None) -> ChatGoals
                 "— searches multiple verbose logs (hex-encoded fields need broad patterns like 'xml', not only 'xmlObj'). "
                 "If http filter missed salt, re-run analyze_pcapng with filter_expression='xml'."
             )
+        wants_reports = bool(
+            re.search(r"\b(report|latest|previous|prior)\b", lower)
+        )
+        if wants_reports:
+            step1 = (
+                "1) find_file('report_*.md') + read_file, or analyze_pcapng on last_capture.pcapng "
+                "(verbose=true; try filter 'xml' if 'http' misses salt) "
+            )
+        else:
+            step1 = (
+                "1) analyze_pcapng on last_capture.pcapng (verbose=true; filter 'http' then 'xml' if salt missing) "
+                "— do NOT read unrelated engagement reports from output/ unless the user asked for reports. "
+            )
         hints["context_directive"] = (
             hints.get("context_directive", "")
-            + f"\n[ROADMAP] 1) find_file('report_*.md') + read_file, or analyze_pcapng on last_capture.pcapng (verbose=true; try filter 'xml' if 'http' misses salt) "
-            f"2) find_and_grep across verbose logs (NOT single-file grep only) "
-            f"3) crack_hash with each Password hash + its xmlObj salt (sha256(password+salt)) "
-            f"4) write_file path='{out_path}' with hash, salt, AND cracked plaintext results.{xml_hint}"
+            + f"\n[ROADMAP] {step1}"
+            f"2) find_and_grep across .pulse/pcap_logs/verbose_*.txt (NOT grep on spilled artifacts) "
+            f"3) crack_hash each Password hash + xmlObj salt (sha256(password+salt)); "
+            "if NNNNNNNAA! exhausts, retry with broader masks (e.g. ULLLLLLLNN!!, ?????????). "
+            f"4) write_file path='{out_path}' with hash, salt, AND cracked/plaintext or NOT CRACKED per hash.{xml_hint}"
         )
         # #region agent log
         try:
@@ -542,14 +556,35 @@ def _build_hashcrack_goal(message: str, session: list[dict] | None) -> ChatGoals
     )
 
 
+# Only tools that are unambiguously forensic/credential work (read_file excluded —
+# it fires on virtually any session and made the credential goal over-trigger).
+_CREDENTIAL_TOOLS = frozenset({
+    "analyze_pcapng",
+    "grep_file",
+    "find_and_grep",
+    "crack_hash",
+})
+
+# Dev/coding/planning intent — credential goals must not fire on these even when the
+# message contains intent-neutral words like login/xml/filter.
+_DEV_INTENT_RE = re.compile(
+    r"\b(write|script|python|\.py|code|implement|create|build|plan|options?|review)\b",
+    re.I,
+)
+
+
 def _session_had_credential_work(session: list[dict]) -> bool:
     for msg in reversed((session or [])[-50:]):
         if msg.get("role") != "tool":
             continue
-        if msg.get("name") in (
-            "analyze_pcapng", "grep_file", "find_and_grep",
-            "crack_hash", "write_file", "read_file",
-        ):
+        if msg.get("name") in _CREDENTIAL_TOOLS:
+            # Also require that the tool succeeded (not just that it was called).
+            try:
+                payload = json.loads(msg.get("content", "{}"))
+                if isinstance(payload, dict) and payload.get("success") is False:
+                    continue
+            except Exception:
+                pass
             return True
     return False
 
@@ -559,6 +594,9 @@ def _build_credential_session_goal(message: str, session: list[dict] | None) -> 
     if session is None:
         return None
     if not _CREDENTIAL_SESSION_RE.search(message or ""):
+        return None
+    # Do not fire if the prompt is primarily a dev/coding/planning request.
+    if _DEV_INTENT_RE.search(message or ""):
         return None
     if not _session_had_credential_work(session):
         return None
@@ -588,6 +626,10 @@ def _build_credential_session_goal(message: str, session: list[dict] | None) -> 
 # ──────────────────────────────────────────────────────────────────────────────
 # Register all goal templates
 # ──────────────────────────────────────────────────────────────────────────────
+#
+# GATING POLICY: Hard required_tools are ONLY attached to credential/pcap/forensic
+# goals (or when the user explicitly names a tool). For conversational, coding, and
+# analysis intents, match_message() must return None so tool use remains optional.
 
 # PCAP — priority 10 (most specific, many regex patterns)
 ChatGoalRegistry.register(
@@ -639,6 +681,20 @@ class ChatGoalGuard:
         strategy_note: bool = False,
     ) -> tuple[str, dict[str, Any], str | None]:
         if not goals:
+            # #region agent log
+            if tool_name == "sequentialthinking":
+                try:
+                    from core.debug_log import debug_log_session
+                    debug_log_session(
+                        "5a1f5b",
+                        "chat_goals.py:ChatGoalGuard.apply",
+                        "no goals — sequentialthinking allowed",
+                        {"tool": tool_name},
+                        "B",
+                    )
+                except Exception:
+                    pass
+            # #endregion
             return tool_name, args, None
 
         pending = goals.pending(executed)
@@ -648,21 +704,62 @@ class ChatGoalGuard:
             if tool_name == "sequentialthinking":
                 # Allow one planning thought, then force action tools.
                 if "sequentialthinking" in done:
+                    # #region agent log
+                    try:
+                        from core.debug_log import debug_log_session
+                        debug_log_session(
+                            "5a1f5b",
+                            "chat_goals.py:ChatGoalGuard.apply",
+                            "block ST — already in done (pending phase)",
+                            {
+                                "label": goals.label,
+                                "pending": pending,
+                                "done": sorted(done),
+                            },
+                            "C",
+                        )
+                    except Exception:
+                        pass
+                    # #endregion
                     return tool_name, args, (
                         f"Blocked: {goals.label} requires action tools ({', '.join(pending)}). "
                         "Do NOT use sequentialthinking again — emit find_and_grep, read_file, or analyze_pcapng."
                     )
+                # #region agent log
+                try:
+                    from core.debug_log import debug_log_session
+                    debug_log_session(
+                        "5a1f5b",
+                        "chat_goals.py:ChatGoalGuard.apply",
+                        "allow ST (pending phase, first)",
+                        {"label": goals.label, "pending": pending, "done": sorted(done)},
+                        "C",
+                    )
+                except Exception:
+                    pass
+                # #endregion
                 return tool_name, args, None
             if tool_name == "append_note":
                 if strategy_note:
                     return tool_name, args, None
                 if "write_file" in pending:
                     deliverable = goals.hints.get("deliverable_path", "login_forms.txt")
+                    if "crack_hash" in pending:
+                        return tool_name, args, (
+                            f"Blocked: run crack_hash on PCAP Password hashes before "
+                            f"writing '{deliverable}'. "
+                            f"{format_crack_hash_call(goals.hints)} "
+                            "Extract hash+salt from http_forms and login_token xmlObj "
+                            "(re-run analyze_pcapng with filter "
+                            "'http.request.uri contains login_token' if salt missing). "
+                            "No append_note until crack_hash and write_file succeed."
+                        )
                     return tool_name, args, (
                         f"Blocked: deliverable '{deliverable}' not written yet. "
-                        "Parse http_forms from the last analyze_pcapng result and "
-                        f"write_file(path='{deliverable}', content=<REAL values>) — "
-                        "no more strategy append_note until the file exists."
+                        "Call write_file with hash, salt, and cracked plaintext "
+                        f"(or NOT CRACKED) per entry — "
+                        f"write_file(path='{deliverable}', content=<REAL values>). "
+                        "No more append_note until the file exists."
                     )
                 return tool_name, args, (
                     f"Blocked: {goals.label} still pending ({', '.join(pending)}). "
@@ -730,6 +827,23 @@ class ChatGoalGuard:
                     "Summarize findings in plain text — do not re-run tools."
                 )
             if tool_name == "sequentialthinking":
+                # #region agent log
+                try:
+                    from core.debug_log import debug_log_session
+                    debug_log_session(
+                        "5a1f5b",
+                        "chat_goals.py:ChatGoalGuard.apply",
+                        "block ST — post-minimum (no pending)",
+                        {
+                            "label": goals.label,
+                            "blocked_tools": list(goals.blocked_tools),
+                            "done": sorted(done),
+                        },
+                        "D",
+                    )
+                except Exception:
+                    pass
+                # #endregion
                 return tool_name, args, (
                     f"Blocked: {goals.label} already completed this turn. "
                     "Summarize findings in plain text — do not re-run tools."

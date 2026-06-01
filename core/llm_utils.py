@@ -428,6 +428,17 @@ class DynamicContextBuilder:
         has_enum   = bool(tools_used & cls._ENUM_TOOLS)
         has_report = bool(tools_used & cls._REPORT_TOOLS)
 
+        # General / conversational / analysis intent — do not force recon tools.
+        if kind == "general" and not has_recon and not has_enum and not has_report:
+            return (
+                "\n[CURRENT PHASE: GENERAL / ANALYSIS]\n"
+                "This is a conversational, planning, or review request.\n"
+                "Respond directly in plain text. Tool use is optional — "
+                "only call a tool if it directly serves the user's question.\n"
+                "Do NOT force network recon tools (port_scan, dns_lookup, ping_sweep) "
+                "unless the user explicitly asks for them.\n"
+            )
+
         if has_report:
             return (
                 "\n[CURRENT PHASE: ANALYSIS & REPORTING]\n"
@@ -532,12 +543,33 @@ class SequentialThinkingEngine:
         self._render_console(thought, thought_num, total_thoughts,
                              is_revision, revises_thought, branch_id)
 
-        return {
+        result = {
             "thoughtNumber":   thought_num,
             "totalThoughts":   total_thoughts,
             "nextThoughtNeeded": next_needed,
             "status":          "success",
         }
+        # #region agent log
+        try:
+            from core.debug_log import debug_log_session
+            debug_log_session(
+                "5a1f5b",
+                "llm_utils.py:process_thought",
+                "sequentialthinking result",
+                {
+                    "thought_num": thought_num,
+                    "total_thoughts": total_thoughts,
+                    "next_needed_in": next_needed,
+                    "next_needed_out": result["nextThoughtNeeded"],
+                    "history_len": len(self.thought_history),
+                    "budget": self.max_thoughts,
+                },
+                "A",
+            )
+        except Exception:
+            pass
+        # #endregion
+        return result
 
     # ── ANSI console rendering ─────────────────────────────────────────────
 

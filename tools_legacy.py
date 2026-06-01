@@ -1178,7 +1178,7 @@ def crack_hash(
     wordlist: str = None,
     cpu_workers: int = None,
     no_gpu: bool = False,
-    timeout: int = 180,
+    timeout: int = 1200,
     **kwargs: Any,
 ) -> dict:
     """
@@ -1228,20 +1228,49 @@ def crack_hash(
     # #endregion
 
     try:
-        result = subprocess.run(
+        import sys
+        process = subprocess.Popen(
             cmd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
             env=env,
             cwd=cwd,
-            timeout=timeout,
             **_subprocess_run_kwargs(),
         )
 
-        stdout_str = result.stdout or ""
-        stderr_str = result.stderr or ""
+        stdout_chunks = []
+        stderr_chunks = []
+        start_time = time.time()
+
+        while True:
+            # Check timeout
+            elapsed = time.time() - start_time
+            if elapsed > timeout:
+                process.kill()
+                raise subprocess.TimeoutExpired(cmd, timeout)
+
+            # Read a line from stdout
+            line = process.stdout.readline()
+            if not line:
+                break
+            # Print to host unbuffered console so user can monitor in real time
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            stdout_chunks.append(line)
+
+        # After stdout ends, wait for the process to finish and capture stderr
+        try:
+            rem_stderr, _ = process.communicate(timeout=max(1.0, timeout - (time.time() - start_time)))
+            stderr_chunks.append(rem_stderr)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            raise
+
+        stdout_str = "".join(stdout_chunks)
+        stderr_str = "".join(stderr_chunks)
 
         # #region agent log
         try:

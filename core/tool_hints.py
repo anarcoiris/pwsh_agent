@@ -72,6 +72,23 @@ def parse_hash_crack_hints(message: str) -> dict[str, Any]:
     elif re.search(r"\bmask\s*[:=]\s*([NALU!?H]+)", text, re.I):
         hints["mask"] = re.search(r"\bmask\s*[:=]\s*([NALU!?H]+)", text, re.I).group(1)
     else:
+        upper_m = re.search(r"(\d+)\s*upper", lower)
+        lower_m = re.search(r"(\d+)\s*lower", lower)
+        digits_m = re.search(r"(\d+)\s*(?:digit|number)", lower)
+        punc_m = re.search(r"(\d+)\s*(?:punctuation|symbol)", lower)
+        
+        if upper_m or lower_m or digits_m or punc_m:
+            mask_parts = []
+            if upper_m:
+                mask_parts.append("U" * int(upper_m.group(1)))
+            if lower_m:
+                mask_parts.append("L" * int(lower_m.group(1)))
+            if digits_m:
+                mask_parts.append("N" * int(digits_m.group(1)))
+            if punc_m:
+                mask_parts.append("!" * int(punc_m.group(1)))
+            if mask_parts:
+                hints["mask"] = "".join(mask_parts)
         hints.setdefault("mask", _DEFAULT_MASK)
 
     if re.search(r"\bwordlist\b", lower):

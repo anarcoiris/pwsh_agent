@@ -187,6 +187,48 @@ def test_extract_pcap_hashes_to_custom_pwd_file_uses_multistep_goal():
     assert goals.hints.get("deliverable_path") == "pwd_0106.txt"
 
 
+def test_pending_keeps_crack_hash_when_hash_not_from_pcap():
+    """Wrong/placeholder crack_hash must not clear crack_hash from pending."""
+    goals = ChatGoals(
+        required_tools=["read_file", "analyze_pcapng", "crack_hash", "write_file"],
+        label="Extract credentials and crack hash",
+        hints={"deliverable_path": "pwd.txt"},
+    )
+    executed = [
+        {"name": "read_file", "success": True},
+        {"name": "analyze_pcapng", "success": True},
+        {
+            "name": "crack_hash",
+            "success": False,
+            "args": {
+                "target_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            },
+        },
+    ]
+    assert "crack_hash" in goals.pending(executed)
+    assert "write_file" in goals.pending(executed)
+
+
+def test_goal_guard_blocks_append_note_before_crack():
+    goals = ChatGoals(
+        required_tools=["read_file", "analyze_pcapng", "crack_hash", "write_file"],
+        label="Extract credentials and crack hash",
+        hints={"deliverable_path": "pwd.txt", "mask": "NNNNNNAA!"},
+    )
+    executed = [
+        {"name": "read_file", "success": True},
+        {"name": "analyze_pcapng", "success": True},
+    ]
+    _, _, err = ChatGoalGuard.apply(
+        "append_note",
+        {"path": "workspace/plan.md", "line": "still working"},
+        goals,
+        executed,
+    )
+    assert err is not None
+    assert "crack_hash" in err
+
+
 def test_goal_guard_blocks_write_before_crack():
     goals = ChatGoals(
         required_tools=["read_file", "analyze_pcapng", "crack_hash", "write_file"],
@@ -205,6 +247,32 @@ def test_goal_guard_blocks_write_before_crack():
     )
     assert err is not None
     assert "crack_hash" in err
+
+
+def test_goal_guard_allows_write_after_terminal_crack_events():
+    """write_file must not stay blocked when crack_hash exhausted/cracked in events."""
+    goals = ChatGoals(
+        required_tools=["read_file", "analyze_pcapng", "crack_hash", "write_file"],
+        label="Extract credentials and crack hash",
+        hints={"deliverable_path": "pwd.txt"},
+    )
+    executed = [
+        {"name": "read_file", "success": True},
+        {"name": "analyze_pcapng", "success": True},
+        {"name": "crack_hash", "success": True},
+        {"name": "crack_hash", "success": True},  # exhausted attempts also count
+        {"name": "crack_hash", "success": True},
+    ]
+    _, _, err = ChatGoalGuard.apply(
+        "write_file",
+        {
+            "path": "pwd.txt",
+            "content": "hash=934a4dba\npassword=321123Aa!\n",
+        },
+        goals,
+        executed,
+    )
+    assert err is None
 
 
 print("All chat_goals tests passed.")

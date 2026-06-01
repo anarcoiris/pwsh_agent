@@ -52,7 +52,7 @@ echo [*] Upgrading pip...
 python -m pip install --upgrade pip --quiet
 
 echo [*] Checking and installing dependencies...
-python -m pip install "ollama>=0.2.0" "mcp>=1.20.0" "pyyaml>=6.0.0" "rich>=13.7.0" "pyfiglet>=1.0.2" --quiet
+python -m pip install -r requirements.txt --quiet
 
 :: 5. Set Required Environment Variables
 :: PYTHONIOENCODING / PYTHONUTF8 : force UTF-8 I/O (prevents charmap errors on Windows)

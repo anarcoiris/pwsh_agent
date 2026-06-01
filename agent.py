@@ -594,8 +594,11 @@ class ReActAgent:
             pending_deliverables=pending,
         )
         if not block_err:
+            # Chat goals track per-tool success in _chat_tool_events (updated each
+            # tool). _chat_tools_executed is only synced at step boundaries and
+            # misses crack_hash completed in the same ReAct batch as write_file.
             executed_so_far = (
-                getattr(self, "_chat_tools_executed", [])
+                getattr(self, "_chat_tool_events", [])
                 if getattr(self, "_chat_goals", None)
                 else getattr(self, "_mission_tools_executed", [])
             )
@@ -612,6 +615,29 @@ class ReActAgent:
                 executed_so_far,
                 strategy_note=strategy_note,
             )
+            # #region agent log
+            if tool_name == "sequentialthinking":
+                try:
+                    from core.debug_log import debug_log_session
+                    debug_log_session(
+                        "5a1f5b",
+                        "agent.py:_execute_tool",
+                        "sequentialthinking guard",
+                        {
+                            "blocked": bool(block_err),
+                            "block_head": (block_err or "")[:160],
+                            "events_len": len(executed_so_far),
+                            "events_names": [
+                                e.get("name") for e in executed_so_far
+                                if isinstance(e, dict)
+                            ][-8:],
+                            "goals_label": active_goals.label if active_goals else None,
+                        },
+                        "C",
+                    )
+                except Exception:
+                    pass
+            # #endregion
         if block_err:
             if step_callback:
                 step_callback("AGENT_TOOL_CALL", {"tool": tool_name, "args": tool_args})
@@ -786,6 +812,17 @@ class ReActAgent:
                     result.get("success") or result.get("status") == "exhausted"
                 ):
                     success_flag = True
+                # Do not satisfy the goal with placeholder/wrong hashes (e.g. empty SHA-256).
+                pairs = getattr(self, "_credential_pairs", None) or []
+                if pairs:
+                    th = str(tool_args.get("target_hash", "")).lower().strip()
+                    known = {
+                        str(p.get("hash", "")).lower()
+                        for p in pairs
+                        if p.get("hash")
+                    }
+                    if th not in known:
+                        success_flag = False
             if tool_name == "write_file" and success_flag and cg and "crack_hash" in cg.required_tools:
                 content = str(tool_args.get("content", ""))
                 done = ChatGoals._successful_names(self._chat_tool_events)
@@ -1033,6 +1070,45 @@ class ReActAgent:
                         ]
                         self._credential_pairs = pair_hashes_with_salts(base, salts)
                 pairs = self._credential_pairs
+                if pairs and not any(p.get("salt") for p in pairs):
+                    pcap_path = self._last_pcap_path or str(
+                        tool_args.get("file_path") or "workspace/last_capture.pcapng"
+                    )
+                    try:
+                        token_result = await asyncio.to_thread(
+                            tools.analyze_pcapng,
+                            file_path=pcap_path,
+                            filter_expression='http.request.uri contains "login_token"',
+                            limit=30,
+                            verbose=False,
+                        )
+                        if isinstance(token_result, dict) and token_result.get("success"):
+                            token_analysis = token_result.get("analysis", {})
+                            blob = "\n".join(
+                                str(token_analysis.get(k, ""))
+                                for k in (
+                                    "key_fields",
+                                    "packet_summary",
+                                    "http_index",
+                                    "http_forms",
+                                )
+                            )
+                            salts = find_xml_salts(blob)
+                            if salts:
+                                base = [
+                                    {
+                                        "hash": p["hash"],
+                                        "username": p.get("username", ""),
+                                        "session_token": p.get("session_token", ""),
+                                    }
+                                    for p in pairs
+                                ]
+                                self._credential_pairs = pair_hashes_with_salts(
+                                    base, salts
+                                )
+                                pairs = self._credential_pairs
+                    except Exception:
+                        pass
                 if pairs:
                     # #region agent log
                     try:
@@ -1595,6 +1671,24 @@ class ReActAgent:
                 self.ctx_manager.get_messages(), message
             )
         self._chat_goals = chat_goals
+        # #region agent log
+        try:
+            from core.debug_log import debug_log_session
+            debug_log_session(
+                "5a1f5b",
+                "agent.py:chat_turn",
+                "chat goals resolved",
+                {
+                    "message_head": (message or "")[:120],
+                    "goals_label": chat_goals.label if chat_goals else None,
+                    "required": chat_goals.required_tools if chat_goals else [],
+                    "blocked_tools": list(chat_goals.blocked_tools) if chat_goals else [],
+                },
+                "B",
+            )
+        except Exception:
+            pass
+        # #endregion
         self._last_pcap_summary: str | None = None
         self._pcap_objective_met: bool = False
         self._task_plan = load_plan_state(self.session_id) or TaskPlanTracker(message)
@@ -1759,6 +1853,28 @@ class ReActAgent:
                 consecutive_no_tool = 0
                 batch_executed = False
                 batch_only_notes = bool(tool_calls)
+                # #region agent log
+                try:
+                    from core.debug_log import debug_log_session
+                    _tc_names = [
+                        (tc.get("function", tc) or {}).get("name", tc.get("name", ""))
+                        for tc in tool_calls
+                    ]
+                    debug_log_session(
+                        "5a1f5b",
+                        "agent.py:chat_turn",
+                        "tool batch",
+                        {
+                            "step": step,
+                            "count": len(tool_calls),
+                            "names": _tc_names,
+                            "st_count": sum(1 for n in _tc_names if n == "sequentialthinking"),
+                        },
+                        "C",
+                    )
+                except Exception:
+                    pass
+                # #endregion
                 for tc in tool_calls:
                     func = tc.get("function", tc)
                     name = func.get("name", tc.get("name", ""))
@@ -2115,6 +2231,7 @@ class ReActAgent:
                     # Max reflections or no salvage — force action bootstrap for search/credential work
                     if (
                         not reflection
+                        and (not chat_goals or "find_and_grep" in chat_goals.required_tools or "find_and_grep" in chat_goals.iterative_tools)
                         and salvage_intent_tool_call(message, message, session_id=self.session_id)
                         and "find_and_grep" not in tools_executed_names
                     ):
@@ -2144,11 +2261,15 @@ class ReActAgent:
                             )
                         continue
                     if step < 1 and not tools_executed_names:
-                        self._add_nudge(
-                            "[SYSTEM] No tools executed yet. Call an appropriate tool "
-                            "before summarizing."
-                        )
-                        continue
+                        if chat_goals:
+                            # Active goal with required tools — nudge is valid.
+                            self._add_nudge(
+                                "[SYSTEM] No tools executed yet. Call an appropriate tool "
+                                "before summarizing."
+                            )
+                            continue
+                        # No active goals → conversational/planning response is complete.
+                        break
                     try:
                         from core.debug_log import log_completion_exit
                         log_completion_exit(
@@ -2405,16 +2526,31 @@ class ReActAgent:
                     pairs = pair_hashes_with_salts(base, salts)
                     self._credential_pairs = pairs
 
-        mask = str(goals.hints.get("mask") or "NNNNNNAA!")
+        primary_mask = str(goals.hints.get("mask") or "NNNNNNAA!")
+        fallback_masks = [
+            m for m in ("ULLLLLLLNN!!", "?????????", "NNNNNNAA!")
+            if m != primary_mask
+        ]
+        masks_to_try = [primary_mask] + fallback_masks
         for pair in pairs[:5]:
             if not pair.get("hash"):
                 continue
-            args: dict[str, Any] = {"target_hash": pair["hash"], "mask": mask, "timeout": 180}
-            if pair.get("salt"):
-                args["salt"] = pair["salt"]
-            did, _ = await self._execute_tool("crack_hash", args, tools_called, step_callback)
-            if did:
-                executed.append("crack_hash")
+            for mask in masks_to_try:
+                args: dict[str, Any] = {"target_hash": pair["hash"], "mask": mask, "timeout": 180}
+                if pair.get("salt"):
+                    args["salt"] = pair["salt"]
+                before = len(self._crack_results)
+                did, _ = await self._execute_tool(
+                    "crack_hash", args, tools_called, step_callback
+                )
+                if did:
+                    executed.append("crack_hash")
+                if len(self._crack_results) > before:
+                    last = self._crack_results[-1]
+                    if last.get("success") or last.get("status") == "cracked":
+                        break
+                    if last.get("status") == "exhausted" and mask == masks_to_try[-1]:
+                        break
 
         if self._crack_results and "write_file" in goals.required_tools:
             wboot = await self._bootstrap_write_cracked(goals, tools_called, step_callback)

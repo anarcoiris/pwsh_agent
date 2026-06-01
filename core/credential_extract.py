@@ -92,15 +92,20 @@ def find_xml_salts(text: str) -> list[str]:
     for m in _AJAX_SALT_RE.finditer(text or ""):
         _add(m.group(1))
 
-    for hex_m in re.finditer(r'"([0-9a-f]{24,})"', text or "", re.I):
-        try:
-            decoded = binascii.unhexlify(hex_m.group(1)[:8000]).decode(
-                "utf-8", errors="replace"
-            )
-        except (binascii.Error, ValueError):
-            continue
-        for m in _AJAX_SALT_RE.finditer(decoded):
-            _add(m.group(1))
+    hex_patterns = (
+        r'"([0-9a-f]{24,})"',
+        r"\b([0-9a-f]{80,})\b",
+    )
+    for pattern in hex_patterns:
+        for hex_m in re.finditer(pattern, text or "", re.I):
+            try:
+                decoded = binascii.unhexlify(hex_m.group(1)[:8000]).decode(
+                    "utf-8", errors="replace"
+                )
+            except (binascii.Error, ValueError):
+                continue
+            for m in _AJAX_SALT_RE.finditer(decoded):
+                _add(m.group(1))
     return salts
 
 

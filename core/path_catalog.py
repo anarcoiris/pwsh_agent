@@ -77,8 +77,9 @@ def session_context_paths(session_id: str) -> list[tuple[str, Path]]:
         ("session_plan", plan_file(sid)),
         ("session_status", status_file(sid)),
     ]
-    for i, rp in enumerate(latest_reports(2)):
-        out.append((f"report_{i}", rp))
+    # Do not inject global output/report_*.md into every new session — that steers
+    # PCAP/credential tasks toward stale engagement reports. Reports remain
+    # discoverable via find_file when the user or roadmap asks for them.
     vlog = latest_pcap_verbose_log()
     if vlog:
         out.append(("pcap_verbose_log", vlog))

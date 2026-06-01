@@ -15,9 +15,39 @@ def debug_log(location: str, message: str, data: dict, hypothesis_id: str = "", 
     # #region agent log
     if not _DEBUG_ENABLED:
         return
+    _write_ndjson(_LOG, _SESSION_ID, location, message, data, hypothesis_id, run_id)
+    # #endregion
+
+
+def debug_log_session(
+    session_id: str,
+    location: str,
+    message: str,
+    data: dict,
+    hypothesis_id: str = "",
+    run_id: str = "pre-fix",
+) -> None:
+    """Write to debug-{session_id}.log (Cursor debug mode)."""
+    # #region agent log
+    if not _DEBUG_ENABLED:
+        return
+    log_path = Path(__file__).resolve().parent.parent / f"debug-{session_id}.log"
+    _write_ndjson(log_path, session_id, location, message, data, hypothesis_id, run_id)
+    # #endregion
+
+
+def _write_ndjson(
+    log_path: Path,
+    session_id: str,
+    location: str,
+    message: str,
+    data: dict,
+    hypothesis_id: str,
+    run_id: str,
+) -> None:
     try:
         payload = {
-            "sessionId": _SESSION_ID,
+            "sessionId": session_id,
             "timestamp": int(time.time() * 1000),
             "location": location,
             "message": message,
@@ -25,11 +55,10 @@ def debug_log(location: str, message: str, data: dict, hypothesis_id: str = "", 
             "hypothesisId": hypothesis_id,
             "runId": run_id,
         }
-        with open(_LOG, "a", encoding="utf-8") as f:
+        with open(log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(payload, default=str) + "\n")
     except Exception:
         pass
-    # #endregion
 
 
 def log_completion_exit(

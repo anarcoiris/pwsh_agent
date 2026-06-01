@@ -12,7 +12,7 @@ from tools_legacy import _sanitize_powershell_content
 
 # Exact broken content from audit_trail/2026-05-29.jsonl (creative helloworld write)
 AUDIT_BROKEN = None
-for line in Path("audit_trail/2026-05-29.jsonl").read_text(encoding="utf-8").splitlines():
+for line in Path("state/audit_trail/2026-05-29.jsonl").read_text(encoding="utf-8").splitlines():
     rec = json.loads(line)
     if rec.get("method") == "write_file" and "Write-Host" in rec.get("params", {}).get("content", ""):
         AUDIT_BROKEN = rec["params"]["content"]

@@ -33,3 +33,7 @@ agent:
   # Phase 2: recent raw turns sent to the LLM each step. Full history stays on
   # disk for audit; CURRENT STATE carries durable continuity. 0 = send all.
   history_window_turns: 8
+
+console:
+  # Multiline submit binding. Options: "ctrl-enter", "esc-enter", "enter"
+  submit_binding: "ctrl-enter"

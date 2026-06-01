@@ -22,6 +22,19 @@ _DISPLAY_FACTS_RE = re.compile(
     re.I,
 )
 
+_HASH_CRACK_RE = re.compile(
+    r"(crack.*hash|hash.*crack|brute.*force|password.*hash|\bcrack_hash\b|"
+    r"crack.*sha-?256|sha-?256.*crack|\bhaspro\b|\bhashpro\b|\bhash_pro7\b)",
+    re.I,
+)
+
+_PCAP_OR_EXTRACT_RE = re.compile(
+    r"(\.pcapng|\.pcap\b|\btshark\b|\bwireshark\b|last_capture|decode.*packet|"
+    r"analyze.*packet|http packet|login.*packet|locate.*pcap|login_forms\.txt|"
+    r"pwd(?:_[\d]+)?\.txt|credentials?\.txt|extract.*(?:pcap|password|salt))",
+    re.I,
+)
+
 
 def looks_like_prose_stall(content: str) -> bool:
     text = (content or "").strip()
@@ -61,6 +74,10 @@ def salvage_intent_tool_call(
     Used by parser_reflection before falling back to sequentialthinking.
     """
     combined = f"{user_context} {raw_content}".lower()
+
+    # Simple hash cracking prompts without PCAP/extraction intent should never trigger grep salvage
+    if _HASH_CRACK_RE.search(combined) and not _PCAP_OR_EXTRACT_RE.search(combined):
+        return None
 
     if _DISPLAY_FACTS_RE.search(combined):
         paths = []
