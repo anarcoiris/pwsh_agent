@@ -75,6 +75,7 @@ from core.execution_policy import ExecutionPolicy, set_pip_near
 from core.runtime_paths import app_root, workspace_root
 from core.mission_progress import MissionProgressTracker
 from core.mission_evaluator import MissionEvaluator
+from core.intent_spec import IntentFormalizer, build_fallback_spec, save_intent_spec
 
 logger = logging.getLogger("pwsh_agent.agent")
 
@@ -278,6 +279,28 @@ class ReActAgent:
                 model=self.conversational_model,
                 temperature=self.evaluator_temperature,
             )
+
+        # ── Intent formalization (Phase 1 — shadow mode) ───────────────────
+        # Computes a structured IntentSpec per turn for logging/validation; it
+        # does NOT yet gate routing/planning/completion.
+        intent_cfg = self.config.get("intent", {})
+        self.intent_shadow_mode = bool(intent_cfg.get("shadow_mode", True))
+        self.intent_use_llm = bool(intent_cfg.get("use_llm", True))
+        self.intent_inject_context = bool(intent_cfg.get("inject_context", True))
+        self._intent_spec = None
+        self._intent_refine_task = None
+        intent_model = intent_cfg.get("model") or self.conversational_model
+        self.intent_formalizer: IntentFormalizer | None = None
+        if self.intent_use_llm and intent_model:
+            try:
+                self.intent_formalizer = IntentFormalizer(
+                    host=self.base_url,
+                    model=intent_model,
+                    temperature=float(intent_cfg.get("temperature", self.evaluator_temperature)),
+                    timeout=float(intent_cfg.get("timeout_sec", 30.0)),
+                )
+            except Exception:
+                self.intent_formalizer = None
 
         # Session persistence
         self.session_id  = session_id or load_active_session_id()
@@ -535,27 +558,11 @@ class ReActAgent:
         anchor = getattr(self, "_anchor_query", "") or ""
         try:
             from core.intent_salvage import redirect_misrouted_search_tool
-            from core.debug_log import debug_log_session
 
             new_name, new_args, redirect_note = redirect_misrouted_search_tool(
                 tool_name, tool_args, anchor
             )
             if redirect_note and new_name != tool_name:
-                debug_log_session(
-                    "05286d",
-                    "agent.py:_execute_tool",
-                    "search tool redirect",
-                    {
-                        "from": tool_name,
-                        "to": new_name,
-                        "old_path": str(
-                            (tool_args or {}).get("path_glob")
-                            or (tool_args or {}).get("path", "")
-                        ),
-                        "anchor_head": anchor[:100],
-                    },
-                    "B",
-                )
                 if step_callback:
                     step_callback("AGENT_THOUGHT", redirect_note)
                 tool_name, tool_args = new_name, new_args
@@ -1639,6 +1646,109 @@ class ReActAgent:
 
     # ── Chat turn (interactive) ────────────────────────────────────────────
 
+    async def _compute_intent_spec_shadow(self, message: str) -> None:
+        """Compute and persist an IntentSpec for the turn.
+
+        The deterministic fallback is computed synchronously (instant) and used
+        for this turn. If an LLM formalizer is configured, it refines the spec in
+        the BACKGROUND so a slow/unavailable model never stalls the turn. The
+        refined spec is persisted/logged for validation but does not retro-gate
+        the current turn.
+        """
+        if not self.intent_shadow_mode:
+            return
+        try:
+            spec = build_fallback_spec(message)
+        except Exception:
+            self._intent_spec = None
+            return
+
+        self._intent_spec = spec
+        self._log_intent_spec(message, spec)
+        try:
+            save_intent_spec(self.session_id, spec)
+        except Exception:
+            pass
+
+        if self.intent_formalizer is not None:
+            try:
+                self._intent_refine_task = asyncio.create_task(
+                    self._refine_intent_spec_bg(message)
+                )
+            except Exception:
+                pass
+
+    async def _refine_intent_spec_bg(self, message: str) -> None:
+        """Background LLM refinement of the intent spec (best-effort)."""
+        try:
+            refined = await self.intent_formalizer.formalize(message)
+        except Exception:
+            return
+        if refined is None or refined.source == "fallback":
+            return
+        self._intent_spec = refined
+        self._log_intent_spec(message, refined)
+        try:
+            save_intent_spec(self.session_id, refined)
+        except Exception:
+            pass
+
+    def _log_intent_spec(self, message: str, spec) -> None:
+        # #region agent log
+        try:
+            from core.debug_log import debug_log_session
+            legacy_kind = getattr(self._active_intent, "mission_kind", None)
+            debug_log_session(
+                "5a1f5b",
+                "agent.py:_compute_intent_spec_shadow",
+                "intent spec",
+                {
+                    "message_head": (message or "")[:120],
+                    "domain": spec.domain,
+                    "legacy_mission_kind": legacy_kind,
+                    "agrees_with_legacy": legacy_kind == spec.domain,
+                    "capabilities": spec.capabilities,
+                    "targets": spec.targets[:5],
+                    "needs_confirmation": spec.safety.needs_confirmation,
+                    "source": spec.source,
+                    "confidence": spec.confidence,
+                },
+                "I1",
+            )
+        except Exception:
+            pass
+        # #endregion
+
+    def _intent_context_block(self) -> str:
+        """Concise, informational DECLARED INTENT block for the model.
+
+        Does not gate tools — it helps the agent self-direct and judge
+        completion against the declared success criteria.
+        """
+        spec = getattr(self, "_intent_spec", None)
+        if spec is None:
+            return ""
+        lines = ["### DECLARED INTENT ###", f"Domain: {spec.domain}"]
+        if spec.summary:
+            lines.append(f"Goal: {spec.summary}")
+        if spec.objectives:
+            lines.append("Objectives: " + "; ".join(spec.objectives[:6]))
+        if spec.targets:
+            lines.append("Targets: " + ", ".join(spec.targets[:6]))
+        if spec.success_criteria:
+            lines.append("Done when: " + "; ".join(spec.success_criteria[:4]))
+        if spec.constraints:
+            lines.append("Constraints: " + "; ".join(spec.constraints[:4]))
+        if spec.safety.needs_confirmation:
+            concern = spec.safety.notes or "sensitive action"
+            lines.append(
+                f"Safety: this task may {concern}. In HOST mode, confirm with the "
+                "user before any irreversible or off-host action."
+            )
+        lines.append("Pick tools that serve this intent; do not force unrelated workflows.")
+        lines.append("#######################")
+        return "\n".join(lines)
+
     async def chat_turn(self, message: str, step_callback=None) -> str:
         """
         Single-turn interactive chat with optional tool use.
@@ -1672,6 +1782,7 @@ class ReActAgent:
         self._anchor_query = raw_message
         self.parser.set_user_context(raw_message)
         self._active_intent = TaskIntentExtractor.parse(message)
+        await self._compute_intent_spec_shadow(raw_message)
         self._chat_tool_events = []
         self._credential_pairs = []
         self._crack_results = []
@@ -1694,6 +1805,11 @@ class ReActAgent:
             f"{deliverable_hint}\n"
         )
         self.ctx_manager.add_message({"role": "user", "content": chat_directive + message})
+
+        if self.intent_inject_context:
+            intent_block = self._intent_context_block()
+            if intent_block:
+                self.ctx_manager.add_message({"role": "user", "content": intent_block})
 
         chat_goals = ChatGoalRegistry.match_message(message)
         if not chat_goals:

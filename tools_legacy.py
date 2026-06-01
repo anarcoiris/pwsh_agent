@@ -1271,6 +1271,7 @@ def crack_hash(
 
         stdout_str = "".join(stdout_chunks)
         stderr_str = "".join(stderr_chunks)
+        returncode = process.returncode if process.returncode is not None else -1
 
         # #region agent log
         try:
@@ -1279,7 +1280,7 @@ def crack_hash(
                 "tools_legacy.py:crack_hash",
                 "finished",
                 {
-                    "returncode": result.returncode,
+                    "returncode": returncode,
                     "stderr_head": stderr_str[:200],
                     "stdout_head": stdout_str[:200],
                 },
@@ -1318,10 +1319,10 @@ def crack_hash(
                 "stderr": stderr_str,
             }
 
-        if "No encontrado" in stdout_str or "No encontrado" in stderr_str or result.returncode != 0:
+        if "No encontrado" in stdout_str or "No encontrado" in stderr_str or returncode != 0:
             err = "Password not found in the specified search space."
-            if result.returncode != 0 and stderr_str.strip():
-                err = f"{err} (exit {result.returncode}: {stderr_str.strip()[:300]})"
+            if returncode != 0 and stderr_str.strip():
+                err = f"{err} (exit {returncode}: {stderr_str.strip()[:300]})"
             return {
                 "success": False,
                 "status": "exhausted",

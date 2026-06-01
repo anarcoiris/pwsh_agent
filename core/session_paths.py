@@ -75,6 +75,10 @@ def plan_state_file(session_id: str) -> Path:
     return session_state_dir(session_id) / "plan_state.json"
 
 
+def intent_spec_file(session_id: str) -> Path:
+    return session_state_dir(session_id) / "intent_spec.json"
+
+
 def facts_rel(session_id: str) -> str:
     return _rel(facts_file(session_id))
 

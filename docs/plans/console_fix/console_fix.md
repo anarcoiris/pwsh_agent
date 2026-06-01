@@ -1,5 +1,10 @@
 # Analysis and Generalization Plan for Pulse Agent Console & Cognitive Loop
 
+> **STATUS (2026-06): IMPLEMENTED / SUPERSEDED.** The fixes here (exhausted-crack
+> PARTIAL state, soft chat goals, GENERAL phase, Ctrl+Enter submit binding) have
+> shipped. Ongoing generalization work lives in
+> `../Generalization/multi_purpose_agent_design.md`. Kept for historical context.
+
 This document outlines the findings, root causes, and architectural proposals to resolve the loop stalls, repeated completions, and too-specific behaviors observed in the interactive ReAct loop of the Pulse Windows Agent.
 
 ---

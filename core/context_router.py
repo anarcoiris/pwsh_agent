@@ -23,7 +23,7 @@ _NETWORK_TOOLS = [
     "list_network_interfaces", "capture_packets", "analyze_pcapng", "find_tshark", "find_file", "grep_file", "find_and_grep",
 ]
 _EXPLOIT_TOOLS = ["crack_hash", "hash_identify", "encode_decode"]
-_WEB_TOOLS = ["http_headers_check", "ssl_analysis"]
+_WEB_TOOLS = ["http_headers_check", "ssl_analysis", "try_http_login"]
 _REPORTING_TOOLS = ["finding_create", "finding_list", "report_generate"]
 _INTEL_TOOLS = ["cve_lookup"]
 
@@ -213,6 +213,20 @@ class ContextRouter:
         tools: set[str] = set()
         lower = query.lower()
 
+        # ── Primary: capability-driven routing (Phase 2) ──────────────────
+        # Derive a deterministic IntentSpec from the query and resolve its
+        # capabilities → tools. This replaces the old keyword heuristic where a
+        # bare "password" surfaced the hash-cracking tools.
+        if query:
+            try:
+                from core.intent_spec import build_fallback_spec
+                from core.capabilities import tools_for_capabilities, tools_for_domain
+                spec = build_fallback_spec(query)
+                tools.update(tools_for_capabilities(spec.capabilities))
+                tools.update(tools_for_domain(spec.domain))
+            except Exception:
+                pass
+
         if intent and intent.is_dev_task:
             tools.update(_DEV_TOOLS)
 
@@ -223,10 +237,16 @@ class ContextRouter:
         elif phase_label in ("NETWORK", "ENUM"):
             tools.update(_NETWORK_TOOLS)
 
+        # ── Secondary: low-priority keyword fallback ──────────────────────
+        # Note: "password" is intentionally NOT a trigger for exploit/hash
+        # tools — testing a known password is web_auth, not hash cracking.
         if re.search(r"\b(pcap|tshark|wireshark|capture|packet)\b", lower):
             tools.update(_NETWORK_TOOLS)
-        if re.search(r"\b(hash|crack|sha-?256|password)\b", lower):
+        if re.search(r"\b(hash|crack|sha-?256|sha-?512|md5|digest|hashpro|haspro)\b", lower):
             tools.update(_EXPLOIT_TOOLS)
+        if re.search(r"\b(log\s?in|login|sign\s?in|authenticate|credential)\b", lower):
+            tools.update(_WEB_TOOLS)
+            tools.add("try_http_login")
         if re.search(r"\b(cve|vulnerability|vulnerabilities)\b", lower):
             tools.update(_INTEL_TOOLS)
         if re.search(r"\b(finding|findings|report)\b", lower):

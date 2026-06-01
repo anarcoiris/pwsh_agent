@@ -34,6 +34,21 @@ agent:
   # disk for audit; CURRENT STATE carries durable continuity. 0 = send all.
   history_window_turns: 8
 
+intent:
+  # Phase 1 intent formalization. shadow_mode computes/logs a structured
+  # IntentSpec per turn WITHOUT gating routing/planning/completion yet.
+  shadow_mode: true
+  # Use a small LLM call to enrich the spec. If false (or no model resolves),
+  # the deterministic regex fallback is used instead.
+  use_llm: true
+  # Model for formalization; defaults to ollama.conversational_model when unset.
+  model: null
+  temperature: 0.1
+  # Inject a concise "DECLARED INTENT" context block (domain, objectives,
+  # success criteria, safety) so the agent self-directs and judges completion
+  # against the criteria. Informational only — does not hard-gate tools.
+  inject_context: true
+
 console:
   # Multiline submit binding. Options: "ctrl-enter", "esc-enter", "enter"
   submit_binding: "ctrl-enter"

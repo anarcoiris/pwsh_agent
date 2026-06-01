@@ -38,6 +38,7 @@ from tools.recon import (
     port_scan,
     http_headers_check,
     ssl_analysis,
+    try_http_login,
     cve_lookup,
     system_info,
 )
@@ -123,6 +124,26 @@ TOOLS_SCHEMA += [
                     "port": {"type": "integer", "description": "TLS port (default: 443)."}
                 },
                 "required": ["hostname"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "try_http_login",
+            "description": "Attempt to authenticate to an HTTP endpoint with a username and password (HTTP Basic and/or form POST), returning a heuristic accepted/rejected verdict. Use this for 'try user X with password Y against <site>' — NOT hash_identify/crack_hash, since a known plaintext password is not a hash.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "Target URL (e.g., http://192.168.1.1 or http://host/login)."},
+                    "user": {"type": "string", "description": "Username to try."},
+                    "password": {"type": "string", "description": "Password to try."},
+                    "method": {"type": "string", "description": "'auto' (basic then form), 'basic', or 'form' (default: auto)."},
+                    "username_field": {"type": "string", "description": "Form field name for the username (default: username)."},
+                    "password_field": {"type": "string", "description": "Form field name for the password (default: password)."},
+                    "timeout_sec": {"type": "integer", "description": "Per-request timeout in seconds (default: 15)."}
+                },
+                "required": ["url", "user", "password"]
             }
         }
     },
@@ -238,7 +259,7 @@ __all__ = [
     "list_network_interfaces", "capture_packets", "analyze_pcapng",
     "crack_hash", "find_tshark",
     "dns_lookup", "ping_sweep", "port_scan",
-    "http_headers_check", "ssl_analysis", "cve_lookup", "system_info",
+    "http_headers_check", "ssl_analysis", "try_http_login", "cve_lookup", "system_info",
     "encode_decode", "hash_identify",
     "finding_create", "finding_list", "report_generate",
     "TOOLS_SCHEMA",

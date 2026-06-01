@@ -1,5 +1,11 @@
 # Consolidated Generalization Plan — Pulse Windows Agent
 
+> **STATUS (2026-06): IMPLEMENTED / SUPERSEDED.** The defensive de-biasing in this
+> document (PARTIAL crack state, dev-intent gating, GENERAL phase branch,
+> configurable console submit binding) has shipped. The constructive successor —
+> intent formalization, capability registry, generic planner, soft-guidance loop —
+> is tracked in `multi_purpose_agent_design.md`. Kept for historical context.
+
 **Source:** Cherry-picked from `Original_proposal.md` + `generalization_plan.md`, grounded in code review of `agent.py`, `core/chat_goals.py`, `core/task_plan.py`, `core/llm_utils.py`, and `console.py`.
 
 > **Important behavioral change:** The current system enforces hard required-tool rules (e.g. forcing `find_and_grep` or `analyze_pcapng` when keywords like `login`, `password`, or `pcap` appear). This plan softens those constraints using intent detection so that conversational, coding, and review tasks can complete immediately without forced tool execution.

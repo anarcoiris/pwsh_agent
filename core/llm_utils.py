@@ -312,6 +312,7 @@ class RetryOrchestrator:
         snippet = raw_content[:400].strip()
         user_ctx = getattr(parser, "_user_context", "") if parser else ""
         from core.task_intent import detect_mission_kind, extract_filename_globs
+        from core.intent_salvage import _SEARCH_INTENT_RE
 
         kind = detect_mission_kind(user_ctx)
         if kind == "file_find":
@@ -319,10 +320,18 @@ class RetryOrchestrator:
             example = (
                 f'<tool_call>\n{{"name": "find_file", "arguments": {{"name": "{globs[0]}"}}}}\n</tool_call>'
             )
-        else:
+        elif kind == "pcap" or _SEARCH_INTENT_RE.search(user_ctx.lower()):
+            # Only bias toward PCAP verbose-log grep when the task is actually
+            # PCAP/credential search — not for arbitrary tasks.
             example = (
                 '<tool_call>\n{"name": "find_and_grep", "arguments": {"pattern": "xml|Password", '
                 '"path_glob": ".pulse/pcap_logs/verbose_*.txt", "case_insensitive": true}}\n</tool_call>'
+            )
+        else:
+            # Generic, tool-agnostic example so recovery does not hardcode any one workflow.
+            example = (
+                '<tool_call>\n{"name": "<one_of_the_available_tools>", '
+                '"arguments": { /* required fields */ }}\n</tool_call>'
             )
         thought = (
             f"Parse failure #{self._parse_fail_count} detected. "
@@ -379,6 +388,24 @@ class DynamicContextBuilder:
         hash_task = kind == "hash"
         pcap_task = kind == "pcap"
 
+        # Capability-aware domain (Phase 2/4): catches intents the legacy
+        # mission classifier lumps into "general" — notably web_auth.
+        try:
+            from core.intent_spec import build_fallback_spec
+            domain = build_fallback_spec(latest).domain
+        except Exception:
+            domain = ""
+
+        if domain == "web_auth" and not hash_task:
+            return (
+                "\n[CURRENT PHASE: WEB AUTH]\n"
+                "The user wants to TEST credentials against a web endpoint.\n"
+                "Read any referenced password file with read_file, then call "
+                "try_http_login(url=..., user=..., password=...).\n"
+                "A known plaintext password is NOT a hash — do NOT use hash_identify "
+                "or crack_hash here.\n"
+            )
+
         # #region agent log
         try:
             from core.debug_log import debug_log
@@ -428,7 +455,7 @@ class DynamicContextBuilder:
 
             globs = extract_filename_globs(latest) or ["<glob>.txt"]
             glob_hint = ", ".join(f"find_file('{g}')" for g in globs[:3])
-            phase = (
+            return (
                 "\n[CURRENT PHASE: FILE DISCOVERY]\n"
                 "Locate files by NAME under workspace and app install roots (search_roots) — "
                 "NOT under .pulse unless the user named that path.\n"
@@ -436,20 +463,6 @@ class DynamicContextBuilder:
                 "Do NOT use find_and_grep for filename discovery (it greps file CONTENTS, not names).\n"
                 "Do NOT default path_glob to .pulse/pcap_logs — that is only for PCAP verbose logs.\n"
             )
-            # #region agent log
-            try:
-                from core.debug_log import debug_log_session
-                debug_log_session(
-                    "05286d",
-                    "llm_utils.py:build_context",
-                    "file_find phase",
-                    {"globs": globs, "query_head": latest[:120]},
-                    "A",
-                )
-            except Exception:
-                pass
-            # #endregion
-            return phase
 
         from core.intent_salvage import _SEARCH_INTENT_RE
         from core.task_intent import is_file_discovery_mission
@@ -503,8 +516,10 @@ class DynamicContextBuilder:
         return (
             "\n[CURRENT PHASE: RECONNAISSANCE]\n"
             "No recon performed yet. "
-            "Start with: system_info, dns_lookup, ping_sweep.\n"
-            "Do NOT emit plain text — call a tool immediately.\n"
+            "If the user wants active reconnaissance, start with: system_info, "
+            "dns_lookup, ping_sweep, port_scan.\n"
+            "If the request is conversational, a plan, or a review, answer directly "
+            "in plain text — tool use is optional.\n"
         )
 
 

@@ -247,6 +247,118 @@ try {{
     return {"success": False, "url": url, "error": result.get("error") or result.get("stderr", "HTTP check failed")}
 
 
+def try_http_login(
+    url: str,
+    user: str,
+    password: str,
+    method: str = "auto",
+    username_field: str = "username",
+    password_field: str = "password",
+    timeout_sec: int = 15,
+) -> dict:
+    """
+    Attempt to authenticate to an HTTP endpoint with a username and password.
+
+    Tries HTTP Basic auth and/or a standard form POST and returns a heuristic
+    verdict on whether the credentials were accepted. This is the right tool for
+    "try user X with password Y against <site>" — NOT hash_identify/crack_hash
+    (a known plaintext password is not a hash to crack).
+
+    Args:
+        url: Target URL (e.g. http://192.168.1.1 or http://host/login).
+        user: Username to try.
+        password: Password to try.
+        method: 'auto' (basic then form), 'basic', or 'form'.
+        username_field: Form field name for the username (form/auto POST).
+        password_field: Form field name for the password (form/auto POST).
+        timeout_sec: Per-request timeout in seconds.
+
+    Returns:
+        Dict with per-attempt results (status code, likely_success, evidence)
+        and an overall authenticated verdict. Sends traffic to the target host.
+    """
+    if not url or not str(url).strip():
+        return {"success": False, "error": "url is required."}
+    m = (method or "auto").lower()
+    if m not in ("auto", "basic", "form"):
+        return {"success": False, "error": f"Unknown method '{method}'. Use auto|basic|form."}
+
+    # PowerShell does the request so behavior matches the rest of recon.py.
+    # Heuristics: a 2xx/3xx that is NOT obviously a re-served login page, or a
+    # Set-Cookie session, suggests success; common failure markers suggest failure.
+    ps_cmd = f"""
+$ErrorActionPreference = 'Stop'
+$url = '{url}'
+$user = '{user}'
+$pass = '{password}'
+$method = '{m}'
+$uField = '{username_field}'
+$pField = '{password_field}'
+$timeout = {int(timeout_sec)}
+
+$failMarkers = @('invalid','incorrect','failed','wrong password','authentication failed','login failed','denied','try again')
+
+function Test-Login($desc, $invoke) {{
+    $r = [ordered]@{{ attempt = $desc; status = $null; final_url = $null; length = 0; set_cookie = $false; likely_success = $false; note = '' }}
+    try {{
+        $resp = & $invoke
+        $r.status = [int]$resp.StatusCode
+        $r.length = ($resp.Content | Measure-Object -Character).Characters
+        try {{ $r.final_url = $resp.BaseResponse.ResponseUri.AbsoluteUri }} catch {{}}
+        $r.set_cookie = [bool]($resp.Headers['Set-Cookie'])
+        $body = ($resp.Content | Out-String).ToLower()
+        $hasFail = $false
+        foreach ($mk in $failMarkers) {{ if ($body.Contains($mk)) {{ $hasFail = $true; break }} }}
+        if ($r.status -ge 200 -and $r.status -lt 400 -and -not $hasFail) {{ $r.likely_success = $true }}
+        if ($hasFail) {{ $r.note = 'failure marker in body' }}
+    }} catch {{
+        $exresp = $_.Exception.Response
+        if ($exresp) {{
+            try {{ $r.status = [int]$exresp.StatusCode }} catch {{}}
+        }}
+        if ($r.status -eq 401 -or $r.status -eq 403) {{ $r.note = 'rejected (auth failed)' }}
+        else {{ $r.note = $_.Exception.Message }}
+    }}
+    return [PSCustomObject]$r
+}}
+
+$results = @()
+
+if ($method -eq 'basic' -or $method -eq 'auto') {{
+    $secpass = ConvertTo-SecureString $pass -AsPlainText -Force
+    $cred = New-Object System.Management.Automation.PSCredential($user, $secpass)
+    $results += Test-Login 'basic' {{ Invoke-WebRequest -Uri $url -Credential $cred -TimeoutSec $timeout -UseBasicParsing -MaximumRedirection 3 }}
+}}
+
+if ($method -eq 'form' -or $method -eq 'auto') {{
+    $bodyHash = @{{ $uField = $user; $pField = $pass }}
+    $results += Test-Login 'form' {{ Invoke-WebRequest -Uri $url -Method POST -Body $bodyHash -TimeoutSec $timeout -UseBasicParsing -MaximumRedirection 3 }}
+}}
+
+$results | ConvertTo-Json -Depth 4
+"""
+    result = _run_ps(ps_cmd, timeout=timeout_sec * 4 + 10)
+    if result.get("success") and result.get("stdout"):
+        try:
+            attempts = json.loads(result["stdout"])
+            if isinstance(attempts, dict):
+                attempts = [attempts]
+            authenticated = any(a.get("likely_success") for a in attempts)
+            return {
+                "success": True,
+                "url": url,
+                "user": user,
+                "authenticated": authenticated,
+                "verdict": "credentials likely ACCEPTED" if authenticated
+                           else "credentials likely REJECTED",
+                "attempts": attempts,
+                "note": "Heuristic verdict from HTTP status + body markers; verify manually for high-stakes use.",
+            }
+        except json.JSONDecodeError:
+            return {"success": True, "url": url, "raw": result["stdout"]}
+    return {"success": False, "url": url, "error": result.get("error") or result.get("stderr", "Login attempt failed")}
+
+
 def ssl_analysis(hostname: str, port: int = 443) -> dict:
     """
     Analyze the SSL/TLS certificate and configuration of a remote host using Python's ssl module.

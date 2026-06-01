@@ -93,6 +93,30 @@ class TaskPlanTracker:
         lower = (prompt or "").lower()
         steps: list[TaskStep] = []
 
+        # Domain-aware planning (Phase 3). For domains the legacy credential
+        # keyword logic mishandles (notably web_auth), build appropriate steps
+        # and return early. Forensic prompts classify as hash/pcap and fall
+        # through to the original logic below — unchanged.
+        try:
+            from core.intent_spec import build_fallback_spec
+            domain = build_fallback_spec(prompt).domain
+        except Exception:
+            domain = ""
+
+        if domain == "web_auth":
+            if re.search(r"\.(txt|md|json|cfg|conf)\b", lower) or re.search(r"\bfile\b", lower):
+                steps.append(TaskStep(
+                    "read_credentials",
+                    "Read the referenced credential/password file",
+                    "read_file",
+                ))
+            steps.append(TaskStep(
+                "attempt_login",
+                "Attempt authentication against the target endpoint",
+                "try_http_login",
+            ))
+            return steps
+
         if re.search(r"\b(read|report|plan|latest)\b", lower):
             steps.append(TaskStep(
                 "read_context",
@@ -189,6 +213,18 @@ class TaskPlanTracker:
                 if self.steps and self.steps[0].id == "extract_secrets":
                     self.steps[0].status = StepStatus.FAILED
                 return
+
+        if tool_name == "try_http_login":
+            # Making the attempt satisfies the step regardless of the verdict
+            # (accepted / rejected / unreachable are all reportable terminals).
+            for s in self.steps:
+                if s.id == "attempt_login":
+                    s.status = StepStatus.DONE
+                    if isinstance(result, dict):
+                        s.note = str(result.get("verdict") or result.get("error") or "login attempt made")[:120]
+                    else:
+                        s.note = "login attempt made"
+            return
 
         if tool_name == "crack_hash" and isinstance(result, dict):
             if result.get("status") == "exhausted":

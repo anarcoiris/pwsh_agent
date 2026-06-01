@@ -75,6 +75,27 @@ def analyze_pcapng(file_path: str, filter_expression: str = None, limit: int = 5
     return tools.analyze_pcapng(file_path=file_path, filter_expression=filter_expression, limit=limit)
 
 @mcp.tool()
+def try_http_login(
+    url: str,
+    user: str,
+    password: str,
+    method: str = "auto",
+    username_field: str = "username",
+    password_field: str = "password",
+    timeout_sec: int = 15,
+) -> dict:
+    """
+    Attempts to authenticate to an HTTP endpoint with a username and password
+    (HTTP Basic and/or form POST) and returns a heuristic accepted/rejected verdict.
+    Use this to test known credentials against a site — not hash cracking.
+    """
+    return tools.try_http_login(
+        url=url, user=user, password=password, method=method,
+        username_field=username_field, password_field=password_field,
+        timeout_sec=timeout_sec,
+    )
+
+@mcp.tool()
 def crack_hash(
     target_hash: str,
     mask: str = "NNNNNNAA!",
