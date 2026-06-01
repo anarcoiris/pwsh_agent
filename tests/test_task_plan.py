@@ -85,6 +85,8 @@ def test_empty_pwd_marks_failed():
 def test_placeholder_detection():
     assert _looks_like_placeholder_file("user:password\nxmlObj:salt")
     assert not _looks_like_placeholder_file("user=alice\npassword=hunter2\nxmlObj=abc123")
+    assert _looks_like_placeholder_file("xmlObj: 1234567890abcdef\nsalt: abcdef1234567890")
+    assert _looks_like_placeholder_file("# HTTP login forms (from analyze_pcapng http_forms)\n")
 
 
 def test_read_file_resets_failed_extract():

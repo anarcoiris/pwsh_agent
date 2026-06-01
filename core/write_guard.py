@@ -7,7 +7,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from core.task_intent import TaskIntent, TaskIntentExtractor
+from core.task_intent import TaskIntent, TaskIntentExtractor, path_matches_deliverable
 
 logger = logging.getLogger("pwsh_agent.core.write_guard")
 
@@ -35,9 +35,6 @@ class WriteGuard:
         path = str(args.get("path", "")).replace("\\", "/")
         content = str(args.get("content", ""))
 
-        if not TaskIntentExtractor.is_workspace_meta_path(path):
-            return tool_name, args, None
-
         # Distinguish "not provided" (None) from "explicitly empty" ([]): an
         # empty list means the caller asserts there are no pending deliverables
         # and must not silently fall back to the intent-derived list.
@@ -45,6 +42,27 @@ class WriteGuard:
             pending = pending_deliverables
         else:
             pending = intent.pending_deliverables() if intent else []
+
+        if pending and not path_matches_deliverable(path, pending):
+            # #region agent log
+            try:
+                from core.debug_log import debug_log
+                debug_log(
+                    "write_guard.py:apply",
+                    "blocked wrong deliverable path",
+                    {"path": path, "pending": pending},
+                    "W1",
+                )
+            except Exception:
+                pass
+            # #endregion
+            return tool_name, args, (
+                f"Blocked: required deliverable is '{pending[0]}', not '{path}'. "
+                f"Call write_file(path='{pending[0]}', content=<REAL extracted values>)."
+            )
+
+        if not TaskIntentExtractor.is_workspace_meta_path(path):
+            return tool_name, args, None
 
         if intent and intent.is_dev_task and pending:
             if TaskIntentExtractor.is_progress_note(content):

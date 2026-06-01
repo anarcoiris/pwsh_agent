@@ -257,7 +257,13 @@ class RetryOrchestrator:
     def __init__(self):
         self._parse_fail_count: int = 0
 
-    def parser_reflection(self, raw_content: str, parser=None) -> dict | None:
+    def parser_reflection(
+        self,
+        raw_content: str,
+        parser=None,
+        *,
+        session_id: str | None = None,
+    ) -> dict | None:
         """
         Return a synthetic sequentialthinking tool_call that forces the LLM
         to self-diagnose why it didn't emit a valid tool call, then plan the
@@ -277,6 +283,24 @@ class RetryOrchestrator:
                 self._parse_fail_count = 0
                 return salvaged
 
+        # Intent salvage: map user/action prose to a concrete tool (avoid thinking loops)
+        try:
+            from core.intent_salvage import salvage_intent_tool_call
+            intent_call = salvage_intent_tool_call(
+                raw_content,
+                getattr(parser, "_user_context", "") if parser else "",
+                session_id=session_id,
+            )
+            if intent_call:
+                logger.info(
+                    "parser_reflection: intent-salvaged tool call %s",
+                    intent_call["function"]["name"],
+                )
+                self._parse_fail_count = 0
+                return intent_call
+        except Exception:
+            pass
+
         self._parse_fail_count += 1
         if self._parse_fail_count > self.MAX_REFLECTIONS:
             logger.warning(
@@ -293,9 +317,12 @@ class RetryOrchestrator:
             f"Action plan:\n"
             f"  1. Identify the intent expressed in the output.\n"
             f"  2. Map that intent to the closest registered tool (host_exec, dns_lookup, port_scan, etc.).\n"
-            f"  3. Emit the correct tool call in valid JSON format in the VERY NEXT turn. Example:\n"
-            f"     {{\"name\": \"tool_name\", \"arguments\": {{\"param\": \"value\"}}}}\n"
-            f"  4. DO NOT use bash-like syntax like `tool_name arg1 arg2`. You MUST use JSON!"
+            f"  3. Emit the correct tool call using <tool_call> XML tags (required format). Example:\n"
+            f"<tool_call>\n"
+            f'{{"name": "find_and_grep", "arguments": {{"pattern": "xml|Password", '
+            f'"path_glob": ".pulse/pcap_logs/verbose_*.txt", "case_insensitive": true}}}}\n'
+            f"</tool_call>\n"
+            f"  4. DO NOT emit [SYSTEM] Task complete, [STATUS], or **Next Steps** prose — ONLY a tool call."
         )
         return {
             "function": {
@@ -383,6 +410,16 @@ class DynamicContextBuilder:
                 "Do NOT run port_scan, dns_lookup, ping_sweep, system_info, or http_headers_check "
                 "unless the user explicitly requests network activity.\n"
                 "In chat mode: do NOT declare MISSION_COMPLETE or generate engagement reports.\n"
+            )
+
+        from core.intent_salvage import _SEARCH_INTENT_RE
+        if _SEARCH_INTENT_RE.search(latest_lower):
+            return (
+                "\n[CURRENT PHASE: CREDENTIAL / LOG SEARCH]\n"
+                "Prior PCAP or credential work is active — NOT generic recon.\n"
+                "Use find_and_grep across .pulse/pcap_logs/verbose_*.txt "
+                "(pattern: password|Password|Username|xml|xmlObj|login).\n"
+                "Do NOT emit [SYSTEM] Task complete or **Next Steps** prose — emit a <tool_call> block.\n"
             )
 
         tools_used = {m.get("name", "") for m in messages if m.get("role") == "tool"}

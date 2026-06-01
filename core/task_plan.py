@@ -33,15 +33,42 @@ _PLACEHOLDER_PWD = re.compile(
 )
 
 
+def _looks_like_extraction_draft(content: str) -> bool:
+    """True when content is a PCAP extraction stub, not final cracked results."""
+    text = (content or "").strip()
+    if not text:
+        return True
+    lower = text.lower()
+    if "from analyze_pcapng http_forms" in lower:
+        return True
+    if "# full decode: read_file" in lower:
+        return True
+    if "plaintext=" in lower or "crack_status=" in lower:
+        return False
+    if re.search(r"\b[a-f0-9]{64}\b", text) and "salt=" in lower:
+        return False
+    return False
+
+
 def _looks_like_placeholder_file(content: str) -> bool:
     text = (content or "").strip()
     if not text:
+        return True
+    if _looks_like_extraction_draft(text):
         return True
     if len(text) > 500:
         return False
     if _PLACEHOLDER_PWD.search(text):
         return True
     if text.lower() in ("user:password", "user:password\nxmlObj:salt"):
+        return True
+    lower = text.lower()
+    has_user_pass = any(
+        k in lower
+        for k in ("username", "password", "user:", "password:", "user=", "password=")
+    )
+    has_xml_or_salt = "xmlobj" in lower or re.search(r"\bsalt\b", lower)
+    if has_xml_or_salt and not has_user_pass:
         return True
     return False
 
@@ -131,10 +158,28 @@ class TaskPlanTracker:
         if tool_name == "write_file" and isinstance(result, dict) and result.get("success"):
             content = str((args or {}).get("content", ""))
             path = str((args or {}).get("path", "")).replace("\\", "/")
-            if "pwd.txt" in path.lower() and _looks_like_placeholder_file(content):
+            from core.task_intent import (
+                path_matches_deliverable,
+                TaskIntentExtractor,
+                _is_credential_deliverable,
+            )
+
+            expected = TaskIntentExtractor._extract_deliverables(self.prompt)
+            expected_txt = next((d for d in expected if d.endswith(".txt")), "")
+            if expected_txt and not path_matches_deliverable(path, [expected_txt]):
                 self.last_failure = (
-                    "pwd.txt is empty or uses placeholder values — extract REAL credentials "
-                    "from PCAP/reports before writing."
+                    f"Wrote '{path}' but required deliverable is '{expected_txt}'."
+                )
+                for s in self.steps:
+                    if s.id == "write_deliverable":
+                        s.status = StepStatus.FAILED
+                        s.note = self.last_failure
+                return
+
+            if _is_credential_deliverable(path) and _looks_like_placeholder_file(content):
+                self.last_failure = (
+                    f"{path} is empty or uses placeholder/incomplete values — extract REAL "
+                    "user/password/xmlObj/salt from PCAP/reports before writing."
                 )
                 for s in self.steps:
                     if s.id == "write_deliverable":
@@ -256,6 +301,28 @@ class TaskPlanTracker:
             lines.extend(f"  - {n}" for n in self.strategy_notes[-3:])
         return "\n".join(lines)
 
+    def compact(self) -> dict[str, Any]:
+        """Compact plan state for the canonical CURRENT STATE injection.
+
+        Returns only the decision-relevant fields; the full checklist
+        (status_block) stays on disk via save_plan_state.
+        """
+        cur = self.current_step
+        phase = ""
+        next_action = ""
+        if cur:
+            phase = cur.id
+            first_tool = cur.tool_hint.split("|")[0].strip()
+            next_action = f"{cur.label} (use `{first_tool}`)" if first_tool else cur.label
+        return {
+            "goal": (self.prompt or "").strip()[:160],
+            "phase": phase,
+            "next_action": next_action,
+            "done_steps": [s.id for s in self.steps if s.status == StepStatus.DONE],
+            "last_failure": (self.last_failure or "")[:200],
+            "strategy": self.strategy_notes[-1] if self.strategy_notes else "",
+        }
+
     def readaptation_directive(self) -> str:
         parts = [
             "[SYSTEM — PLAN READAPTATION REQUIRED]",
@@ -272,8 +339,8 @@ class TaskPlanTracker:
             "2) If analyze_pcapng already ran, parse credential fields from that tool result "
             "(http_forms, potential_plaintext_credentials) — do NOT guess report paths.\n"
             "3) find_file('report_*.md') then read_file(path=<recommended>) — or read_file('report_*.md') directly.\n"
-            "4) find_file('verbose_*.txt') then grep_file(path=<recommended>, pattern='xmlObj|salt') "
-            "— or grep_file('.pulse/pcap_logs/verbose_*.txt', pattern=...) — or use pcap.verbose_log_file from SESSION FACTS.\n"
+            "4) find_and_grep(pattern='xml|Password|Username|616a6178|xmlObj', path_glob='.pulse/pcap_logs/verbose_*.txt', case_insensitive=true, max_files=10) "
+            "— or grep_file with pattern='xml' if a single log is known — or use pcap.verbose_log_file from SESSION FACTS.\n"
             "5) write_file the user deliverable with REAL values from http_forms/key_fields, then crack_hash."
         )
         return "\n".join(p for p in parts if p)

@@ -240,6 +240,29 @@ def _partition_turns(tail: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     return turns
 
 
+def _collapse_stale_nudges(
+    messages: list[dict[str, Any]],
+    keep_recent: int = 2,
+) -> list[dict[str, Any]]:
+    """Drop superseded control nudges, keeping only the most recent few.
+
+    Recurrent system directives (goal/deliverable/stall/readaptation) are
+    transient: only the latest one or two matter for the next decision. Older
+    copies are pure context tax, so we collapse them here. The pinned anchor
+    user message is never a directive (is_system_directive == False), so it is
+    preserved.
+    """
+    nudge_idx = [
+        i
+        for i, m in enumerate(messages)
+        if m.get("role") == "user" and is_system_directive(str(m.get("content", "")))
+    ]
+    if len(nudge_idx) <= keep_recent:
+        return messages
+    drop = set(nudge_idx[:-keep_recent])
+    return [m for i, m in enumerate(messages) if i not in drop]
+
+
 def _drop_oldest_turns(
     pinned: list[dict[str, Any]],
     turns: list[list[dict[str, Any]]],
@@ -341,6 +364,24 @@ class AgentContextManager:
     def get_messages(self) -> list[dict[str, Any]]:
         return self.messages
 
+    def messages_for_llm(self, max_turns: int | None = None) -> list[dict[str, Any]]:
+        """Return a windowed view for the LLM: pinned headers + last N turns.
+
+        Phase 2 history policy: the full log stays in self.messages (and on disk
+        via save_state) for audit/replay, but the model only needs the pinned
+        system/anchor prefix plus the most recent turns — CURRENT STATE carries
+        the durable continuity. Non-mutating: never shrinks the canonical log.
+        """
+        msgs = self.messages
+        if not max_turns or max_turns <= 0:
+            return msgs
+        pinned, tail = _pin_headers(msgs)
+        turns = _partition_turns(tail)
+        if len(turns) <= max_turns:
+            return msgs
+        kept = turns[-max_turns:]
+        return pinned + [m for t in kept for m in t]
+
     def set_messages(self, messages: list[dict[str, Any]]) -> None:
         self.messages = messages
 
@@ -352,6 +393,9 @@ class AgentContextManager:
 
     def trim_context(self) -> None:
         """Compact old tool results and enforce budget-first trim policy."""
+        # Collapse superseded control nudges before any other trimming so they
+        # do not consume the char/token budget reserved for real signal.
+        self.messages = _collapse_stale_nudges(self.messages, keep_recent=2)
         self.messages = ContextCompactor.compact_old_tool_results(
             self.messages,
             self.max_context_chars,

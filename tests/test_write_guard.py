@@ -36,6 +36,18 @@ def test_blocks_plan_write_when_deliverable_pending():
     assert name == "append_note" or err is not None
 
 
+def test_blocks_wrong_deliverable_path():
+    intent = TaskIntentExtractor.parse("write pwd_0106.txt with extracted values")
+    name, args, err = WriteGuard.apply(
+        "write_file",
+        {"path": "workspace/extracted_credentials.txt", "content": "hash=abc"},
+        intent,
+        pending_deliverables=["pwd_0106.txt"],
+    )
+    assert err is not None
+    assert "pwd_0106.txt" in err
+
+
 def test_allows_deliverable_write():
     intent = TaskIntentExtractor.parse(MSG)
     name, args, err = WriteGuard.apply(

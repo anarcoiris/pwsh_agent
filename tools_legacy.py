@@ -346,6 +346,48 @@ def read_file(path: str, line_start: int = 1, line_count: int = None) -> dict:
             return {"success": False, "error": "line_start must be >= 1."}
         if line_count is not None and line_count <= 0:
             return {"success": False, "error": "line_count must be > 0 when provided."}
+        norm = str(file_path).replace("\\", "/").lower()
+        if "/artifacts/" in norm and re.search(r"/(read_file|grep_file|analyze_pcapng)_\d", norm):
+            # #region agent log
+            try:
+                from core.debug_log import debug_log
+                debug_log(
+                    "tools_legacy.py:read_file",
+                    "blocked artifact spill read",
+                    {"path": norm},
+                    "B2",
+                )
+            except Exception:
+                pass
+            # #endregion
+            return {
+                "success": False,
+                "error": (
+                    f"'{path}' is a spilled tool-result artifact, not source data. "
+                    "Use analyze_pcapng output, verbose_log_file, or find_and_grep on "
+                    ".pulse/pcap_logs/verbose_*.txt instead."
+                ),
+            }
+        if file_path.suffix.lower() in {".pcap", ".pcapng"}:
+            # #region agent log
+            try:
+                from core.debug_log import debug_log
+                debug_log(
+                    "tools_legacy.py:read_file",
+                    "blocked binary capture read",
+                    {"path": str(file_path), "suffix": file_path.suffix.lower()},
+                    "B1",
+                )
+            except Exception:
+                pass
+            # #endregion
+            return {
+                "success": False,
+                "error": (
+                    f"'{path}' appears to be a packet capture file. "
+                    "Use analyze_pcapng(file_path=..., filter_expression='http', verbose=true) instead of read_file."
+                ),
+            }
 
         _MAX_UNBOUNDED_READ_BYTES = 2 * 1024 * 1024
         file_size = file_path.stat().st_size
@@ -400,7 +442,7 @@ def grep_file(
     pattern: str,
     max_matches: int = 50,
     context_lines: int = 0,
-    case_insensitive: bool = False,
+    case_insensitive: bool = True,
 ) -> dict:
     """
     Search a file for matching lines and return compact, line-numbered matches.
@@ -458,7 +500,7 @@ def find_and_grep(
     max_files: int = 5,
     max_matches_per_file: int = 20,
     context_lines: int = 0,
-    case_insensitive: bool = False,
+    case_insensitive: bool = True,
 ) -> dict:
     """
     Search multiple files matched by a filename glob for regex matches.

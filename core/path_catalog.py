@@ -15,7 +15,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from core.runtime_paths import app_root, search_roots, workspace_root
-from core.session_paths import facts_file, plan_file, status_file, session_workspace_dir
+from core.session_paths import plan_file, status_file, session_workspace_dir
 
 LEGACY_SESSION_NOTE_PATHS = frozenset({
     "workspace/plan.md",
@@ -70,10 +70,12 @@ def latest_pcap_verbose_log() -> Path | None:
 def session_context_paths(session_id: str) -> list[tuple[str, Path]]:
     """Ordered (label, path) for ephemeral session injection — no legacy workspace/plan.md."""
     sid = session_id
+    # NOTE: facts.json is intentionally excluded here — it is surfaced once via
+    # summarize_facts() in the session snippet, so listing it again would pay for
+    # the same structured facts twice.
     out: list[tuple[str, Path]] = [
         ("session_plan", plan_file(sid)),
         ("session_status", status_file(sid)),
-        ("session_facts", facts_file(sid)),
     ]
     for i, rp in enumerate(latest_reports(2)):
         out.append((f"report_{i}", rp))

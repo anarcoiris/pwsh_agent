@@ -30,3 +30,6 @@ agent:
   max_total_messages: 80
   max_tool_result_chars: 22000
   injection_budget_chars: 8000
+  # Phase 2: recent raw turns sent to the LLM each step. Full history stays on
+  # disk for audit; CURRENT STATE carries durable continuity. 0 = send all.
+  history_window_turns: 8

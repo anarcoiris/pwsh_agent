@@ -55,3 +55,22 @@ def test_grep_file_glob_report():
                 res = tools.grep_file("report_*.md", "CVE-2024")
                 assert res["success"], res.get("error")
                 assert res["match_count"] >= 1
+
+
+def test_read_file_blocks_pcap_binary():
+    with tempfile.TemporaryDirectory() as tmp:
+        p = Path(tmp) / "last_capture.pcapng"
+        p.write_bytes(b"\x0a\x0d\x0d\x0a\x01\x02binary")
+        res = tools.read_file(str(p))
+        assert not res["success"]
+        assert "analyze_pcapng" in res["error"]
+
+
+def test_read_file_blocks_artifact_spill():
+    with tempfile.TemporaryDirectory() as tmp:
+        p = Path(tmp) / "state" / "sessions" / "sid" / "artifacts" / "read_file_20260601_035041_x.txt"
+        p.parent.mkdir(parents=True)
+        p.write_text('{"success": true, "content": "nested"}', encoding="utf-8")
+        res = tools.read_file(str(p))
+        assert not res["success"]
+        assert "artifact" in res["error"].lower()

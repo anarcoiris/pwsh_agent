@@ -50,14 +50,116 @@ def _decode_xml_hint_from_key_fields(key_fields: str) -> str:
                     pass
             return (
                 "XML response present as hex in key_fields (frame ~12). "
-                "find_file('verbose_*.txt') then grep_file(path=<recommended>, pattern='xmlObj|ajax_response|ParaName') "
-                "or grep_file('.pulse/pcap_logs/verbose_*.txt', pattern='xmlObj|ajax_response|ParaName') "
+                "find_file('verbose_*.txt') then find_and_grep(pattern='xml|Password|Username|616a6178|xmlObj', "
+                "path_glob='.pulse/pcap_logs/verbose_*.txt', case_insensitive=true) "
                 "or decode the http.file_data hex column."
             )
     return ""
 
 
-def build_login_forms_draft(analysis: dict[str, Any], max_chars: int = 4000) -> str | None:
+_LOGIN_HASH_RE = re.compile(
+    r'"([0-9a-f]{64}),([^,\s"]+),(\d+),login"',
+    re.I,
+)
+_AJAX_SALT_RE = re.compile(
+    r"<ajax_response_xml_root>(\d+)</ajax_response_xml_root>",
+    re.I,
+)
+
+
+def parse_login_hashes(http_forms: str) -> list[dict[str, str]]:
+    """Extract SHA-256 password hashes from analyze_pcapng http_forms rows."""
+    entries: list[dict[str, str]] = []
+    for m in _LOGIN_HASH_RE.finditer(http_forms or ""):
+        entries.append({
+            "hash": m.group(1).lower(),
+            "username": m.group(2),
+            "session_token": m.group(3),
+        })
+    return entries
+
+
+def find_xml_salts(text: str) -> list[str]:
+    """Find xmlObj salt values (ajax_response_xml_root) in plain or hex-encoded text."""
+    salts: list[str] = []
+    seen: set[str] = set()
+
+    def _add(val: str) -> None:
+        if val and val not in seen:
+            seen.add(val)
+            salts.append(val)
+
+    for m in _AJAX_SALT_RE.finditer(text or ""):
+        _add(m.group(1))
+
+    for hex_m in re.finditer(r'"([0-9a-f]{24,})"', text or "", re.I):
+        try:
+            decoded = binascii.unhexlify(hex_m.group(1)[:8000]).decode(
+                "utf-8", errors="replace"
+            )
+        except (binascii.Error, ValueError):
+            continue
+        for m in _AJAX_SALT_RE.finditer(decoded):
+            _add(m.group(1))
+    return salts
+
+
+def pair_hashes_with_salts(
+    hashes: list[dict[str, str]],
+    salts: list[str],
+) -> list[dict[str, str]]:
+    """Pair login_entry hashes with login_token xmlObj salts (ordered)."""
+    pairs: list[dict[str, str]] = []
+    for i, entry in enumerate(hashes):
+        salt = salts[i] if i < len(salts) else (salts[-1] if salts else "")
+        pairs.append({**entry, "salt": salt})
+    return pairs
+
+
+def extract_hash_salt_pairs(analysis: dict[str, Any]) -> list[dict[str, str]]:
+    """Build hash+salt pairs from a single analyze_pcapng analysis dict."""
+    if not analysis:
+        return []
+    hashes = parse_login_hashes(str(analysis.get("http_forms", "")))
+    if not hashes:
+        return []
+    blob = "\n".join(
+        str(analysis.get(k, ""))
+        for k in ("key_fields", "packet_summary", "potential_plaintext_credentials", "http_index")
+    )
+    salts = find_xml_salts(blob)
+    return pair_hashes_with_salts(hashes, salts)
+
+
+def build_cracked_deliverable(
+    pairs: list[dict[str, str]],
+    crack_results: list[dict[str, Any]],
+) -> str:
+    """Format pwd*.txt content with hash, salt, and cracked plaintext."""
+    lines = ["# Password hash / salt / cracked results", ""]
+    for i, pair in enumerate(pairs):
+        lines.append(f"## entry_{i + 1}")
+        lines.append(f"hash={pair.get('hash', '')}")
+        lines.append(f"salt={pair.get('salt', '')}")
+        lines.append(f"username={pair.get('username', '')}")
+        if i < len(crack_results):
+            res = crack_results[i]
+            plain = res.get("password") or res.get("plaintext")
+            if plain:
+                lines.append(f"plaintext={plain}")
+            else:
+                status = res.get("status") or res.get("error") or "unknown"
+                lines.append(f"plaintext=NOT CRACKED ({status})")
+                mask = res.get("mask")
+                if mask:
+                    lines.append(f"mask_tried={mask}")
+        else:
+            lines.append("plaintext=NOT ATTEMPTED")
+        lines.append("")
+    return "\n".join(lines).strip() + "\n"
+
+
+def build_login_forms_draft(analysis: dict[str, Any], max_chars: int = 8000) -> str | None:
     """Structured text the model can paste into write_file(login_forms.txt)."""
     if not analysis:
         return None

@@ -141,9 +141,11 @@ def _pick_best_tool_calls(calls: list[dict], limit: int = 1) -> list[dict]:
     if not calls:
         return []
     priority = {
-        "write_file": 0, "read_file": 1, "find_file": 2, "run_script": 3,
-        "analyze_pcapng": 4, "host_exec": 5,
-        "finding_create": 6, "report_generate": 7,
+        "write_file": 0, "read_file": 1, "find_file": 2, "grep_file": 3,
+        "find_and_grep": 3, "run_script": 4,
+        "analyze_pcapng": 5, "host_exec": 6,
+        "crack_hash": 7,
+        "finding_create": 8, "report_generate": 9,
         "sequentialthinking": 50,
     }
 

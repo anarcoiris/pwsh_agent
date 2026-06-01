@@ -135,4 +135,76 @@ def test_strategy_note_bypass_when_pending():
     assert err is None
 
 
+def test_goal_guard_allows_one_sequentialthinking_then_blocks():
+    goals = ChatGoals(
+        required_tools=["crack_hash"],
+        label="Hash cracking",
+    )
+    _, _, err1 = ChatGoalGuard.apply(
+        "sequentialthinking",
+        {"thought": "Plan"},
+        goals,
+        [],
+    )
+    assert err1 is None
+    _, _, err2 = ChatGoalGuard.apply(
+        "sequentialthinking",
+        {"thought": "Plan again"},
+        goals,
+        [{"name": "sequentialthinking", "success": True}],
+    )
+    assert err2 is not None
+
+
+def test_actionable_extract_prompt_not_misclassified_as_display_only():
+    msg = (
+        "Extract a list with the Password hashes and salts, use hashpro, "
+        "then give me the results and write pwd_0106.txt"
+    )
+    goals = ChatGoals.from_message(msg)
+    assert goals is not None
+    assert goals.label != "Display session facts"
+    assert "crack_hash" in goals.required_tools
+
+
+def test_display_only_facts_prompt_uses_read_file_goal():
+    msg = "Show me the facts. Show me the Password hash and the salt."
+    goals = ChatGoals.from_message(msg)
+    assert goals is not None
+    assert goals.label == "Display session facts"
+    assert goals.required_tools == ["read_file"]
+
+
+def test_extract_pcap_hashes_to_custom_pwd_file_uses_multistep_goal():
+    msg = (
+        "Find last_capture.pcapng. Extract a list with Password hashes and salt, "
+        "use hashpro, and write results to pwd_0106.txt"
+    )
+    goals = ChatGoals.from_message(msg)
+    assert goals is not None
+    assert goals.label == "Extract credentials and crack hash"
+    assert goals.required_tools == ["read_file", "analyze_pcapng", "crack_hash", "write_file"]
+    assert goals.hints.get("deliverable_path") == "pwd_0106.txt"
+
+
+def test_goal_guard_blocks_write_before_crack():
+    goals = ChatGoals(
+        required_tools=["read_file", "analyze_pcapng", "crack_hash", "write_file"],
+        label="Extract credentials and crack hash",
+        hints={"deliverable_path": "pwd_1234.txt"},
+    )
+    executed = [
+        {"name": "read_file", "success": True},
+        {"name": "analyze_pcapng", "success": True},
+    ]
+    _, _, err = ChatGoalGuard.apply(
+        "write_file",
+        {"path": "pwd_1234.txt", "content": "hash=abc"},
+        goals,
+        executed,
+    )
+    assert err is not None
+    assert "crack_hash" in err
+
+
 print("All chat_goals tests passed.")

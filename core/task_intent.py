@@ -16,11 +16,27 @@ MissionKind = Literal["hash", "pcap", "dev", "recon", "general"]
 
 
 def _is_credential_deliverable(rel_path: str) -> bool:
-    lower = rel_path.replace("\\", "/").lower()
-    return any(
-        k in lower
-        for k in ("pwd.txt", "login_forms.txt", "login_forms", "credentials.txt")
-    )
+    lower = Path(rel_path.replace("\\", "/")).name.lower()
+    if lower in ("pwd.txt", "login_forms.txt", "credentials.txt"):
+        return True
+    if re.match(r"pwd(?:_[\d]+)?\.txt$", lower):
+        return True
+    return "login_forms" in lower
+
+
+def path_matches_deliverable(path: str, deliverables: list[str]) -> bool:
+    """True when write path matches one of the user-requested deliverable paths."""
+    if not deliverables:
+        return True
+    norm = path.replace("\\", "/").lower()
+    basename = Path(norm).name
+    for d in deliverables:
+        d_norm = d.replace("\\", "/").lower()
+        if norm == d_norm or norm.endswith("/" + d_norm):
+            return True
+        if Path(d_norm).name == basename:
+            return True
+    return False
 
 
 def _pwd_file_is_placeholder(path: Path) -> bool:

@@ -64,6 +64,7 @@ class ContextRouter:
         anchor_query: str | None = None,
         session_snippet: str | None = None,
         plan_block: str | None = None,
+        current_state: str | None = None,
         injection_budget_chars: int = 8000,
     ) -> list[dict[str, str]]:
         injections: list[dict[str, str]] = []
@@ -71,16 +72,22 @@ class ContextRouter:
         query = (anchor_query or "").strip() or resolve_anchor_query(messages)
         query = strip_directives(query)
 
-        if session_snippet:
-            injections.append({
-                "role": "system",
-                "content": f"{_SESSION_CTX_HEADER}\n{session_snippet}\n{'#' * len(_SESSION_CTX_HEADER)}",
-            })
-        if plan_block:
-            injections.append({
-                "role": "system",
-                "content": f"{_PLAN_CTX_HEADER}\n{plan_block}\n{'#' * len(_PLAN_CTX_HEADER)}",
-            })
+        if current_state:
+            # Phase 2: a single canonical block replaces the separate session
+            # snippet + plan status injections (already wrapped with its own
+            # ### CURRENT STATE ### header by build_current_state()).
+            injections.append({"role": "system", "content": current_state})
+        else:
+            if session_snippet:
+                injections.append({
+                    "role": "system",
+                    "content": f"{_SESSION_CTX_HEADER}\n{session_snippet}\n{'#' * len(_SESSION_CTX_HEADER)}",
+                })
+            if plan_block:
+                injections.append({
+                    "role": "system",
+                    "content": f"{_PLAN_CTX_HEADER}\n{plan_block}\n{'#' * len(_PLAN_CTX_HEADER)}",
+                })
 
         static_routing = get_static_tool_routing(max_chars=DEFAULT_STATIC_MAX_CHARS)
         if static_routing:

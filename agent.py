@@ -42,14 +42,14 @@ from core.llm_utils import (
     SequentialThinkingEngine,
 )
 from core.parser import AgentOutputParser
-from core.task_intent import TaskIntent, TaskIntentExtractor, _is_credential_deliverable
+from core.task_intent import TaskIntent, TaskIntentExtractor, _is_credential_deliverable, path_matches_deliverable
 from core.task_plan import (
     TaskPlanTracker,
-    load_session_context_snippets,
     load_plan_state,
     save_plan_state,
     clear_plan_state,
     _looks_like_placeholder_file,
+    _looks_like_extraction_draft,
 )
 from core.session_paths import (
     ensure_session_layout,
@@ -63,6 +63,12 @@ from core.session_paths import (
 )
 from core.spill import maybe_spill_text
 from core.facts_store import summarize_facts, update_from_tool
+from core.working_state import (
+    WorkingMemory,
+    build_current_state,
+    load_working_memory,
+    save_working_memory,
+)
 from core.chat_goals import ChatGoals, ChatGoalGuard, ChatGoalRegistry
 from core.write_guard import WriteGuard
 from core.execution_policy import ExecutionPolicy, set_pip_near
@@ -113,6 +119,7 @@ class OllamaAdapter:
         anchor_query: str | None = None,
         session_snippet: str | None = None,
         plan_block: str | None = None,
+        current_state: str | None = None,
     ) -> dict[str, Any]:
         try:
             for injection in ContextRouter.build_injections(
@@ -121,6 +128,7 @@ class OllamaAdapter:
                 anchor_query=anchor_query,
                 session_snippet=session_snippet,
                 plan_block=plan_block,
+                current_state=current_state,
                 injection_budget_chars=self.injection_budget_chars,
             ):
                 messages = messages + [injection]
@@ -225,6 +233,9 @@ class ReActAgent:
         self.max_total_messages = int(agent_cfg.get("max_total_messages", 80))
         self.max_tool_result_chars = int(agent_cfg.get("max_tool_result_chars", 22_000))
         self.injection_budget_chars = int(agent_cfg.get("injection_budget_chars", 8000))
+        # Phase 2: how many recent turns of raw history to send to the LLM. The
+        # full log is still persisted to disk; CURRENT STATE carries continuity.
+        self.history_window_turns = int(agent_cfg.get("history_window_turns", 8))
         self.max_context_tokens = int(agent_cfg.get("max_context_tokens", 0))
         self.reserve_generation_tokens = int(
             agent_cfg.get("reserve_generation_tokens", self.num_predict)
@@ -293,6 +304,16 @@ class ReActAgent:
         self._pending_script_failure: dict[str, Any] | None = None
         self._last_script_path: str | None = None
         self._chat_tool_events: list[dict[str, Any]] = []
+        # Transient ephemeral draft (e.g. login_forms) injected once via CURRENT STATE.
+        self._pcap_draft: str | None = None
+        self._pcap_draft_raw: str | None = None
+        self._credential_pairs: list[dict[str, str]] = []
+        self._crack_results: list[dict[str, Any]] = []
+        self._last_pcap_path: str | None = None
+        # Volatile reasoning scratch (Phase 2). Persisted small for continuity.
+        self._working_memory: WorkingMemory = WorkingMemory()
+        # Last tool result head, surfaced once via CURRENT STATE (not re-narrated).
+        self._last_tool_head: str = ""
 
         # Initialise system prompt if fresh session
         if not self.ctx_manager.has_system():
@@ -364,42 +385,28 @@ class ReActAgent:
             f"{identity_context}\n\n"
 
             "COGNITIVE WORKFLOW (ReAct):\n"
-            "1. Always start with a sequentialthinking call to plan your approach.\n"
-            "2. For multi-step MISSIONS: use the `append_note` tool on the session plan/status files for progress (never overwrite with write_file). For user-requested deliverables, use the `write_file` tool to the exact path.\n"
-            "3. Execute tools one at a time; inspect each result before proceeding.\n"
-            "4. Keep a persistent checklist updated via the `append_note` tool on the session status file.\n"
-            "5. Register significant discoveries using the `finding_create` tool.\n"
-            "6. When finished (mission mode only), declare MISSION_COMPLETE and summarise findings.\n\n"
-            
-            "DELIVERABLE RULES:\n"
-            "- User-requested files (e.g. watcher/watcher.py) MUST be written with the `write_file` tool to that path.\n"
-            f"- Session progress logs ONLY — use `append_note` on `{plan_path}` and `{status_path}` (never write_file for status lines).\n"
-            f"- Per-task scratch notes live under workspace/sessions/{self.session_id}/scratchpads/ — append via append_note.\n"
-            "- Do NOT substitute plan files for a code deliverable. Do NOT claim a script was created until `write_file` succeeded on the target path.\n\n"
+            "1. Plan briefly (one sequentialthinking call max), then act. Run tools one at a time and inspect each result before the next.\n"
+            f"2. Progress notes: append_note on `{plan_path}`/`{status_path}` (never write_file for status). Deliverables: write_file to the exact user path. Per-task notes: append_note under workspace/sessions/{self.session_id}/scratchpads/.\n"
+            "3. Register significant discoveries with finding_create. In mission mode, declare MISSION_COMPLETE only after producing evidence.\n\n"
 
             "TOOL CALL FORMAT:\n"
-            "You MUST use the exact `<tool_call>` XML tags for ALL tool calls. DO NOT use `<tool_response>`. DO NOT use XML child nodes like `<name>` inside the block. Provide ONLY valid JSON inside the tags.\n"
+            "Use the exact `<tool_call>` XML tags with ONLY valid JSON inside. No `<tool_response>`, no XML child nodes, no raw terminal syntax.\n"
             "<tool_call>\n"
             '{"name": "host_exec", "arguments": {"command": "Get-Process"}}\n'
             "</tool_call>\n\n"
-            
-            "AVAILABLE TOOLS:\n"
-            "— Core — sequentialthinking, host_exec, run_script, find_file, read_file, write_file, append_note\n"
-            "— Network Capture — list_network_interfaces, capture_packets, analyze_pcapng\n"
-            "— Recon — dns_lookup, ping_sweep, port_scan, http_headers_check, ssl_analysis, cve_lookup, system_info\n"
-            "— Intel — encode_decode, hash_identify, crack_hash\n"
-            "— Findings — finding_create, finding_list, report_generate\n\n"
+
+            "AVAILABLE TOOLS (see TOOL ROUTING for when to use each):\n"
+            "sequentialthinking, host_exec, run_script, find_file, read_file, grep_file, find_and_grep, "
+            "write_file, append_note, list_network_interfaces, capture_packets, analyze_pcapng, "
+            "dns_lookup, ping_sweep, port_scan, http_headers_check, ssl_analysis, cve_lookup, system_info, "
+            "encode_decode, hash_identify, crack_hash, finding_create, finding_list, report_generate.\n\n"
 
             "CRITICAL RULES:\n"
-            f"- Progress notes: use `append_note` on `{plan_path}` or `{status_path}`. Code deliverables: use `write_file` to the user-specified path.\n"
-            f"- Active session id: {self.session_id}. Prior sessions are preserved under workspace/sessions/ — use find_file or read_file only when the user asks for older work.\n"
-            "- Do NOT invent facts. Run a tool to verify everything.\n"
-            "- Emit only ONE tool call per turn.\n"
-            "- DO NOT write raw terminal commands to execute tools (e.g., `append_note file.txt msg`). Use ONLY the `<tool_call>` XML format.\n"
-            "- If a tool fails (e.g. file not found), DO NOT immediately retry or give up. You MUST use an investigative tool (find_file, read_file, host_exec) to understand the failure.\n"
-            "- Never repeat the exact same tool call with identical arguments.\n"
-            "- Use finding_create immediately when you discover a significant issue.\n"
-            "- Executing direct shell commands via host_exec is a strict LAST RESORT. Always prefer high-level specialized tools (e.g. port_scan, dns_lookup, system_info, analyze_pcapng) whenever they are available to minimize raw shell usage.\n"
+            "- Do NOT invent facts; verify with a tool. Do NOT claim a file was created until write_file succeeded on the target path.\n"
+            "- Emit ONE tool call per turn; never repeat an identical call. If a tool fails, investigate with find_file/read_file/grep_file/host_exec before retrying.\n"
+            "- In chat mode: NEVER emit [SYSTEM] Task complete, [STATUS], or **Next Steps** prose without a <tool_call> block in the same turn.\n"
+            f"- Active session id: {self.session_id}. Prior sessions under workspace/sessions/ — read them only when the user asks for older work.\n"
+            "- host_exec is a LAST RESORT; prefer specialized tools (port_scan, dns_lookup, analyze_pcapng, etc.).\n"
         )
 
         self.ctx_manager.clear_history()
@@ -450,6 +457,62 @@ class ReActAgent:
     def messages(self) -> list[dict]:
         """Legacy attribute accessor for console.py compatibility."""
         return self.ctx_manager.get_messages()
+
+    def _add_nudge(self, content: str) -> bool:
+        """Add a transient control nudge, skipping exact duplicates.
+
+        Recurrent control signals (goal/deliverable/stall directives) would
+        otherwise accumulate in persisted history and inflate every subsequent
+        prompt. We drop the add if an identical nudge already exists in the
+        recent window; stale nudges are further collapsed during trim_context.
+        Returns True if the nudge was appended.
+        """
+        text = (content or "").strip()
+        if not text:
+            return False
+        recent = self.ctx_manager.get_messages()[-10:]
+        for m in recent:
+            if m.get("role") == "user" and str(m.get("content", "")).strip() == text:
+                return False
+        self.ctx_manager.add_message({"role": "user", "content": text})
+        return True
+
+    def _artifact_refs(self) -> list[str]:
+        """Compact list of on-disk artifact pointers for CURRENT STATE.
+
+        Sourced from structured facts plus the requested deliverables that
+        already exist — paths only, no content (recoverable via read_file).
+        """
+        refs: list[str] = []
+        seen: set[str] = set()
+
+        def _add(label: str, value: str) -> None:
+            v = (value or "").strip()
+            if not v or v in seen:
+                return
+            seen.add(v)
+            refs.append(f"{label}: {v}")
+
+        try:
+            from core.facts_store import load_facts
+
+            facts = load_facts(self.session_id)
+            pcap = facts.get("pcap", {}) if isinstance(facts, dict) else {}
+            _add("pcap", str(pcap.get("path", "")))
+            _add("verbose_log", str(pcap.get("verbose_log_file", "")))
+        except Exception:
+            pass
+
+        try:
+            from core.path_catalog import session_context_paths, rel_path
+
+            for label, path in session_context_paths(self.session_id):
+                if label in ("login_forms.txt", "pwd.txt") and path.is_file():
+                    _add(label, rel_path(path))
+        except Exception:
+            pass
+
+        return refs[:8]
 
     # ── Tool execution ─────────────────────────────────────────────────────
 
@@ -568,6 +631,26 @@ class ReActAgent:
         if tool_name == "write_file":
             content = str(tool_args.get("content", ""))
             path = str(tool_args.get("path", "")).replace("\\", "/")
+            cg = getattr(self, "_chat_goals", None)
+            if cg and "crack_hash" in cg.required_tools and "crack_hash" in cg.pending(
+                getattr(self, "_chat_tool_events", [])
+            ):
+                block_err = (
+                    f"Blocked: run crack_hash before writing '{path}'. "
+                    "Extract hash+salt from http_forms/login_token, then write cracked plaintext."
+                )
+                if step_callback:
+                    step_callback("AGENT_TOOL_CALL", {"tool": tool_name, "args": tool_args})
+                    step_callback("AGENT_TOOL_RESULT", {
+                        "tool": tool_name,
+                        "result": {"success": False, "error": block_err},
+                    })
+                self.ctx_manager.add_message({
+                    "role": "tool",
+                    "name": tool_name,
+                    "content": json.dumps({"success": False, "error": block_err}),
+                })
+                return False, 0
             if _is_credential_deliverable(path) and _looks_like_placeholder_file(content):
                 block_err = (
                     f"Blocked: {path} must contain REAL values extracted from PCAP/reports "
@@ -601,10 +684,7 @@ class ReActAgent:
                 plan = getattr(self, "_task_plan", None)
                 if plan and plan.steps:
                     plan.register_tool(tool_name, {"success": False, "error": block_err}, tool_args)
-                    self.ctx_manager.add_message({
-                        "role": "user",
-                        "content": plan.readaptation_directive(),
-                    })
+                    # Readaptation surfaced via plan_block next step, not persisted.
                 return False, 0
 
         # Deduplication
@@ -677,6 +757,56 @@ class ReActAgent:
             success_flag = True
             if isinstance(result, dict) and result.get("success") is False:
                 success_flag = False
+            if (
+                tool_name == "write_file"
+                and success_flag
+                and self._active_intent
+                and self._active_intent.deliverables
+            ):
+                wpath = str(tool_args.get("path", ""))
+                if not path_matches_deliverable(wpath, self._active_intent.deliverables):
+                    success_flag = False
+                    # #region agent log
+                    try:
+                        from core.debug_log import debug_log
+                        debug_log(
+                            "agent.py:_execute_tool",
+                            "write_file wrong deliverable for goals",
+                            {"path": wpath, "expected": self._active_intent.deliverables},
+                            "W2",
+                        )
+                    except Exception:
+                        pass
+                    # #endregion
+            cg = getattr(self, "_chat_goals", None)
+            if tool_name == "crack_hash":
+                # A terminal crack outcome (found OR exhausted) completes the step;
+                # only genuine tool errors (bad args, launcher missing) leave it pending.
+                if isinstance(result, dict) and (
+                    result.get("success") or result.get("status") == "exhausted"
+                ):
+                    success_flag = True
+            if tool_name == "write_file" and success_flag and cg and "crack_hash" in cg.required_tools:
+                content = str(tool_args.get("content", ""))
+                done = ChatGoals._successful_names(self._chat_tool_events)
+                if "crack_hash" not in done or _looks_like_extraction_draft(content):
+                    success_flag = False
+                    # #region agent log
+                    try:
+                        from core.debug_log import debug_log
+                        debug_log(
+                            "agent.py:_execute_tool",
+                            "write_file before crack or extraction draft",
+                            {
+                                "path": str(tool_args.get("path", "")),
+                                "crack_done": "crack_hash" in done,
+                                "extraction_draft": _looks_like_extraction_draft(content),
+                            },
+                            "H5",
+                        )
+                    except Exception:
+                        pass
+                    # #endregion
             self._chat_tool_events.append({
                 "name": tool_name,
                 "success": success_flag,
@@ -700,6 +830,10 @@ class ReActAgent:
                     "role":    "user",
                     "content": reflection_hint,
                 })
+            else:
+                grep_hint = self._build_grep_miss_hint(tool_name, result, tool_args)
+                if grep_hint:
+                    self.ctx_manager.add_message({"role": "user", "content": grep_hint})
 
         if tool_name == "run_script" and isinstance(result, dict):
             exit_code = result.get("exit_code", 0)
@@ -740,8 +874,8 @@ class ReActAgent:
         if tool_name == "analyze_pcapng" and isinstance(result, dict) and result.get("success"):
             analysis = result.get("analysis") or {}
             low = result_str.lower()
+            digest_parts: list[str] = []
             if not any(k in low for k in ("login", "password", "xmlobj", "credential")):
-                digest_parts: list[str] = []
                 kf = analysis.get("key_fields")
                 if kf:
                     digest_parts.append(f"key_fields:\n{str(kf)[:4000]}")
@@ -749,12 +883,25 @@ class ReActAgent:
                     val = analysis.get(key)
                     if val:
                         digest_parts.append(f"{key}:\n{str(val)[:4000]}")
+            # Fold the verbose-log pointer into this single canonical tool message
+            # so we do not emit a separate summary message for the same analysis.
+            log_file = analysis.get("verbose_log_file")
+            pointer = ""
+            if log_file:
+                log_bytes = analysis.get("verbose_log_bytes", 0)
+                pointer = (
+                    f"verbose_log ({log_bytes} chars) -> {log_file}\n"
+                    f"read_file(path=\"{log_file}\", line_start=1, line_count=100) to inspect; "
+                    f"find_and_grep(pattern='xml|Password|Username|616a6178|xmlObj', "
+                    f"path_glob='.pulse/pcap_logs/verbose_*.txt', case_insensitive=true, max_files=10)."
+                )
+            if digest_parts or pointer:
+                extra = ""
                 if digest_parts:
-                    result_str = (
-                        result_str[:16_000]
-                        + "\n\n[CREDENTIAL DIGEST]\n"
-                        + "\n\n".join(digest_parts)
-                    )[:ResultCompactor.MAX_CHARS]
+                    extra += "\n\n[CREDENTIAL DIGEST]\n" + "\n\n".join(digest_parts)
+                if pointer:
+                    extra += "\n\n[VERBOSE LOG POINTER]\n" + pointer
+                result_str = (result_str[:16_000] + extra)[:ResultCompactor.MAX_CHARS]
         elif spill_meta and isinstance(result, dict):
             # Pointer-first compaction for large non-PCAP outputs.
             result_str = json.dumps(
@@ -790,6 +937,27 @@ class ReActAgent:
                 pass
         # #endregion
 
+        # #region agent log
+        if tool_name in ("grep_file", "find_and_grep"):
+            try:
+                from core.debug_log import debug_log
+                debug_log(
+                    "agent.py:_execute_tool:grep",
+                    "grep result",
+                    {
+                        "tool": tool_name,
+                        "path": str((tool_args or {}).get("path") or (tool_args or {}).get("path_glob", "")),
+                        "pattern": str((tool_args or {}).get("pattern", "")),
+                        "case_insensitive": (tool_args or {}).get("case_insensitive"),
+                        "match_count": result.get("match_count") if tool_name == "grep_file" else result.get("total_matches"),
+                        "files_with_matches": result.get("files_with_matches"),
+                    },
+                    "A",
+                )
+            except Exception:
+                pass
+        # #endregion
+
         # Audit
         get_audit().record(AuditEntry(
             method=tool_name,
@@ -807,8 +975,77 @@ class ReActAgent:
 
         if tool_name == "analyze_pcapng" and isinstance(result, dict) and result.get("success"):
             analysis = result.get("analysis", {})
+            self._last_pcap_path = str(tool_args.get("file_path") or self._last_pcap_path or "")
             try:
-                from core.credential_extract import build_login_forms_draft, has_login_evidence
+                from core.credential_extract import (
+                    build_login_forms_draft,
+                    extract_hash_salt_pairs,
+                    find_xml_salts,
+                    has_login_evidence,
+                    pair_hashes_with_salts,
+                )
+                new_pairs = extract_hash_salt_pairs(analysis)
+                if new_pairs:
+                    if self._credential_pairs and not any(
+                        p.get("salt") for p in self._credential_pairs
+                    ):
+                        salts = [p.get("salt", "") for p in new_pairs if p.get("salt")]
+                        if not salts:
+                            blob = "\n".join(
+                                str(analysis.get(k, ""))
+                                for k in ("key_fields", "packet_summary", "http_index")
+                            )
+                            salts = find_xml_salts(blob)
+                        base = [
+                            {
+                                "hash": p["hash"],
+                                "username": p.get("username", ""),
+                                "session_token": p.get("session_token", ""),
+                            }
+                            for p in self._credential_pairs
+                        ] or [
+                            {
+                                "hash": p["hash"],
+                                "username": p.get("username", ""),
+                                "session_token": p.get("session_token", ""),
+                            }
+                            for p in new_pairs
+                        ]
+                        self._credential_pairs = pair_hashes_with_salts(base, salts)
+                    else:
+                        self._credential_pairs = new_pairs
+                elif self._credential_pairs and not any(
+                    p.get("salt") for p in self._credential_pairs
+                ):
+                    blob = "\n".join(
+                        str(analysis.get(k, ""))
+                        for k in ("key_fields", "packet_summary", "http_index", "http_forms")
+                    )
+                    salts = find_xml_salts(blob)
+                    if salts:
+                        base = [
+                            {
+                                "hash": p["hash"],
+                                "username": p.get("username", ""),
+                                "session_token": p.get("session_token", ""),
+                            }
+                            for p in self._credential_pairs
+                        ]
+                        self._credential_pairs = pair_hashes_with_salts(base, salts)
+                pairs = self._credential_pairs
+                if pairs:
+                    # #region agent log
+                    try:
+                        from core.debug_log import debug_log
+                        debug_log(
+                            "agent.py:_execute_tool",
+                            "hash/salt pairs extracted",
+                            {"count": len(pairs), "has_salt": any(p.get("salt") for p in pairs)},
+                            "H5",
+                        )
+                    except Exception:
+                        pass
+                    # #endregion
                 if has_login_evidence(analysis):
                     self._pcap_objective_met = True
                     draft = build_login_forms_draft(analysis)
@@ -816,20 +1053,21 @@ class ReActAgent:
                         deliverable = "login_forms.txt"
                         if self._active_intent and self._active_intent.deliverables:
                             deliverable = self._active_intent.deliverables[0]
-                        self.ctx_manager.add_message({
-                            "role": "user",
-                            "content": (
-                                f"[SYSTEM] Draft for write_file(path='{deliverable}') "
-                                "from analyze_pcapng — verify xmlObj/salt, edit if needed:\n"
-                                f"{draft}"
-                            ),
-                        })
+                        # Store as a transient draft injected once (ephemeral), not
+                        # persisted to history — avoids a third copy of the same
+                        # analysis fields living in the message log.
+                        self._pcap_draft = (
+                            f"[DRAFT for write_file(path='{deliverable}')] "
+                            "from analyze_pcapng — verify xmlObj/salt, edit if needed:\n"
+                            f"{draft}"
+                        )
+                        self._pcap_draft_raw = draft
                         # #region agent log
                         try:
                             from core.debug_log import debug_log
                             debug_log(
                                 "agent.py:_execute_tool",
-                                "login_forms draft injected",
+                                "login_forms draft staged (ephemeral)",
                                 {"deliverable": deliverable, "draft_len": len(draft)},
                                 "H4",
                             )
@@ -840,6 +1078,32 @@ class ReActAgent:
                 pass
             if analysis.get("extracted_secrets"):
                 self._pcap_objective_met = True
+
+        if tool_name == "crack_hash" and isinstance(result, dict) and (
+            result.get("success") or result.get("status") == "exhausted"
+        ):
+            self._crack_results.append(dict(result))
+            # #region agent log
+            try:
+                from core.debug_log import debug_log
+                debug_log(
+                    "agent.py:_execute_tool",
+                    "crack_hash result recorded",
+                    {
+                        "count": len(self._crack_results),
+                        "has_password": bool(result.get("password")),
+                        "status": result.get("status"),
+                    },
+                    "H5",
+                )
+            except Exception:
+                pass
+            # #endregion
+
+        if tool_name == "analyze_pcapng" and isinstance(result, dict) and result.get("success"):
+            analysis = result.get("analysis", {})
+            if analysis.get("extracted_secrets"):
+                pass  # handled above
             creds = str(analysis.get("potential_plaintext_credentials", ""))
             if creds and re.search(r"(login|password|authorization|credential)", creds, re.I):
                 self._pcap_objective_met = True
@@ -910,30 +1174,41 @@ class ReActAgent:
                 cur = plan.current_step
                 if cur:
                     plan.append_scratchpad(self.session_id, cur.id, note)
-                self.ctx_manager.add_message({
-                    "role": "user",
-                    "content": plan.readaptation_directive(),
-                })
+                # Readaptation guidance is injected ephemerally via plan_block on
+                # the next step, not appended to persisted history.
 
-        if tool_name == "analyze_pcapng" and isinstance(result, dict) and result.get("success"):
-            analysis = result.get("analysis") or {}
-            if analysis.get("http_forms") or analysis.get("potential_plaintext_credentials"):
-                if "[CREDENTIAL DIGEST]" not in result_str:
-                    self.ctx_manager.add_message({
-                        "role": "user",
-                        "content": (
-                        "[SYSTEM] PCAP credential fields are in the analyze_pcapng result above "
-                        "(http_forms / potential_plaintext_credentials). Extract Username, Password, "
-                        "hash, and xmlObj/salt — use grep_file on verbose_log for xml keys if missing. "
-                        "write_file the user-requested deliverable (e.g. login_forms.txt), then crack_hash."
-                        ),
-                    })
+        # Credential-extraction guidance is carried by the single tool message
+        # (CREDENTIAL DIGEST / VERBOSE LOG POINTER) and the plan_block injection,
+        # so no separate persisted nudge is emitted here.
 
         if tool_name == "read_file" and isinstance(result, dict) and result.get("success"):
             if re.search(r"(login|password|xmlobj)", str(result.get("content", "")), re.I):
                 self._pcap_objective_met = True
 
         success_exec = not (isinstance(result, dict) and result.get("success") is False)
+
+        # Phase 2 STRUCTURED UPDATE: refresh volatile working memory + last-tool
+        # head so the NEXT CURRENT STATE reflects this step, instead of appending
+        # narrative user messages to the persisted history.
+        try:
+            ok_word = "ok" if success_exec else "FAILED"
+            self._last_tool_head = f"{tool_name} -> {ok_word}: {result_str[:380]}"
+            wm_failure = None
+            wm_next = None
+            if plan and plan.steps:
+                pc = plan.compact()
+                wm_next = pc.get("next_action") or None
+                if plan.needs_readaptation():
+                    wm_failure = pc.get("last_failure") or None
+            self._working_memory.update(
+                observation=self._last_tool_head,
+                next_action=wm_next,
+                failure=("" if success_exec and not wm_failure else wm_failure),
+            )
+            save_working_memory(self.session_id, self._working_memory)
+        except Exception:
+            pass
+
         return success_exec, (1 if success_exec else 0)
 
     # ── Mission loop ───────────────────────────────────────────────────────
@@ -1083,17 +1358,14 @@ class ReActAgent:
                     break
                 else:
                     # Not enough tools run — reject and keep going
-                    self.ctx_manager.add_message({
-                        "role":    "user",
-                        "content": (
-                            f"[SYSTEM] MISSION_COMPLETE rejected — tools_executed={tools_executed}, "
-                            f"minimum={self.MIN_TOOLS_BEFORE_COMPLETE}, "
-                            f"substantive={getattr(self._mission_tracker, 'substantive_tools', 0)}, "
-                            f"substantive_minimum={self.MIN_SUBSTANTIVE_BEFORE_COMPLETE}, "
-                            f"objective_satisfied={objective_ok}. "
-                            "Continue your investigation and produce evidence before completion."
-                        ),
-                    })
+                    self._add_nudge(
+                        f"[SYSTEM] MISSION_COMPLETE rejected — tools_executed={tools_executed}, "
+                        f"minimum={self.MIN_TOOLS_BEFORE_COMPLETE}, "
+                        f"substantive={getattr(self._mission_tracker, 'substantive_tools', 0)}, "
+                        f"substantive_minimum={self.MIN_SUBSTANTIVE_BEFORE_COMPLETE}, "
+                        f"objective_satisfied={objective_ok}. "
+                        "Continue your investigation and produce evidence before completion."
+                    )
                     continue
 
             if tool_calls:
@@ -1132,18 +1404,14 @@ class ReActAgent:
                         if boot:
                             self._mission_tools_executed.extend(boot)
                     if self._mission_goals and self._mission_goals.pending(self._mission_tools_executed):
-                        self.ctx_manager.add_message({
-                            "role": "user",
-                            "content": self._mission_goals.nudge_text(
+                        self._add_nudge(
+                            self._mission_goals.nudge_text(
                                 self._mission_goals.pending(self._mission_tools_executed)
-                            ),
-                        })
+                            )
+                        )
 
                 if self._mission_tracker and self._mission_tracker.needs_stall_recovery():
-                    self.ctx_manager.add_message({
-                        "role": "user",
-                        "content": self._mission_tracker.stall_directive(),
-                    })
+                    self._add_nudge(self._mission_tracker.stall_directive())
                     if self.mission_evaluator and MissionEvaluator.should_run(user_prompt):
                         try:
                             eval_data = await self.mission_evaluator.evaluate(
@@ -1154,17 +1422,16 @@ class ReActAgent:
                             )
                             hint = str(eval_data.get("hint", "")).strip()
                             if hint:
-                                self.ctx_manager.add_message({
-                                    "role": "user",
-                                    "content": f"[SYSTEM EVALUATOR] {hint}",
-                                })
+                                self._add_nudge(f"[SYSTEM EVALUATOR] {hint}")
                         except Exception:
                             pass
             else:
                 # No tool call — attempt parser reflection
                 consecutive_empty += 1
 
-                reflection = self.retry_orchestrator.parser_reflection(content, self.parser)
+                reflection = self.retry_orchestrator.parser_reflection(
+                    content, self.parser, session_id=self.session_id
+                )
 
                 if reflection:
                     consecutive_empty = 0
@@ -1193,7 +1460,7 @@ class ReActAgent:
                         "then immediately call a recon or execution tool. "
                         "Do NOT produce prose or declare MISSION_COMPLETE yet."
                     )
-                    self.ctx_manager.add_message({"role": "user", "content": nudge})
+                    self._add_nudge(nudge)
                     try:
                         from core.debug_log import log_completion_exit
                         log_completion_exit(
@@ -1300,6 +1567,9 @@ class ReActAgent:
         self.parser.set_user_context(raw_message)
         self._active_intent = TaskIntentExtractor.parse(message)
         self._chat_tool_events = []
+        self._credential_pairs = []
+        self._crack_results = []
+        self._last_pcap_path = None
 
         deliverable_hint = ""
         if self._active_intent.deliverables:
@@ -1328,24 +1598,10 @@ class ReActAgent:
         self._last_pcap_summary: str | None = None
         self._pcap_objective_met: bool = False
         self._task_plan = load_plan_state(self.session_id) or TaskPlanTracker(message)
-
-        session_snippet = load_session_context_snippets(
-            self.app_root, self.workspace_root, session_id=self.session_id,
-        )
-        from core.path_catalog import deliverable_hint_block
-        path_block = deliverable_hint_block(
-            self.session_id,
-            self._active_intent.deliverables if self._active_intent else [],
-        )
-        session_snippet = (
-            f"{session_snippet}\n\n{path_block}" if session_snippet else path_block
-        )
-        facts_hint = summarize_facts(self.session_id, max_chars=600)
-        if facts_hint:
-            if session_snippet:
-                session_snippet = f"{session_snippet}\n\n{facts_hint}"
-            else:
-                session_snippet = facts_hint
+        # Phase 2: load volatile working memory and reset the per-turn tool head.
+        self._working_memory = load_working_memory(self.session_id)
+        self._last_tool_head = ""
+        self._rehydrate_credential_pairs()
 
         if chat_goals and chat_goals.context_directive():
             self.ctx_manager.add_message({
@@ -1357,6 +1613,7 @@ class ReActAgent:
         max_goal_nudges = 4
         evaluator_nudges = 0
         max_evaluator_nudges = 1
+        crack_bootstrap_attempted = False
 
         # #region agent log
         try:
@@ -1384,7 +1641,24 @@ class ReActAgent:
         for step in range(12):
             self._chat_tools_executed = list(tools_executed_names)
 
-            plan_block = self._task_plan.status_block() if self._task_plan.steps else None
+            # Phase 2: one canonical CURRENT STATE injection replaces the separate
+            # session snippet + plan status blocks. Rebuilt each step so it always
+            # reflects the latest facts/plan/working-memory; never persisted to
+            # history. The long checklist lives only on disk (plan_state).
+            plan_compact = self._task_plan.compact() if self._task_plan.steps else None
+            draft = ""
+            if self._pcap_draft:
+                draft = self._pcap_draft
+                self._pcap_draft = None
+            current_state = build_current_state(
+                mission=raw_message,
+                plan=plan_compact,
+                working_memory=self._working_memory,
+                last_tool_result=self._last_tool_head,
+                draft=draft,
+                facts_block=summarize_facts(self.session_id, max_chars=500),
+                artifact_refs=self._artifact_refs(),
+            )
 
             self.ctx_manager.trim_context()
             # #region agent log
@@ -1406,16 +1680,69 @@ class ReActAgent:
                 pass
             # #endregion
             response = await self.adapter.chat(
-                messages=self.ctx_manager.get_messages(),
+                messages=self.ctx_manager.messages_for_llm(self.history_window_turns),
                 tools_schema=tools.TOOLS_SCHEMA,
                 task_intent=self._active_intent,
                 anchor_query=self._anchor_query,
-                session_snippet=session_snippet or None,
-                plan_block=plan_block,
+                current_state=current_state or None,
             )
 
             msg     = response.get("message", {})
             content = msg.get("content", "") or ""
+            if isinstance(content, str) and content.strip().startswith("ERROR: Ollama unreachable."):
+                # #region agent log
+                try:
+                    from core.debug_log import debug_log
+                    debug_log(
+                        "agent.py:chat_turn",
+                        "llm unreachable fallback",
+                        {
+                            "step": step,
+                            "chat_goal": chat_goals.label if chat_goals else None,
+                            "tools_so_far": list(tools_executed_names),
+                        },
+                        "L1",
+                    )
+                except Exception:
+                    pass
+                # #endregion
+                pending_now = chat_goals.pending(self._chat_tool_events) if chat_goals else []
+                recovered = False
+                if chat_goals and any(t in pending_now for t in ("read_file", "analyze_pcapng")):
+                    boot = await self._bootstrap_pcap_analysis(chat_goals, tools_called, step_callback)
+                    if boot:
+                        tools_executed_names.extend(boot)
+                        recovered = True
+                elif chat_goals and "find_and_grep" in pending_now:
+                    boot = await self._bootstrap_verbose_grep(tools_called, step_callback)
+                    if boot:
+                        tools_executed_names.extend(boot)
+                        recovered = True
+                elif chat_goals and "crack_hash" in pending_now and self._credential_pairs:
+                    boot = await self._bootstrap_crack_hash(
+                        chat_goals, tools_called, step_callback
+                    )
+                    if boot:
+                        tools_executed_names.extend(boot)
+                        recovered = True
+                elif (
+                    chat_goals
+                    and "write_file" in pending_now
+                    and self._crack_results
+                    and self._credential_pairs
+                ):
+                    boot = await self._bootstrap_write_cracked(
+                        chat_goals, tools_called, step_callback
+                    )
+                    if boot:
+                        tools_executed_names.extend(boot)
+                        recovered = True
+                if recovered:
+                    self._chat_tools_executed = list(tools_executed_names)
+                    self._add_nudge(
+                        "[SYSTEM] LLM temporarily unavailable; continued with deterministic tool fallback."
+                    )
+                    continue
             _, reasoning, tool_calls = self.parser.process_llm_output(msg)
 
             assistant_msg = {"role": "assistant", "content": content}
@@ -1430,6 +1757,8 @@ class ReActAgent:
 
             if tool_calls:
                 consecutive_no_tool = 0
+                batch_executed = False
+                batch_only_notes = bool(tool_calls)
                 for tc in tool_calls:
                     func = tc.get("function", tc)
                     name = func.get("name", tc.get("name", ""))
@@ -1441,36 +1770,90 @@ class ReActAgent:
                             args = {}
                     if not isinstance(args, dict):
                         args = {}
+                    if name != "append_note":
+                        batch_only_notes = False
                     did_exec, _ = await self._execute_tool(name, args, tools_called, step_callback)
                     if did_exec:
+                        batch_executed = True
                         tools_executed_names.append(name)
                         if name == "write_file" and args.get("path"):
                             paths_written.append(str(args["path"]).replace("\\", "/"))
 
                 self._chat_tools_executed = list(tools_executed_names)
 
+                pending_goals = chat_goals.pending(self._chat_tool_events) if chat_goals else []
+                if (
+                    chat_goals
+                    and "crack_hash" in pending_goals
+                    and self._credential_pairs
+                    and not self._crack_hash_succeeded()
+                    and not crack_bootstrap_attempted
+                    and (not batch_executed or batch_only_notes)
+                ):
+                    crack_bootstrap_attempted = True
+                    # #region agent log
+                    try:
+                        from core.debug_log import debug_log
+                        debug_log(
+                            "agent.py:chat_turn",
+                            "append_note stall → crack bootstrap",
+                            {
+                                "step": step,
+                                "batch_executed": batch_executed,
+                                "batch_only_notes": batch_only_notes,
+                                "pairs": len(self._credential_pairs),
+                            },
+                            "L2",
+                        )
+                    except Exception:
+                        pass
+                    # #endregion
+                    boot = await self._bootstrap_crack_hash(
+                        chat_goals, tools_called, step_callback
+                    )
+                    if boot:
+                        tools_executed_names.extend(boot)
+                        self._chat_tools_executed = list(tools_executed_names)
+                        self._add_nudge(
+                            "[SYSTEM] Progress notes blocked — ran crack_hash bootstrap with extracted hash/salt pairs."
+                        )
+                        continue
+
                 # Do not exit immediately after the last required tool — allow further ReAct steps.
 
                 pending = self._active_intent.pending_deliverables(self.workspace_root)
                 if pending and deliverable_nudges < 2:
                     deliverable_nudges += 1
-                    self.ctx_manager.add_message({
-                        "role":    "user",
-                        "content": (
-                            f"[SYSTEM] Deliverable not on disk yet: {pending[0]}. "
-                            "Extract real content from PCAP/reports first, then write_file "
-                            "(no placeholders like user:password)."
-                        ),
-                    })
+                    self._add_nudge(
+                        f"[SYSTEM] Deliverable not on disk yet: {pending[0]}. "
+                        "Extract real content from PCAP/reports first, then write_file "
+                        "(no placeholders like user:password)."
+                    )
 
                 pending_goals = chat_goals.pending(self._chat_tool_events) if chat_goals else []
                 if pending_goals and goal_nudges < max_goal_nudges:
                     goal_nudges += 1
-                    self.ctx_manager.add_message({
-                        "role": "user",
-                        "content": chat_goals.nudge_text(pending_goals),
-                    })
+                    self._add_nudge(chat_goals.nudge_text(pending_goals))
                     continue
+
+                if (
+                    chat_goals
+                    and "write_file" in (chat_goals.pending(self._chat_tool_events) or [])
+                    and self._crack_results
+                    and self._credential_pairs
+                    and self._active_intent
+                    and self._active_intent.deliverables
+                ):
+                    boot = await self._bootstrap_write_cracked(
+                        chat_goals, tools_called, step_callback
+                    )
+                    if boot:
+                        tools_executed_names.extend(boot)
+                        paths_written.append(
+                            str(self._active_intent.deliverables[0]).replace("\\", "/")
+                        )
+                        self._chat_tools_executed = list(tools_executed_names)
+                        continue
 
                 if self._task_plan.steps and self._task_plan.needs_readaptation():
                     if self.mission_evaluator and evaluator_nudges < max_evaluator_nudges:
@@ -1488,21 +1871,56 @@ class ReActAgent:
                                 cur = self._task_plan.current_step
                                 if cur:
                                     self._task_plan.append_scratchpad(self.session_id, cur.id, hint)
-                                self.ctx_manager.add_message({
-                                    "role": "user",
-                                    "content": f"[SYSTEM EVALUATOR — readapt] {hint}",
-                                })
                         except Exception:
                             pass
-                    else:
-                        self.ctx_manager.add_message({
-                            "role": "user",
-                            "content": self._task_plan.readaptation_directive(),
-                        })
+                    # Readaptation/evaluator guidance is surfaced via plan_block on
+                    # the next step (strategy notes + last failure), not persisted.
                     continue
             else:
                 consecutive_no_tool += 1
+                from core.intent_salvage import (
+                    hard_action_nudge,
+                    looks_like_prose_stall,
+                    salvage_intent_tool_call,
+                )
+
+                if looks_like_prose_stall(content):
+                    # #region agent log
+                    try:
+                        from core.debug_log import debug_log
+                        debug_log(
+                            "agent.py:chat_turn",
+                            "prose stall detected",
+                            {"step": step, "content_head": content[:200]},
+                            "E",
+                        )
+                    except Exception:
+                        pass
+                    # #endregion
+                    intent_call = salvage_intent_tool_call(
+                        content, message, session_id=self.session_id
+                    )
+                    if intent_call:
+                        iname = intent_call["function"]["name"]
+                        iargs = intent_call["function"]["arguments"]
+                        did_exec, _ = await self._execute_tool(
+                            iname, iargs, tools_called, step_callback
+                        )
+                        if did_exec:
+                            tools_executed_names.append(iname)
+                            self.retry_orchestrator.reset()
+                        self._chat_tools_executed = list(tools_executed_names)
+                        continue
+                    self._add_nudge(hard_action_nudge(message, self.session_id))
+                    continue
+
                 salvage = self.parser.salvage_tool_call(content, user_context=message)
+                if not salvage:
+                    intent_call = salvage_intent_tool_call(
+                        content, message, session_id=self.session_id
+                    )
+                    if intent_call:
+                        salvage = intent_call
                 pending_goals = chat_goals.pending(self._chat_tool_events) if chat_goals else []
 
                 if salvage and salvage["function"]["name"] != "sequentialthinking":
@@ -1542,13 +1960,41 @@ class ReActAgent:
                         if boot:
                             tools_executed_names.extend(boot)
                             pending_goals = chat_goals.pending(self._chat_tool_events)
+                    elif (
+                        goal_nudges >= max_goal_nudges
+                        and chat_goals
+                        and "find_and_grep" not in tools_executed_names
+                        and (
+                            "find_and_grep" in pending_goals
+                            or "grep_file" in tools_executed_names
+                        )
+                    ):
+                        boot = await self._bootstrap_verbose_grep(tools_called, step_callback)
+                        if boot:
+                            tools_executed_names.extend(boot)
+                            pending_goals = chat_goals.pending(self._chat_tool_events)
+                    elif goal_nudges >= max_goal_nudges and "crack_hash" in pending_goals:
+                        boot = await self._bootstrap_crack_hash(
+                            chat_goals, tools_called, step_callback
+                        )
+                        if boot:
+                            tools_executed_names.extend(boot)
+                            pending_goals = chat_goals.pending(self._chat_tool_events)
+                    elif (
+                        goal_nudges >= max_goal_nudges
+                        and "write_file" in pending_goals
+                        and self._crack_results
+                    ):
+                        boot = await self._bootstrap_write_cracked(
+                            chat_goals, tools_called, step_callback
+                        )
+                        if boot:
+                            tools_executed_names.extend(boot)
+                            pending_goals = chat_goals.pending(self._chat_tool_events)
                     if chat_goals.pending(self._chat_tool_events):
-                        self.ctx_manager.add_message({
-                            "role": "user",
-                            "content": chat_goals.nudge_text(
-                                chat_goals.pending(self._chat_tool_events)
-                            ),
-                        })
+                        self._add_nudge(
+                            chat_goals.nudge_text(chat_goals.pending(self._chat_tool_events))
+                        )
                         continue
 
                 if content and ("?" in content or "¿" in content):
@@ -1591,7 +2037,7 @@ class ReActAgent:
                         )
                         if log_path:
                             nudge += f'\nExample: read_file(path="{log_path}", line_start=1, line_count=80)'
-                        self.ctx_manager.add_message({"role": "user", "content": nudge})
+                        self._add_nudge(nudge)
                         try:
                             from core.debug_log import log_completion_exit
                             log_completion_exit(
@@ -1625,9 +2071,22 @@ class ReActAgent:
                     except Exception:
                         pass
                     break
-                reflection = self.retry_orchestrator.parser_reflection(content, self.parser)
+                reflection = self.retry_orchestrator.parser_reflection(
+                    content, self.parser, session_id=self.session_id
+                )
+                rname = reflection.get("function", {}).get("name", "") if reflection else ""
+                if reflection and rname == "sequentialthinking":
+                    if (
+                        looks_like_prose_stall(content)
+                        or (chat_goals and "sequentialthinking" in chat_goals.blocked_tools)
+                        or all(t == "sequentialthinking" for t in tools_executed_names)
+                    ):
+                        intent_call = salvage_intent_tool_call(
+                            content, message, session_id=self.session_id
+                        )
+                        reflection = intent_call
+                        rname = reflection.get("function", {}).get("name", "") if reflection else ""
                 if reflection and chat_goals and chat_goals.is_pcap_goal():
-                    rname = reflection.get("function", {}).get("name", "")
                     if rname == "sequentialthinking" and consecutive_no_tool >= 3:
                         reflection = None
                 if reflection:
@@ -1647,22 +2106,48 @@ class ReActAgent:
                         tools_executed_names.append(rname)
                         if rname == "write_file" and rargs.get("path"):
                             paths_written.append(str(rargs["path"]).replace("\\", "/"))
+                    elif did_exec and rname == "sequentialthinking":
+                        self._add_nudge(hard_action_nudge(message, self.session_id))
+                    self._chat_tools_executed = list(tools_executed_names)
+                    continue
                 else:
                     pending_now = chat_goals.pending(self._chat_tool_events) if chat_goals else []
-                    if pending_now and goal_nudges < max_goal_nudges:
-                        self.ctx_manager.add_message({
-                            "role": "user",
-                            "content": chat_goals.nudge_text(pending_now),
-                        })
+                    # Max reflections or no salvage — force action bootstrap for search/credential work
+                    if (
+                        not reflection
+                        and salvage_intent_tool_call(message, message, session_id=self.session_id)
+                        and "find_and_grep" not in tools_executed_names
+                    ):
+                        boot = await self._bootstrap_verbose_grep(tools_called, step_callback)
+                        if boot:
+                            tools_executed_names.extend(boot)
+                            self._add_nudge(hard_action_nudge(message, self.session_id))
+                            continue
+                    if pending_now:
+                        # #region agent log
+                        try:
+                            from core.debug_log import debug_log
+                            debug_log(
+                                "agent.py:chat_turn",
+                                "blocked early exit — pending goals",
+                                {"step": step, "pending": pending_now, "goal_nudges": goal_nudges},
+                                "D",
+                            )
+                        except Exception:
+                            pass
+                        # #endregion
+                        if chat_goals:
+                            self._add_nudge(chat_goals.nudge_text(pending_now))
+                        else:
+                            self._add_nudge(
+                                "[SYSTEM] Task incomplete — emit a tool call instead of summarizing."
+                            )
                         continue
                     if step < 1 and not tools_executed_names:
-                        self.ctx_manager.add_message({
-                            "role": "user",
-                            "content": (
-                                "[SYSTEM] No tools executed yet. Call an appropriate tool "
-                                "before summarizing."
-                            ),
-                        })
+                        self._add_nudge(
+                            "[SYSTEM] No tools executed yet. Call an appropriate tool "
+                            "before summarizing."
+                        )
                         continue
                     try:
                         from core.debug_log import log_completion_exit
@@ -1703,6 +2188,7 @@ class ReActAgent:
         self._chat_goals = None
         self._chat_tools_executed = []
         self._pcap_objective_met = False
+        self._pcap_draft = None
         self._mission_goals = None
         self._mission_tools_executed = []
         self._task_plan = None
@@ -1725,6 +2211,59 @@ class ReActAgent:
         log_chat_mem(content, steps_run)
         self.ctx_manager.save_state()
         return content
+
+    def _crack_hash_succeeded(self) -> bool:
+        for item in getattr(self, "_chat_tool_events", []) or []:
+            if isinstance(item, dict) and item.get("name") == "crack_hash" and item.get("success"):
+                return True
+        return bool(getattr(self, "_crack_results", None))
+
+    def _rehydrate_credential_pairs(self) -> None:
+        """Restore hash/salt pairs from session deliverable when resuming after restart."""
+        if self._credential_pairs:
+            return
+        from core.credential_extract import (
+            find_xml_salts,
+            pair_hashes_with_salts,
+            parse_login_hashes,
+        )
+
+        candidates: list[Path] = []
+        if self._active_intent and self._active_intent.deliverables:
+            for rel in self._active_intent.deliverables:
+                rel_norm = rel.replace("\\", "/")
+                candidates.append(self.workspace_root / "sessions" / self.session_id / Path(rel_norm).name)
+                candidates.append(self.workspace_root / rel_norm)
+        for path in candidates:
+            if not path.is_file():
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            hashes = parse_login_hashes(text)
+            if not hashes:
+                continue
+            salts = find_xml_salts(text)
+            self._credential_pairs = pair_hashes_with_salts(hashes, salts)
+            self._last_pcap_path = self._last_pcap_path or "workspace/last_capture.pcapng"
+            # #region agent log
+            try:
+                from core.debug_log import debug_log
+                debug_log(
+                    "agent.py:_rehydrate_credential_pairs",
+                    "restored pairs from deliverable",
+                    {
+                        "path": str(path),
+                        "hash_count": len(hashes),
+                        "has_salt": any(p.get("salt") for p in self._credential_pairs),
+                    },
+                    "L2",
+                )
+            except Exception:
+                pass
+            # #endregion
+            return
 
     async def _bootstrap_pcap_analysis(
         self,
@@ -1770,6 +2309,150 @@ class ReActAgent:
         if did:
             executed.append("analyze_pcapng")
 
+        return executed
+
+    async def _bootstrap_verbose_grep(
+        self,
+        tools_called: set,
+        step_callback=None,
+    ) -> list[str]:
+        """Deterministic multi-file verbose log search when single grep_file stalls."""
+        executed: list[str] = []
+        grep_args = {
+            "pattern": "xml|Password|Username|616a6178|xmlObj",
+            "path_glob": ".pulse/pcap_logs/verbose_*.txt",
+            "max_files": 10,
+            "case_insensitive": True,
+        }
+        # #region agent log
+        try:
+            from core.debug_log import debug_log
+            debug_log(
+                "agent.py:_bootstrap_verbose_grep",
+                "bootstrap find_and_grep",
+                grep_args,
+                "B",
+            )
+        except Exception:
+            pass
+        # #endregion
+        if step_callback:
+            step_callback("AGENT_TOOL_CALL", {"tool": "find_and_grep", "args": grep_args})
+        did, _ = await self._execute_tool("find_and_grep", grep_args, tools_called, step_callback)
+        if did:
+            executed.append("find_and_grep")
+        return executed
+
+    async def _bootstrap_crack_hash(
+        self,
+        goals: ChatGoals,
+        tools_called: set,
+        step_callback=None,
+    ) -> list[str]:
+        """Deterministic crack_hash when model stalls after PCAP extraction."""
+        from core.credential_extract import (
+            build_cracked_deliverable,
+            extract_hash_salt_pairs,
+            find_xml_salts,
+            pair_hashes_with_salts,
+        )
+
+        executed: list[str] = []
+        pairs = list(getattr(self, "_credential_pairs", None) or [])
+        if not pairs:
+            return executed
+
+        if not any(p.get("salt") for p in pairs):
+            path = self._last_pcap_path or "workspace/last_capture.pcapng"
+            token_args = {
+                "file_path": path,
+                "filter_expression": 'http.request.uri contains "login_token"',
+                "limit": 30,
+                "verbose": False,
+            }
+            # #region agent log
+            try:
+                from core.debug_log import debug_log
+                debug_log(
+                    "agent.py:_bootstrap_crack_hash",
+                    "supplemental login_token analyze",
+                    token_args,
+                    "H5",
+                )
+            except Exception:
+                pass
+            # #endregion
+            did, _ = await self._execute_tool(
+                "analyze_pcapng", token_args, tools_called, step_callback
+            )
+            if did:
+                executed.append("analyze_pcapng")
+            pairs = list(getattr(self, "_credential_pairs", None) or pairs)
+            if not any(p.get("salt") for p in pairs):
+                blob = ""
+                if self._last_pcap_summary:
+                    blob = self._last_pcap_summary
+                salts = find_xml_salts(blob)
+                if salts:
+                    base = [
+                        {
+                            "hash": p["hash"],
+                            "username": p.get("username", ""),
+                            "session_token": p.get("session_token", ""),
+                        }
+                        for p in pairs
+                    ]
+                    pairs = pair_hashes_with_salts(base, salts)
+                    self._credential_pairs = pairs
+
+        mask = str(goals.hints.get("mask") or "NNNNNNAA!")
+        for pair in pairs[:5]:
+            if not pair.get("hash"):
+                continue
+            args: dict[str, Any] = {"target_hash": pair["hash"], "mask": mask, "timeout": 180}
+            if pair.get("salt"):
+                args["salt"] = pair["salt"]
+            did, _ = await self._execute_tool("crack_hash", args, tools_called, step_callback)
+            if did:
+                executed.append("crack_hash")
+
+        if self._crack_results and "write_file" in goals.required_tools:
+            wboot = await self._bootstrap_write_cracked(goals, tools_called, step_callback)
+            executed.extend(wboot)
+        return executed
+
+    async def _bootstrap_write_cracked(
+        self,
+        goals: ChatGoals,
+        tools_called: set,
+        step_callback=None,
+    ) -> list[str]:
+        """Write deliverable with cracked plaintext after crack_hash succeeds."""
+        from core.credential_extract import build_cracked_deliverable
+
+        executed: list[str] = []
+        if not self._credential_pairs or not self._crack_results:
+            return executed
+        deliverable = goals.hints.get("deliverable_path", "pwd.txt")
+        if self._active_intent and self._active_intent.deliverables:
+            deliverable = self._active_intent.deliverables[0]
+        content = build_cracked_deliverable(self._credential_pairs, self._crack_results)
+        wargs = {"path": deliverable, "content": content}
+        # #region agent log
+        try:
+            from core.debug_log import debug_log
+            debug_log(
+                "agent.py:_bootstrap_write_cracked",
+                "auto-write cracked deliverable",
+                {"path": deliverable, "content_len": len(content)},
+                "H5",
+            )
+        except Exception:
+            pass
+        # #endregion
+        did, _ = await self._execute_tool("write_file", wargs, tools_called, step_callback)
+        if did:
+            executed.append("write_file")
         return executed
 
     def _enforce_deliverables_guard(
@@ -1861,6 +2544,37 @@ class ReActAgent:
                 "Read the script, fix environment or arguments, then re-run run_script."
             )
         return None
+
+    @staticmethod
+    def _build_grep_miss_hint(tool_name: str, result: Any, args: dict | None) -> str | None:
+        """After a zero-match grep on verbose logs, steer toward multi-file / broader patterns."""
+        if tool_name != "grep_file" or not isinstance(result, dict) or result.get("success") is False:
+            return None
+        if result.get("match_count", 0) > 0:
+            return None
+        path = str((args or {}).get("path", "")).replace("\\", "/").lower()
+        pattern = str((args or {}).get("pattern", ""))
+        if "verbose" not in path and "pcap_logs" not in path:
+            return None
+        # #region agent log
+        try:
+            from core.debug_log import debug_log
+            debug_log(
+                "agent.py:_build_grep_miss_hint",
+                "zero-match verbose grep",
+                {"path": path, "pattern": pattern, "case_insensitive": (args or {}).get("case_insensitive")},
+                "B",
+            )
+        except Exception:
+            pass
+        # #endregion
+        return (
+            "[SYSTEM] grep_file returned 0 matches on a verbose log. "
+            "Credentials are often hex-encoded — 'xmlObj|password' may not appear literally.\n"
+            "Next: find_and_grep(pattern='xml|Password|Username|616a6178|xmlObj', "
+            "path_glob='.pulse/pcap_logs/verbose_*.txt', case_insensitive=true, max_files=10)\n"
+            "Or: analyze_pcapng with filter_expression='xml' (not only 'http')."
+        )
 
     @staticmethod
     def _build_failure_playbook_hint(tool_name: str, result: Any) -> str | None:

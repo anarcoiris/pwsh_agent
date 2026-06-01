@@ -258,9 +258,35 @@ _HASH_CRACK_RE = re.compile(
 )
 
 _FOLLOWUP_DECODE_RE = re.compile(
-    r"\b(decode|extract|parse|key\s*values?|look for|find|contents|login)\b",
+    r"\b(decode|extract|parse|key\s*values?|look for|find|contents|login|expand|search|grep|filter)\b",
     re.I,
 )
+
+_CREDENTIAL_SESSION_RE = re.compile(
+    r"\b(expand.*search|search.*term|grep|filter|password|xml|xmlobj|login|salt|verbose|credential|"
+    r"complete.*previous|previous task|analyze.*filter)\b",
+    re.I,
+)
+
+_DISPLAY_FACTS_RE = re.compile(
+    r"\b(show|display|tell|list|what are|give me)\b.*\b(facts?|hash|salt|cracked|credential)\b",
+    re.I,
+)
+
+_ACTIONABLE_HASH_RE = re.compile(
+    r"\b(extract|crack|use|write|save|create|find|analy[sz]e|try again|hashpro|pwd[_\d]*\.txt)\b",
+    re.I,
+)
+
+
+def _is_display_only_hash_request(message: str) -> bool:
+    """True only for read-only facts requests, not actionable extraction/cracking tasks."""
+    text = message or ""
+    if not _DISPLAY_FACTS_RE.search(text):
+        return False
+    if _ACTIONABLE_HASH_RE.search(text):
+        return False
+    return True
 
 
 def _build_pcap_filters(lower: str) -> str:
@@ -380,6 +406,51 @@ def _build_portscan_goal(message: str, session: list[dict] | None) -> ChatGoals 
 def _build_hashcrack_goal(message: str, session: list[dict] | None) -> ChatGoals | None:
     hints = parse_hash_crack_hints(message)
     lower = (message or "").lower()
+
+    # Display-only: show facts/hash/salt — read session artifacts, do not re-crack blindly
+    if _is_display_only_hash_request(message or ""):
+        # #region agent log
+        try:
+            from core.debug_log import debug_log
+            debug_log(
+                "chat_goals.py:_build_hashcrack_goal",
+                "display-only hash request",
+                {"message_head": (message or "")[:180]},
+                "H2",
+            )
+        except Exception:
+            pass
+        # #endregion
+        return ChatGoals(
+            required_tools=["read_file"],
+            iterative_tools=["read_file", "find_file"],
+            label="Display session facts",
+            blocked_tools=["sequentialthinking", "crack_hash"],
+            blocked_reason=(
+                "User asked to SHOW facts — read_file state/sessions/<id>/facts.json or "
+                "workspace/sessions/<id>/login_forms.txt first; do not run crack_hash until asked."
+            ),
+            hints={
+                "context_directive": (
+                    "[DISPLAY FACTS] Read session facts.json and login_forms.txt, then summarize "
+                    "hash, salt, user/password, xmlObj from disk — no placeholders."
+                ),
+            },
+        )
+    elif _DISPLAY_FACTS_RE.search(message or ""):
+        # #region agent log
+        try:
+            from core.debug_log import debug_log
+            debug_log(
+                "chat_goals.py:_build_hashcrack_goal",
+                "display-intent skipped due actionable request",
+                {"message_head": (message or "")[:180]},
+                "H2",
+            )
+        except Exception:
+            pass
+        # #endregion
+
     if not hints.get("target_hash") and not re.search(
         r"(crack|hash|sha-?256|hashpro|haspro)", (message or ""), re.I
     ):
@@ -389,7 +460,14 @@ def _build_hashcrack_goal(message: str, session: list[dict] | None) -> ChatGoals
 
     # Multi-step: extract from PCAP/reports → deliverable file → crack_hash
     if re.search(
-        r"\b(pwd\.txt|login_forms\.txt|save.*values|extract.*pcap|read.*report|read.*plan|find.*report)\b",
+        r"\b("
+        r"pwd(?:_[\d]+)?\.txt|login_forms\.txt|credentials?\.txt|"
+        r"save.*values|write.*\b(?:pwd|login_forms|credentials?)\b|"
+        r"extract.*(?:pcap|password|salt)|"
+        r"list.*(?:password|hash|salt)|"
+        r"find.*report|read.*report|read.*plan|"
+        r"last_capture(?:\.pcapng)?|pcap(?:ng)?"
+        r")\b",
         lower,
     ):
         deliverables = TaskIntentExtractor._extract_deliverables(message)
@@ -407,16 +485,17 @@ def _build_hashcrack_goal(message: str, session: list[dict] | None) -> ChatGoals
         xml_hint = ""
         if re.search(r"\bxml\b|xmlobj|salt", lower):
             xml_hint = (
-                " For XML/salt: find_file('verbose_*.txt') then grep_file(path=<recommended>, pattern='xmlObj|salt') "
-                "or grep_file('.pulse/pcap_logs/verbose_*.txt', pattern='xmlObj|salt'). "
-                "find_file matches filenames only — use grep_file for packet/XML content."
+                " For XML/salt: find_and_grep(pattern='xml|Password|Username|616a6178|xmlObj', "
+                "path_glob='.pulse/pcap_logs/verbose_*.txt', case_insensitive=true, max_files=10) "
+                "— searches multiple verbose logs (hex-encoded fields need broad patterns like 'xml', not only 'xmlObj'). "
+                "If http filter missed salt, re-run analyze_pcapng with filter_expression='xml'."
             )
         hints["context_directive"] = (
             hints.get("context_directive", "")
-            + f"\n[ROADMAP] 1) find_file('report_*.md') + read_file, or analyze_pcapng on last_capture.pcapng (verbose=true, http filter) "
-            f"2) grep_file on verbose log for xmlObj/salt if needed "
-            f"3) write_file path='{out_path}' with REAL user/password/xmlObj/salt (NO placeholders) "
-            f"4) crack_hash.{xml_hint}"
+            + f"\n[ROADMAP] 1) find_file('report_*.md') + read_file, or analyze_pcapng on last_capture.pcapng (verbose=true; try filter 'xml' if 'http' misses salt) "
+            f"2) find_and_grep across verbose logs (NOT single-file grep only) "
+            f"3) crack_hash with each Password hash + its xmlObj salt (sha256(password+salt)) "
+            f"4) write_file path='{out_path}' with hash, salt, AND cracked plaintext results.{xml_hint}"
         )
         # #region agent log
         try:
@@ -432,9 +511,9 @@ def _build_hashcrack_goal(message: str, session: list[dict] | None) -> ChatGoals
         # #endregion
         iterative = ["read_file", "analyze_pcapng", "write_file", "find_file"]
         if re.search(r"\bxml\b|xmlobj|salt", lower):
-            iterative.append("grep_file")
+            iterative.extend(["grep_file", "find_and_grep"])
         return ChatGoals(
-            required_tools=["read_file", "analyze_pcapng", "write_file", "crack_hash"],
+            required_tools=["read_file", "analyze_pcapng", "crack_hash", "write_file"],
             iterative_tools=iterative,
             label="Extract credentials and crack hash",
             hints=hints,
@@ -442,12 +521,67 @@ def _build_hashcrack_goal(message: str, session: list[dict] | None) -> ChatGoals
             blocked_reason="Use read_file/analyze_pcapng/grep_file for real values — not encode_decode.",
         )
 
+    # #region agent log
+    try:
+        from core.debug_log import debug_log
+        debug_log(
+            "chat_goals.py:_build_hashcrack_goal",
+            "simple hash goal",
+            {"message_head": (message or "")[:180], "target_hash_present": bool(hints.get("target_hash"))},
+            "H3",
+        )
+    except Exception:
+        pass
+    # #endregion
     return ChatGoals(
         required_tools=["crack_hash"],
         label="Hash cracking",
         hints=hints,
         blocked_tools=["analyze_pcapng", "encode_decode"],
         blocked_reason="Hash task — plan salt+mask, then crack_hash only.",
+    )
+
+
+def _session_had_credential_work(session: list[dict]) -> bool:
+    for msg in reversed((session or [])[-50:]):
+        if msg.get("role") != "tool":
+            continue
+        if msg.get("name") in (
+            "analyze_pcapng", "grep_file", "find_and_grep",
+            "crack_hash", "write_file", "read_file",
+        ):
+            return True
+    return False
+
+
+def _build_credential_session_goal(message: str, session: list[dict] | None) -> ChatGoals | None:
+    """Follow-up turns that continue PCAP/credential extraction without re-stating crack/hash."""
+    if session is None:
+        return None
+    if not _CREDENTIAL_SESSION_RE.search(message or ""):
+        return None
+    if not _session_had_credential_work(session):
+        return None
+
+    return ChatGoals(
+        required_tools=["find_and_grep"],
+        iterative_tools=["find_and_grep", "grep_file", "read_file", "analyze_pcapng", "write_file", "crack_hash"],
+        label="Credential extract follow-up",
+        is_from_session=True,
+        blocked_tools=["sequentialthinking"],
+        blocked_reason=(
+            "Do NOT plan in prose or declare task complete — call find_and_grep across "
+            ".pulse/pcap_logs/verbose_*.txt with pattern "
+            "'password|Password|Username|xml|xmlObj|616a6178|login'."
+        ),
+        hints={
+            "context_directive": (
+                "[CREDENTIAL FOLLOW-UP] Prior session has PCAP/credential work. "
+                "Use find_and_grep(pattern='password|Password|Username|xml|xmlObj|616a6178|login', "
+                "path_glob='.pulse/pcap_logs/verbose_*.txt', case_insensitive=true, max_files=10). "
+                "Then write_file login_forms.txt with REAL values and crack_hash if needed."
+            ),
+        },
     )
 
 
@@ -479,6 +613,13 @@ ChatGoalRegistry.register(
     priority=5,
 )
 
+# Credential session follow-up — session-only (pattern never matches match_message)
+ChatGoalRegistry.register(
+    r"(?!)",
+    _build_credential_session_goal,
+    priority=7,
+)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ChatGoalGuard — Generic, goal-driven
@@ -501,9 +642,20 @@ class ChatGoalGuard:
             return tool_name, args, None
 
         pending = goals.pending(executed)
+        done = goals._successful_names(executed)
 
         if pending:
+            if tool_name == "sequentialthinking":
+                # Allow one planning thought, then force action tools.
+                if "sequentialthinking" in done:
+                    return tool_name, args, (
+                        f"Blocked: {goals.label} requires action tools ({', '.join(pending)}). "
+                        "Do NOT use sequentialthinking again — emit find_and_grep, read_file, or analyze_pcapng."
+                    )
+                return tool_name, args, None
             if tool_name == "append_note":
+                if strategy_note:
+                    return tool_name, args, None
                 if "write_file" in pending:
                     deliverable = goals.hints.get("deliverable_path", "login_forms.txt")
                     return tool_name, args, (
@@ -512,17 +664,36 @@ class ChatGoalGuard:
                         f"write_file(path='{deliverable}', content=<REAL values>) — "
                         "no more strategy append_note until the file exists."
                     )
-                if strategy_note:
-                    return tool_name, args, None
                 return tool_name, args, (
                     f"Blocked: {goals.label} still pending ({', '.join(pending)}). "
                     f"Run {pending[0]} before writing progress notes."
+                    + (
+                        f" Example: {format_crack_hash_call(goals.hints)}"
+                        if pending[0] == "crack_hash"
+                        else ""
+                    )
                 )
             if tool_name == "crack_hash" and goals.hints.get("salt") and not args.get("salt"):
                 return tool_name, args, (
                     f"Blocked: user specified salt '{goals.hints['salt']}' — "
                     "pass salt= in crack_hash (concatenated to password before SHA-256)."
                 )
+            if tool_name == "write_file" and "crack_hash" in pending:
+                if goals.label == "Extract credentials and crack hash":
+                    deliverable = goals.hints.get("deliverable_path", "pwd.txt")
+                    return tool_name, args, (
+                        f"Blocked: run crack_hash before writing '{deliverable}'. "
+                        "Extract hash+salt pairs from http_forms and login_token xmlObj, "
+                        "then crack_hash(target_hash=..., salt=..., mask='NNNNNNAA!')."
+                    )
+            if tool_name == "read_file":
+                p = str(args.get("path", "")).replace("\\", "/").lower()
+                if "/artifacts/" in p and re.search(r"/(read_file|grep_file|analyze_pcapng)_\d", p):
+                    return tool_name, args, (
+                        "Blocked: do not read spilled tool artifacts. "
+                        "Use analyze_pcapng output, verbose_log_file, or find_and_grep on "
+                        ".pulse/pcap_logs/verbose_*.txt."
+                    )
             # Block tools that are in the goal's blocked list
             if tool_name in goals.blocked_tools:
                 reason = goals.blocked_reason or f"Blocked: complete {goals.label} first."

@@ -11,6 +11,16 @@ from typing import Any
 from core.session_paths import facts_file
 
 
+# Facts hold facts/state/entities/artifacts only — never narrative, reasoning,
+# or prose findings. String values are clipped to this length to keep the store
+# canonical and machine-shaped (prose belongs in volatile working_memory).
+_VALUE_MAX = 300
+
+
+def _clip(value: Any, limit: int = _VALUE_MAX) -> str:
+    return str(value or "").replace("\n", " ").strip()[:limit]
+
+
 def _default() -> dict[str, Any]:
     return {
         "updated_at": "",
@@ -24,7 +34,38 @@ def _default() -> dict[str, Any]:
         "credentials": [],
         "hosts": {"live": [], "open_ports": []},
         "intel": {"cves": []},
+        "artifacts": [],
+        "dns": [],
+        "web": {},
     }
+
+
+# Keys whose string values are previews/identifiers and may exceed _VALUE_MAX a
+# little (kept separate so the narrative guard does not flag legitimate blobs).
+_PREVIEW_KEYS = {"http_forms_preview", "credentials_preview"}
+
+
+def contains_narrative(facts: dict[str, Any]) -> bool:
+    """True if any non-preview string value looks like prose (schema guard).
+
+    Heuristic for tests/audits: a long multi-sentence string in a fact field is
+    narrative leakage. Previews and known long fields are exempt.
+    """
+    def _walk(node: Any, key: str = "") -> bool:
+        if isinstance(node, dict):
+            return any(_walk(v, k) for k, v in node.items())
+        if isinstance(node, list):
+            return any(_walk(v, key) for v in node)
+        if isinstance(node, str):
+            if key in _PREVIEW_KEYS or key == "updated_at":
+                return False
+            if len(node) > _VALUE_MAX + 40:
+                return True
+            if node.count(". ") >= 2:
+                return True
+        return False
+
+    return _walk(facts)
 
 
 def load_facts(session_id: str) -> dict[str, Any]:
@@ -131,6 +172,66 @@ def update_from_tool(session_id: str, tool_name: str, result: dict[str, Any], ar
             return save_facts(session_id, facts)
         return None
 
+    if tool_name in ("write_file", "report_generate"):
+        path = args.get("path") or result.get("path") or result.get("report_path") or ""
+        path = str(path).replace("\\", "/").strip()
+        if path:
+            arts = facts.setdefault("artifacts", [])
+            entry = {"tool": tool_name, "path": _clip(path)}
+            if not any(a.get("path") == entry["path"] for a in arts if isinstance(a, dict)):
+                arts.append(entry)
+                return save_facts(session_id, facts)
+        return None
+
+    if tool_name == "crack_hash":
+        plain = result.get("plaintext") or result.get("password") or result.get("result")
+        if plain:
+            creds = facts.setdefault("credentials", [])
+            entry = {"source": "crack_hash", "plaintext": _clip(plain, 120)}
+            if entry not in creds:
+                creds.append(entry)
+                return save_facts(session_id, facts)
+        return None
+
+    if tool_name == "hash_identify":
+        types = result.get("types") or result.get("hash_types") or []
+        if isinstance(types, list) and types:
+            facts["intel"].setdefault("hash_types", [])
+            merged = sorted(set(facts["intel"]["hash_types"] + [_clip(t, 40) for t in types]))
+            facts["intel"]["hash_types"] = merged
+            return save_facts(session_id, facts)
+        return None
+
+    if tool_name == "dns_lookup":
+        records = result.get("records") or result.get("answers") or []
+        host = _clip(args.get("hostname") or args.get("domain") or args.get("target") or "", 120)
+        serial: list[str] = []
+        if isinstance(records, list):
+            for r in records:
+                if isinstance(r, dict):
+                    val = r.get("value") or r.get("data") or r.get("address")
+                    if val:
+                        serial.append(_clip(val, 120))
+                elif isinstance(r, str):
+                    serial.append(_clip(r, 120))
+        if serial:
+            dns = facts.setdefault("dns", [])
+            entry = {"host": host, "records": sorted(set(serial))[:12]}
+            if entry not in dns:
+                dns.append(entry)
+                return save_facts(session_id, facts)
+        return None
+
+    if tool_name in ("http_headers_check", "ssl_analysis"):
+        target = _clip(args.get("url") or args.get("host") or args.get("target") or "", 160)
+        if target:
+            web = facts.setdefault("web", {})
+            bucket = web.setdefault(tool_name, [])
+            if target not in bucket:
+                bucket.append(target)
+                return save_facts(session_id, facts)
+        return None
+
     return None
 
 
@@ -161,6 +262,26 @@ def summarize_facts(session_id: str, max_chars: int = 700) -> str:
     cves = data.get("intel", {}).get("cves") or []
     if cves:
         lines.append(f"intel.cves={','.join(cves[:8])}")
+    htypes = data.get("intel", {}).get("hash_types") or []
+    if htypes:
+        lines.append(f"intel.hash_types={','.join(htypes[:6])}")
+    arts = data.get("artifacts") or []
+    if arts:
+        paths = [a.get("path", "") for a in arts if isinstance(a, dict) and a.get("path")]
+        if paths:
+            lines.append(f"artifacts={','.join(paths[:6])}")
+    dns = data.get("dns") or []
+    if dns:
+        hosts = [d.get("host", "") for d in dns if isinstance(d, dict) and d.get("host")]
+        if hosts:
+            lines.append(f"dns.hosts={','.join(hosts[:6])}")
+    web = data.get("web") or {}
+    web_targets: list[str] = []
+    for vals in web.values():
+        if isinstance(vals, list):
+            web_targets.extend(vals)
+    if web_targets:
+        lines.append(f"web.targets={','.join(web_targets[:6])}")
     if not lines:
         return ""
     out = "[SESSION FACTS]\n" + "\n".join(lines)
