@@ -12,7 +12,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-MissionKind = Literal["hash", "pcap", "dev", "recon", "general"]
+MissionKind = Literal["hash", "pcap", "dev", "file_find", "recon", "general"]
+
+# User wants files by name/glob under workspace — not PCAP log content search.
+_FILE_FIND_RE = re.compile(
+    r"\b(find|locate|search for|look for)\b.{0,80}?"
+    r"([\w.*?\[\]-]+\.(?:txt|md|json|yaml|py|ps1|log))\b",
+    re.I | re.S,
+)
+_FILENAME_GLOB_RE = re.compile(
+    r"\b([\w.*?\[\]-]+\.(?:txt|md|json|yaml|py|ps1|log))\b",
+    re.I,
+)
 
 
 def _is_credential_deliverable(rel_path: str) -> bool:
@@ -61,9 +72,34 @@ _CODE_MARKERS = re.compile(
 )
 
 
+def is_file_discovery_mission(text: str) -> bool:
+    """True when the user is asking to locate files by name/glob, not grep log content."""
+    lower = (text or "").lower()
+    if _FILE_FIND_RE.search(lower):
+        return True
+    if re.search(r"\b(find|locate)\b", lower) and _FILENAME_GLOB_RE.search(lower):
+        if re.search(r"[*?]", lower):
+            return True
+        if re.search(r"\b(workspace|folder|directory|nearby)\b", lower):
+            return True
+    return False
+
+
+def extract_filename_globs(text: str) -> list[str]:
+    """Basename globs (e.g. passwd*.txt) mentioned in user text."""
+    seen: list[str] = []
+    for m in _FILENAME_GLOB_RE.finditer(text or ""):
+        g = m.group(1)
+        if g not in seen:
+            seen.append(g)
+    return seen
+
+
 def detect_mission_kind(text: str) -> MissionKind:
     """Classify mission from user text (shared with DynamicContextBuilder)."""
     lower = (text or "").lower()
+    if is_file_discovery_mission(text):
+        return "file_find"
     if re.search(
         r"(crack.*(?:sha-?)?256|(?:sha-?)?256.*hash|hash.*crack|brute.*force|\bcrack_hash\b|"
         r"\bhaspro\b|\bhashpro\b)",
@@ -87,6 +123,8 @@ def detect_mission_kind(text: str) -> MissionKind:
         bool(re.search(r"\b(read|review)\b", lower))
         and not bool(re.search(r"\bfile named\b", lower))
     )
+    if dev_task and is_file_discovery_mission(text):
+        dev_task = False
     explicit_recon = bool(re.search(
         r"\b(scan|recon|capture|pcap|cve|dns|ping|port_scan|network interface)\b",
         lower,

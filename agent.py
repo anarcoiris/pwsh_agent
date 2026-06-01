@@ -532,6 +532,36 @@ class ReActAgent:
         # Normalise args
         tool_args = ArgumentNormalizer.normalize(tool_name, tool_args)
 
+        anchor = getattr(self, "_anchor_query", "") or ""
+        try:
+            from core.intent_salvage import redirect_misrouted_search_tool
+            from core.debug_log import debug_log_session
+
+            new_name, new_args, redirect_note = redirect_misrouted_search_tool(
+                tool_name, tool_args, anchor
+            )
+            if redirect_note and new_name != tool_name:
+                debug_log_session(
+                    "05286d",
+                    "agent.py:_execute_tool",
+                    "search tool redirect",
+                    {
+                        "from": tool_name,
+                        "to": new_name,
+                        "old_path": str(
+                            (tool_args or {}).get("path_glob")
+                            or (tool_args or {}).get("path", "")
+                        ),
+                        "anchor_head": anchor[:100],
+                    },
+                    "B",
+                )
+                if step_callback:
+                    step_callback("AGENT_THOUGHT", redirect_note)
+                tool_name, tool_args = new_name, new_args
+        except Exception:
+            pass
+
         if tool_name == "run_script" and tool_args.get("script_path"):
             self._last_script_path = str(tool_args["script_path"])
             set_pip_near(self._last_script_path)
@@ -2228,18 +2258,31 @@ class ReActAgent:
                     continue
                 else:
                     pending_now = chat_goals.pending(self._chat_tool_events) if chat_goals else []
-                    # Max reflections or no salvage — force action bootstrap for search/credential work
-                    if (
-                        not reflection
-                        and (not chat_goals or "find_and_grep" in chat_goals.required_tools or "find_and_grep" in chat_goals.iterative_tools)
-                        and salvage_intent_tool_call(message, message, session_id=self.session_id)
-                        and "find_and_grep" not in tools_executed_names
-                    ):
-                        boot = await self._bootstrap_verbose_grep(tools_called, step_callback)
-                        if boot:
-                            tools_executed_names.extend(boot)
-                            self._add_nudge(hard_action_nudge(message, self.session_id))
-                            continue
+                    # Max reflections — bootstrap only PCAP log grep or file discovery (not both)
+                    from core.intent_salvage import salvage_intent_tool_call as _salvage_intent
+
+                    salvaged = _salvage_intent(message, message, session_id=self.session_id)
+                    if not reflection and salvaged and "find_and_grep" not in tools_executed_names:
+                        sname = salvaged["function"]["name"]
+                        sargs = salvaged["function"]["arguments"]
+                        if sname == "find_file":
+                            did_exec, _ = await self._execute_tool(
+                                "find_file", sargs, tools_called, step_callback
+                            )
+                            if did_exec:
+                                tools_executed_names.append("find_file")
+                                self._add_nudge(hard_action_nudge(message, self.session_id))
+                                continue
+                        elif sname == "find_and_grep" and (
+                            not chat_goals
+                            or "find_and_grep" in chat_goals.required_tools
+                            or "find_and_grep" in chat_goals.iterative_tools
+                        ):
+                            boot = await self._bootstrap_verbose_grep(tools_called, step_callback)
+                            if boot:
+                                tools_executed_names.extend(boot)
+                                self._add_nudge(hard_action_nudge(message, self.session_id))
+                                continue
                     if pending_now:
                         # #region agent log
                         try:
@@ -2438,6 +2481,11 @@ class ReActAgent:
         step_callback=None,
     ) -> list[str]:
         """Deterministic multi-file verbose log search when single grep_file stalls."""
+        from core.task_intent import is_file_discovery_mission
+
+        if is_file_discovery_mission(getattr(self, "_anchor_query", "")):
+            return []
+
         executed: list[str] = []
         grep_args = {
             "pattern": "xml|Password|Username|616a6178|xmlObj",

@@ -69,6 +69,41 @@ def test_credential_session_goal_still_fires_for_real_followup():
     assert "find_and_grep" in goal.required_tools
 
 
+def test_passwd_find_mission_uses_file_find_phase():
+    from core.task_intent import detect_mission_kind
+
+    msg = (
+        "find any passwd*.txt or pass*.txt file in your workspace and nearby folders, "
+        "then report the content"
+    )
+    assert detect_mission_kind(msg) == "file_find"
+    ctx = DynamicContextBuilder.build_context([], anchor_query=msg)
+    assert "FILE DISCOVERY" in ctx
+    assert ".pulse/pcap_logs" not in ctx.split("Do NOT")[0]
+
+
+def test_file_find_salvage_uses_find_file_not_grep():
+    from core.intent_salvage import redirect_misrouted_search_tool, salvage_intent_tool_call
+
+    msg = (
+        "find any passwd*.txt or pass*.txt file in your workspace and nearby folders, "
+        "then report the content"
+    )
+    salvaged = salvage_intent_tool_call("", msg)
+    assert salvaged is not None
+    assert salvaged["function"]["name"] == "find_file"
+    assert salvaged["function"]["arguments"]["name"] == "passwd*.txt"
+
+    new_name, new_args, note = redirect_misrouted_search_tool(
+        "find_and_grep",
+        {"pattern": "passwd", "path_glob": "*.pulse/**"},
+        msg,
+    )
+    assert new_name == "find_file"
+    assert new_args["name"] == "passwd*.txt"
+    assert note
+
+
 def test_hash_cracking_excludes_grep_salvage():
     from core.intent_salvage import salvage_intent_tool_call
     msg = 'crack this hash "18846efb090813788c3246ce05884e7155eee92186ec23569abc0c39b44b7032" with this salt "55077791" to recover password'

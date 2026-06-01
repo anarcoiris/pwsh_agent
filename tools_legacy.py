@@ -1503,8 +1503,9 @@ TOOLS_SCHEMA = [
         "function": {
             "name": "find_and_grep",
             "description": (
-                "Search multiple files matched by a filename glob for regex matches. "
-                "Use when xmlObj/credentials may appear in any verbose log under .pulse/pcap_logs/."
+                "Search file CONTENTS (regex) across files matched by path_glob. "
+                "For locating files by NAME in workspace, use find_file then read_file — not this tool. "
+                "Default path_glob targets PCAP verbose logs (.pulse/pcap_logs/verbose_*.txt) only."
             ),
             "parameters": {
                 "type": "object",

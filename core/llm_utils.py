@@ -310,6 +310,20 @@ class RetryOrchestrator:
             return None
 
         snippet = raw_content[:400].strip()
+        user_ctx = getattr(parser, "_user_context", "") if parser else ""
+        from core.task_intent import detect_mission_kind, extract_filename_globs
+
+        kind = detect_mission_kind(user_ctx)
+        if kind == "file_find":
+            globs = extract_filename_globs(user_ctx) or ["*.txt"]
+            example = (
+                f'<tool_call>\n{{"name": "find_file", "arguments": {{"name": "{globs[0]}"}}}}\n</tool_call>'
+            )
+        else:
+            example = (
+                '<tool_call>\n{"name": "find_and_grep", "arguments": {"pattern": "xml|Password", '
+                '"path_glob": ".pulse/pcap_logs/verbose_*.txt", "case_insensitive": true}}\n</tool_call>'
+            )
         thought = (
             f"Parse failure #{self._parse_fail_count} detected. "
             f"My previous turn produced output that could not be mapped to any registered tool call.\n"
@@ -318,10 +332,7 @@ class RetryOrchestrator:
             f"  1. Identify the intent expressed in the output.\n"
             f"  2. Map that intent to the closest registered tool (host_exec, dns_lookup, port_scan, etc.).\n"
             f"  3. Emit the correct tool call using <tool_call> XML tags (required format). Example:\n"
-            f"<tool_call>\n"
-            f'{{"name": "find_and_grep", "arguments": {{"pattern": "xml|Password", '
-            f'"path_glob": ".pulse/pcap_logs/verbose_*.txt", "case_insensitive": true}}}}\n'
-            f"</tool_call>\n"
+            f"{example}\n"
             f"  4. DO NOT emit [SYSTEM] Task complete, [STATUS], or **Next Steps** prose — ONLY a tool call."
         )
         return {
@@ -412,8 +423,38 @@ class DynamicContextBuilder:
                 "In chat mode: do NOT declare MISSION_COMPLETE or generate engagement reports.\n"
             )
 
+        if kind == "file_find":
+            from core.task_intent import extract_filename_globs
+
+            globs = extract_filename_globs(latest) or ["<glob>.txt"]
+            glob_hint = ", ".join(f"find_file('{g}')" for g in globs[:3])
+            phase = (
+                "\n[CURRENT PHASE: FILE DISCOVERY]\n"
+                "Locate files by NAME under workspace and app install roots (search_roots) — "
+                "NOT under .pulse unless the user named that path.\n"
+                f"Workflow: {glob_hint} → read_file(path=<recommended>) for each hit.\n"
+                "Do NOT use find_and_grep for filename discovery (it greps file CONTENTS, not names).\n"
+                "Do NOT default path_glob to .pulse/pcap_logs — that is only for PCAP verbose logs.\n"
+            )
+            # #region agent log
+            try:
+                from core.debug_log import debug_log_session
+                debug_log_session(
+                    "05286d",
+                    "llm_utils.py:build_context",
+                    "file_find phase",
+                    {"globs": globs, "query_head": latest[:120]},
+                    "A",
+                )
+            except Exception:
+                pass
+            # #endregion
+            return phase
+
         from core.intent_salvage import _SEARCH_INTENT_RE
-        if _SEARCH_INTENT_RE.search(latest_lower):
+        from core.task_intent import is_file_discovery_mission
+
+        if _SEARCH_INTENT_RE.search(latest_lower) and not is_file_discovery_mission(latest):
             return (
                 "\n[CURRENT PHASE: CREDENTIAL / LOG SEARCH]\n"
                 "Prior PCAP or credential work is active — NOT generic recon.\n"
