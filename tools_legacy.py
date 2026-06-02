@@ -104,19 +104,26 @@ def host_exec(command: str, timeout: int = 120) -> dict:
 
     start_time = time.time()
     try:
-        # Run command via PowerShell NoProfile/NonInteractive
+        # Run command via PowerShell NoProfile/NonInteractive.
+        # encoding/errors are REQUIRED: text=True alone decodes with the Windows
+        # locale codec (cp1252), which raises UnicodeDecodeError on any non-cp1252
+        # byte (e.g. 0x81 from a router web page or gzipped/binary output). That
+        # killed the subprocess reader thread, left stdout=None, and crashed the
+        # agent loop on a downstream .strip(). utf-8 + replace is decode-safe.
         result = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             **_subprocess_run_kwargs(),
         )
         duration = int((time.time() - start_time) * 1000)
         return {
             "exit_code": result.returncode,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
+            "stdout": result.stdout if result.stdout is not None else "",
+            "stderr": result.stderr if result.stderr is not None else "",
             "duration_ms": duration
         }
     except subprocess.TimeoutExpired as e:

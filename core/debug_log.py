@@ -6,9 +6,28 @@ import os
 import time
 from pathlib import Path
 
-_SESSION_ID = os.environ.get("DEBUG_SESSION_ID", "5c212e")
+# Active debug session. All instrumentation funnels into a SINGLE file
+# (debug-{_SESSION_ID}.log) to avoid the confusion of several stale debug-*.log
+# files left over from earlier debug sessions.
+_SESSION_ID = os.environ.get("DEBUG_SESSION_ID", "d9171b")
 _LOG = Path(__file__).resolve().parent.parent / f"debug-{_SESSION_ID}.log"
-_DEBUG_ENABLED = os.environ.get("PULSE_DEBUG", "1") == "1"
+# Legacy scattered debug_log/debug_log_session calls are OFF by default now
+# (set PULSE_DEBUG=1 to re-enable them). They were noisy and wrote to old
+# session files. Targeted tracing for the active investigation uses trace()
+# below, which is always on.
+_DEBUG_ENABLED = os.environ.get("PULSE_DEBUG", "0") == "1"
+
+
+def trace(location: str, message: str, data: dict, run_id: str = "trace") -> None:
+    """Always-on targeted trace for the active debug session.
+
+    Unlike debug_log/debug_log_session (gated by PULSE_DEBUG), this always writes
+    to the single active-session log so the current investigation's signal is not
+    drowned out by, or split across, legacy instrumentation files.
+    """
+    # #region agent log
+    _write_ndjson(_LOG, _SESSION_ID, location, message, data, "", run_id)
+    # #endregion
 
 
 def debug_log(location: str, message: str, data: dict, hypothesis_id: str = "", run_id: str = "verify") -> None:
@@ -27,12 +46,12 @@ def debug_log_session(
     hypothesis_id: str = "",
     run_id: str = "pre-fix",
 ) -> None:
-    """Write to debug-{session_id}.log (Cursor debug mode)."""
+    """Legacy entry point. Funnels into the single active-session log (the passed
+    session_id is ignored) and is gated by PULSE_DEBUG."""
     # #region agent log
     if not _DEBUG_ENABLED:
         return
-    log_path = Path(__file__).resolve().parent.parent / f"debug-{session_id}.log"
-    _write_ndjson(log_path, session_id, location, message, data, hypothesis_id, run_id)
+    _write_ndjson(_LOG, _SESSION_ID, location, message, data, hypothesis_id, run_id)
     # #endregion
 
 
@@ -72,8 +91,9 @@ def log_completion_exit(
     pending_goals: list[str] | None = None,
     hypothesis_id: str = "exit",
 ) -> None:
-    """Log which code path ended a mission/chat turn (debug session d63d0c)."""
-    debug_log(
+    """Log which code path ended a mission/chat turn (always-on for the active
+    debug session, since turn-completion behavior is under investigation)."""
+    trace(
         "agent.completion",
         reason,
         {
@@ -84,6 +104,5 @@ def log_completion_exit(
             "chat_goals_label": chat_goals_label,
             "pending_goals": pending_goals or [],
         },
-        hypothesis_id=hypothesis_id,
         run_id="completion",
     )

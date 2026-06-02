@@ -37,6 +37,58 @@ def test_plan_state_persist_and_reload():
             clear_plan_state(sid)
 
 
+def test_load_plan_state_discards_on_domain_mismatch():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        with patch("core.session_paths.app_root", return_value=root):
+            sid = "domain_mismatch_sid"
+            # Persist a hash-domain roadmap with an in-progress step.
+            plan = TaskPlanTracker("crack this sha256 hash with hashpro")
+            save_plan_state(sid, plan)
+            assert load_plan_state(sid) is not None  # no message -> kept
+            # New, unrelated message (web_auth) must discard + clear the stale plan.
+            assert load_plan_state(sid, "login to http://192.168.1.1 as user with pwd.txt") is None
+            assert load_plan_state(sid) is None  # cleared from disk
+
+
+def test_load_plan_state_kept_on_same_domain():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        with patch("core.session_paths.app_root", return_value=root):
+            sid = "domain_same_sid"
+            plan = TaskPlanTracker("crack this sha256 hash with hashpro")
+            save_plan_state(sid, plan)
+            assert load_plan_state(sid, "now crack the sha256 hash again") is not None
+
+
+def test_load_plan_state_kept_when_new_message_generic():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        with patch("core.session_paths.app_root", return_value=root):
+            sid = "domain_generic_sid"
+            plan = TaskPlanTracker("crack this sha256 hash with hashpro")
+            save_plan_state(sid, plan)
+            # A generic/conversational follow-up should not nuke an active plan.
+            assert load_plan_state(sid, "thanks, what is the status?") is not None
+
+
+def test_non_pcap_password_prompt_has_no_extract_secrets():
+    plan = TaskPlanTracker("review the password handling in auth.py for issues")
+    ids = [s.id for s in plan.steps]
+    assert "extract_secrets" not in ids
+
+
+def test_find_file_wildcard_error_is_neutral():
+    from core.artifacts import find_file
+
+    with tempfile.TemporaryDirectory() as tmp:
+        res = find_file("zzz_no_match_*.qqq", search_root=Path(tmp))
+    assert res["success"] is False
+    err = res["error"].lower()
+    for biased in ("pcap", "verbose_", "xmlobj", "analyze_pcapng"):
+        assert biased not in err
+
+
 def test_parse_extract_and_crack_steps():
     prompt = (
         "read latest reports, extract user/password/xmlObj from pcap, "
@@ -90,7 +142,7 @@ def test_placeholder_detection():
 
 
 def test_read_file_resets_failed_extract():
-    plan = TaskPlanTracker("extract and write pwd.txt")
+    plan = TaskPlanTracker("extract user/password from last_capture.pcapng and write pwd.txt")
     for s in plan.steps:
         if s.id == "extract_secrets":
             s.status = plan.steps[0].status.__class__.FAILED
@@ -100,7 +152,7 @@ def test_read_file_resets_failed_extract():
 
 
 def test_read_file_with_credential_evidence_resets_failed_extract():
-    plan = TaskPlanTracker("extract and write pwd.txt")
+    plan = TaskPlanTracker("extract user/password from last_capture.pcapng and write pwd.txt")
     for s in plan.steps:
         if s.id == "extract_secrets":
             s.status = plan.steps[0].status.__class__.FAILED

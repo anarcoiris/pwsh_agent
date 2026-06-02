@@ -75,6 +75,15 @@ def analyze_pcapng(file_path: str, filter_expression: str = None, limit: int = 5
     return tools.analyze_pcapng(file_path=file_path, filter_expression=filter_expression, limit=limit)
 
 @mcp.tool()
+def http_get(url: str, max_chars: int = 20000, timeout_sec: int = 20) -> dict:
+    """
+    Performs a plain HTTP GET of a URL and returns the response body (HTML/text),
+    status, and headers. Use this to fetch/download/analyze a web page — not
+    capture_packets/analyze_pcapng (those sniff traffic, they do not fetch a page).
+    """
+    return tools.http_get(url=url, max_chars=max_chars, timeout_sec=timeout_sec)
+
+@mcp.tool()
 def try_http_login(
     url: str,
     user: str,

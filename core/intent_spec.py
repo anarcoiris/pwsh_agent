@@ -39,7 +39,7 @@ DOMAINS = frozenset({
 # phases). Free-form is allowed, but these are the canonical ones.
 CAPABILITIES = frozenset({
     "file_read", "file_write", "file_edit",
-    "http_auth_attempt", "http_inspect",
+    "http_auth_attempt", "http_inspect", "http_fetch",
     "port_scan", "dns_lookup", "ping_sweep", "ssl_inspect",
     "pcap_analyze", "hash_crack", "hash_identify", "encode_decode",
     "code_review", "static_scan", "code_build", "scaffold",
@@ -251,9 +251,23 @@ def _detect_domain(message: str) -> str:
     return "general"
 
 
+_FETCH_INTENT_RE = re.compile(
+    r"\b(get|fetch|download|retrieve|curl|wget|scrape|grab|obtener|descargar?|baja[r]?)\b"
+    r"|\bhtml\b|\bweb\s?page\b|\bwebpage\b|\bindex\.html?\b",
+    re.I,
+)
+
+
 def _seed_capabilities(domain: str, message: str) -> list[str]:
     caps = list(_DOMAIN_CAPABILITIES.get(domain, []))
     lower = (message or "").lower()
+    # Fetching the body of a remote URL/IP is an HTTP GET (http_fetch/http_inspect),
+    # NOT packet capture. Surface the fetch tool whenever a web target is present
+    # alongside a get/fetch/download intent, regardless of the coarse domain.
+    if (_URL_RE.search(message or "") or _IP_RE.search(message or "")) and _FETCH_INTENT_RE.search(lower):
+        for c in ("http_fetch", "http_inspect"):
+            if c not in caps:
+                caps.append(c)
     if re.search(r"\bcve\b|vulnerabilit", lower):
         caps.append("cve_lookup")
     if re.search(r"\bport\b|\bnmap\b", lower):

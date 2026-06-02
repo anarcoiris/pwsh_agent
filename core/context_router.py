@@ -23,7 +23,7 @@ _NETWORK_TOOLS = [
     "list_network_interfaces", "capture_packets", "analyze_pcapng", "find_tshark", "find_file", "grep_file", "find_and_grep",
 ]
 _EXPLOIT_TOOLS = ["crack_hash", "hash_identify", "encode_decode"]
-_WEB_TOOLS = ["http_headers_check", "ssl_analysis", "try_http_login"]
+_WEB_TOOLS = ["http_get", "http_headers_check", "ssl_analysis", "try_http_login"]
 _REPORTING_TOOLS = ["finding_create", "finding_list", "report_generate"]
 _INTEL_TOOLS = ["cve_lookup"]
 

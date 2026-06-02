@@ -24,6 +24,11 @@ _FILENAME_GLOB_RE = re.compile(
     r"\b([\w.*?\[\]-]+\.(?:txt|md|json|yaml|py|ps1|log))\b",
     re.I,
 )
+# A filename token that itself carries a wildcard (e.g. pwd*.txt, log_??.json).
+_WILDCARD_FILE_RE = re.compile(
+    r"\b[\w.-]*[*?\[][\w.*?\[\]-]*\.(?:txt|md|json|yaml|py|ps1|log)\b",
+    re.I,
+)
 
 
 def _is_credential_deliverable(rel_path: str) -> bool:
@@ -75,7 +80,14 @@ _CODE_MARKERS = re.compile(
 def is_file_discovery_mission(text: str) -> bool:
     """True when the user is asking to locate files by name/glob, not grep log content."""
     lower = (text or "").lower()
+    # PCAP verbose-log searches are content greps, not filename discovery.
+    if "verbose_" in lower or ".pulse" in lower:
+        return False
     if _FILE_FIND_RE.search(lower):
+        return True
+    # A wildcard filename token (pwd*.txt) implies "find files like this" even in
+    # terse follow-ups such as "try with pwd*.txt".
+    if _WILDCARD_FILE_RE.search(text or ""):
         return True
     if re.search(r"\b(find|locate)\b", lower) and _FILENAME_GLOB_RE.search(lower):
         if re.search(r"[*?]", lower):

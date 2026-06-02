@@ -148,6 +148,24 @@ class OllamaAdapter:
         self.parser.set_user_context(anchor)
         latest_user = anchor
 
+        # region agent log
+        try:
+            from core.debug_log import trace
+            trace("agent.OllamaAdapter.chat:request", "llm prompt", {
+                "model": self.model,
+                "num_messages": len(messages),
+                "anchor": (anchor or "")[:300],
+                "messages": [
+                    {"role": m.get("role"), "len": len(str(m.get("content", ""))),
+                     "content": str(m.get("content", ""))[:6000]}
+                    for m in messages
+                ],
+                "options": _options,
+            })
+        except Exception:
+            pass
+        # endregion
+
         for attempt in range(1, max_retries + 1):
             try:
                 response = await self.client.chat(
@@ -182,6 +200,20 @@ class OllamaAdapter:
                     )
                     if extracted:
                         msg["tool_calls"] = extracted
+
+                # region agent log
+                try:
+                    from core.debug_log import trace
+                    _tcs = msg.get("tool_calls") or []
+                    trace("agent.OllamaAdapter.chat:response", "llm output", {
+                        "content_len": len(msg.get("content") or ""),
+                        "content": (msg.get("content") or "")[:6000],
+                        "tool_calls": [tc.get("function", {}).get("name") for tc in _tcs],
+                        "tool_args": [tc.get("function", {}).get("arguments") for tc in _tcs],
+                    })
+                except Exception:
+                    pass
+                # endregion
 
                 return {"message": msg}
 
@@ -769,6 +801,34 @@ class ReActAgent:
         if step_callback:
             step_callback("AGENT_TOOL_CALL", {"tool": tool_name, "args": tool_args})
 
+        if tool_name == "finding_create":
+            tool_args = dict(tool_args)
+            tool_args.setdefault("session_id", self.session_id)
+        if tool_name == "report_generate":
+            tool_args = dict(tool_args)
+            tool_args.setdefault("scope", "session")
+            tool_args.setdefault("session_id", self.session_id)
+
+        if tool_name == "append_note" and getattr(self, "_http_fetch_objective_met", False):
+            self._chat_append_note_count = getattr(self, "_chat_append_note_count", 0) + 1
+            if self._chat_append_note_count > 2:
+                block_err = (
+                    "append_note limit reached after a successful http_get. "
+                    "Summarize the analysis in your reply — do not keep appending notes."
+                )
+                if step_callback:
+                    step_callback("AGENT_TOOL_CALL", {"tool": tool_name, "args": tool_args})
+                    step_callback("AGENT_TOOL_RESULT", {
+                        "tool": tool_name,
+                        "result": {"success": False, "error": block_err},
+                    })
+                self.ctx_manager.add_message({
+                    "role": "tool",
+                    "name": tool_name,
+                    "content": json.dumps({"success": False, "error": block_err}),
+                })
+                return False, 0
+
         tool_func = self.tools_registry.get(tool_name)
         t_start   = time.monotonic()
 
@@ -793,6 +853,10 @@ class ReActAgent:
 
         if isinstance(result, dict) and redirect_note:
             result["redirect_note"] = redirect_note
+
+        if tool_name == "http_get" and isinstance(result, dict) and result.get("success"):
+            if int(result.get("status_code") or 0) == 200:
+                self._http_fetch_objective_met = True
 
         # Auto-recover missing PCAP path in chat hash/extract workflow.
         if (
@@ -1787,6 +1851,8 @@ class ReActAgent:
         self._credential_pairs = []
         self._crack_results = []
         self._last_pcap_path = None
+        self._http_fetch_objective_met = False
+        self._chat_append_note_count = 0
 
         deliverable_hint = ""
         if self._active_intent.deliverables:
@@ -1797,7 +1863,8 @@ class ReActAgent:
 
         chat_directive = (
             "[CHAT MODE] Focus ONLY on the user's request below. "
-            "Do NOT declare MISSION_COMPLETE or generate engagement/final reports. "
+            "Do NOT declare MISSION_COMPLETE or call report_generate unless you used finding_create this session. "
+            "For fetch/analyze tasks (http_get, read_file), summarize results in your reply — do not generate engagement reports. "
             "Do NOT run network recon tools unless explicitly requested. "
             f"Use append_note on `{plan_note_rel(self.session_id)}` for progress — never write_file for status lines. "
             "sequentialthinking is optional in chat (max one planning thought); prefer action tools. "
@@ -1837,7 +1904,7 @@ class ReActAgent:
         # #endregion
         self._last_pcap_summary: str | None = None
         self._pcap_objective_met: bool = False
-        self._task_plan = load_plan_state(self.session_id) or TaskPlanTracker(message)
+        self._task_plan = load_plan_state(self.session_id, message) or TaskPlanTracker(message)
         # Phase 2: load volatile working memory and reset the per-turn tool head.
         self._working_memory = load_working_memory(self.session_id)
         self._last_tool_head = ""
@@ -2080,6 +2147,46 @@ class ReActAgent:
                             "[SYSTEM] Progress notes blocked — ran crack_hash bootstrap with extracted hash/salt pairs."
                         )
                         continue
+
+                # Early completion: successful http_get satisfies fetch/analyze chat tasks.
+                if getattr(self, "_http_fetch_objective_met", False):
+                    _cg = chat_goals
+                    if not _cg or not _cg.is_pcap_goal():
+                        _min = 1
+                        if (
+                            (not _cg or _cg.may_end_turn(
+                                self._chat_tool_events, step, objective_met=True, min_steps=_min
+                            ))
+                            and self._task_plan.may_complete_turn(
+                                tools_executed_names, step, min_steps=_min
+                            )
+                        ):
+                            try:
+                                from core.debug_log import trace
+                                trace(
+                                    "agent.chat_turn",
+                                    "http_fetch early break",
+                                    {
+                                        "step": step,
+                                        "tools": tools_executed_names[-6:],
+                                        "append_notes": getattr(self, "_chat_append_note_count", 0),
+                                    },
+                                    run_id="completion",
+                                )
+                            except Exception:
+                                pass
+                            try:
+                                from core.debug_log import log_completion_exit
+                                log_completion_exit(
+                                    "chat",
+                                    "http_fetch early break",
+                                    step=step,
+                                    tools_executed=len(tools_executed_names),
+                                    hypothesis_id="fetch",
+                                )
+                            except Exception:
+                                pass
+                            break
 
                 # Do not exit immediately after the last required tool — allow further ReAct steps.
 

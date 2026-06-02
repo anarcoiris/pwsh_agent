@@ -37,6 +37,7 @@ from tools.recon import (
     ping_sweep,
     port_scan,
     http_headers_check,
+    http_get,
     ssl_analysis,
     try_http_login,
     cve_lookup,
@@ -107,6 +108,22 @@ TOOLS_SCHEMA += [
                 "type": "object",
                 "properties": {
                     "url": {"type": "string", "description": "Full URL to inspect (e.g., https://example.com)."}
+                },
+                "required": ["url"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "http_get",
+            "description": "Perform a plain HTTP GET of a URL and return the response body (HTML/text), status, and headers. This is the correct tool for 'GET/fetch/download the HTML of <site>' or 'retrieve and analyze the page at <url>' — NOT capture_packets/analyze_pcapng (packet capture is for sniffing traffic, not fetching a web page).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "Full URL to fetch (e.g., http://192.168.1.1/ or http://host/index.html)."},
+                    "max_chars": {"type": "integer", "description": "Maximum number of body characters to return (default: 20000)."},
+                    "timeout_sec": {"type": "integer", "description": "Request timeout in seconds (default: 20)."}
                 },
                 "required": ["url"]
             }
@@ -217,7 +234,8 @@ TOOLS_SCHEMA += [
                     "target": {"type": "string", "description": "Affected host, URL, or file path (optional)."},
                     "evidence": {"type": "string", "description": "Raw evidence snippet (output, log, etc.) (optional)."},
                     "recommendation": {"type": "string", "description": "Suggested remediation steps (optional)."},
-                    "specialist": {"type": "string", "description": "Active specialist mode at time of finding (default: lead)."}
+                    "specialist": {"type": "string", "description": "Active specialist mode at time of finding (default: lead)."},
+                    "session_id": {"type": "string", "description": "Session id to tag this finding (optional; defaults to active session)."}
                 },
                 "required": ["title", "severity", "description"]
             }
@@ -241,12 +259,15 @@ TOOLS_SCHEMA += [
         "type": "function",
         "function": {
             "name": "report_generate",
-            "description": "Generate a structured Markdown engagement report from all findings in the local database, sorted by severity.",
+            "description": "Generate a Markdown report from findings persisted with finding_create. Default scope=session (THIS session only — never dumps old engagement findings). Do NOT use for simple fetch/analyze tasks unless you recorded findings this session; summarize in chat instead. Use scope=all only when the user explicitly wants a full historical engagement report.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "output_format": {"type": "string", "description": "Output format: markdown | text (default: markdown)."},
-                    "title": {"type": "string", "description": "Report title (default: 'Pulse Agent Engagement Report')."}
+                    "title": {"type": "string", "description": "Report title."},
+                    "scope": {"type": "string", "description": "session (default) | all — session limits to current session findings only."},
+                    "session_id": {"type": "string", "description": "Session id for scope=session (optional; defaults to active session)."},
+                    "task_summary": {"type": "string", "description": "Optional analysis text when no DB findings exist (ad-hoc task report)."}
                 }
             }
         }
@@ -259,7 +280,7 @@ __all__ = [
     "list_network_interfaces", "capture_packets", "analyze_pcapng",
     "crack_hash", "find_tshark",
     "dns_lookup", "ping_sweep", "port_scan",
-    "http_headers_check", "ssl_analysis", "try_http_login", "cve_lookup", "system_info",
+    "http_headers_check", "http_get", "ssl_analysis", "try_http_login", "cve_lookup", "system_info",
     "encode_decode", "hash_identify",
     "finding_create", "finding_list", "report_generate",
     "TOOLS_SCHEMA",

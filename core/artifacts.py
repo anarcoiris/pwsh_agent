@@ -147,10 +147,9 @@ def find_file(name: str, search_root: Path | None = None) -> dict:
         err = f"No files matching pattern '{pattern}'."
         if any(ch in pattern for ch in "*?[]"):
             err += (
-                " find_file matches filenames only — not packet/XML field content. "
-                "Use find_file('verbose_*.txt') then grep_file(path=<recommended>, pattern='xmlObj') "
-                "or grep_file('.pulse/pcap_logs/verbose_*.txt', pattern='xml') "
-                "or read_file on verbose_log_file from analyze_pcapng."
+                " Wildcard patterns match file NAMES only, not file contents. "
+                "To search inside files use grep_file/find_and_grep; to broaden the "
+                "name search try a less specific pattern or a different directory."
             )
         # #region agent log
         try:

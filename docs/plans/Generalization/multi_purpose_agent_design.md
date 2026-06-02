@@ -199,6 +199,31 @@ Each is a registry entry + (optionally) one new tool + a domain plan. None requi
 
 ---
 
+## 6.5 De-bias remediation (minimal, shipped) + full de-bias canary (deferred)
+
+After Phases 1–6, the agent still occasionally derailed unrelated tasks into PCAP/credential analysis. Root cause was two-fold: **cross-turn persistence** (a stale roadmap rehydrated regardless of the new message) and **hardcoded steering** that nudged the model back toward forensics.
+
+### Shipped (minimal, high-impact)
+
+- **Persistence scoping.** `load_plan_state(session_id, current_message)` now recomputes the stored plan's domain via `build_fallback_spec(tracker.prompt).domain` and discards (and clears from disk) any rehydrated roadmap whose specific domain differs from the new message's domain. Generic domains (`general`/`conversation`/`mixed`/empty) never trigger a discard, so benign follow-ups keep an active plan. Wired at `agent.py` (`load_plan_state(self.session_id, message)`).
+- **Neutral `find_file` error.** `core/artifacts.py` no longer tells the agent to go read `verbose_*.txt`/`.pulse` PCAP logs on a failed wildcard search; it gives domain-neutral guidance (use `grep_file`/`find_and_grep` for content, broaden the pattern).
+- **Domain-gated credential planner.** The `extract_secrets` step in `core/task_plan.py` is only emitted for `hash`/`pcap` domains, so a prompt merely mentioning "password"/"user" in another domain no longer spawns a PCAP-extraction step.
+
+Tests: `tests/test_task_plan.py` covers domain-mismatch discard, same-domain/generic retention, no `extract_secrets` for non-pcap password prompts, and the neutralized `find_file` error.
+
+### Deferred — full de-bias canary
+
+These remaining bias sources are higher-risk to change blind, so they should land behind a config flag (e.g. `intent.debias_canary: true`) and be A/B validated against the golden prompt set before becoming the default:
+
+- **Identity neutralization** — `state/SOUL.md` + the base system prompt in `agent.py` frame the agent as a "security auditor / think like an attacker." Replace with a domain-neutral operator persona (the `factory-reset` mode of `scripts/reset_state.py` already writes neutral identity stubs as a reference template).
+- **`ChatGoalGuard` → advisory** — demote the remaining hard `required_tools`/`blocked_tools` gates in `core/chat_goals.py` to context nudges; keep only safety/anti-loop hard gates.
+- **Mission/bootstrap fallbacks** — domain-gate `core/mission_evaluator.py` and the `_bootstrap_*` deterministic seeds so they do not inject hash/pcap assumptions for non-forensic domains.
+- **Salvage heuristics** — relax the PCAP-redirection logic in `core/intent_salvage.py` and the guidance strings in `core/credential_extract.py` so they only fire within `hash`/`pcap` intents.
+
+Canary acceptance: the incident prompt set ("check .cursorrules/CLAUDE.md", "review auth.py", "write a PowerShell scheduled task") completes in-domain with **zero** PCAP/crack tool calls, while the hash and pcap regression prompts behave identically to today.
+
+---
+
 ## 7. Safety & scope
 
 - HOST mode + `SafetyAssessment.network_egress` or `destructive` ⇒ require explicit user confirmation before the action (aligns with the workspace `AGENTS.md` "ask before anything that leaves the machine").

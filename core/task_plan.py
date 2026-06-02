@@ -124,7 +124,9 @@ class TaskPlanTracker:
                 "read_file",
             ))
 
-        if re.search(r"\b(pcap|pcapng|extract|xml|xmlobj|salt|password|user)\b", lower):
+        if domain in ("hash", "pcap") and re.search(
+            r"\b(pcap|pcapng|extract|xml|xmlobj|salt|password|user)\b", lower
+        ):
             steps.append(TaskStep(
                 "extract_secrets",
                 "Extract real user/password/xmlObj/salt from PCAP or prior analysis",
@@ -492,8 +494,19 @@ def save_plan_state(session_id: str, tracker: TaskPlanTracker) -> Path | None:
     return path
 
 
-def load_plan_state(session_id: str) -> TaskPlanTracker | None:
-    """Load persisted roadmap if present and not fully complete."""
+_GENERIC_DOMAINS = {"", "general", "conversation", "mixed"}
+
+
+def load_plan_state(
+    session_id: str, current_message: str | None = None
+) -> TaskPlanTracker | None:
+    """Load persisted roadmap if present and not fully complete.
+
+    When ``current_message`` is provided, discard (and clear from disk) any
+    rehydrated plan whose original intent domain differs from the new message's
+    domain. This prevents a stale credential/PCAP roadmap from hijacking an
+    unrelated follow-up turn in a resumed session.
+    """
     from core.session_paths import plan_state_file
 
     path = plan_state_file(session_id)
@@ -506,6 +519,21 @@ def load_plan_state(session_id: str) -> TaskPlanTracker | None:
         tracker = _tracker_from_dict(data)
         if tracker.all_done:
             return None
+        if current_message:
+            try:
+                from core.intent_spec import build_fallback_spec
+
+                prev = build_fallback_spec(tracker.prompt).domain
+                new = build_fallback_spec(current_message).domain
+            except Exception:
+                prev = new = ""
+            if (
+                prev not in _GENERIC_DOMAINS
+                and new not in _GENERIC_DOMAINS
+                and prev != new
+            ):
+                clear_plan_state(session_id)
+                return None
         return tracker
     except (OSError, json.JSONDecodeError):
         return None

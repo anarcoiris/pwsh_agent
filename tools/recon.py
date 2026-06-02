@@ -247,6 +247,60 @@ try {{
     return {"success": False, "url": url, "error": result.get("error") or result.get("stderr", "HTTP check failed")}
 
 
+def http_get(url: str, max_chars: int = 20000, timeout_sec: int = 20) -> dict:
+    """
+    Perform a plain HTTP GET of a URL and return the response body (HTML/text).
+
+    This is the right tool for "GET/fetch/download the HTML of <site>" or
+    "retrieve and analyze the page at <url>" — NOT capture_packets/analyze_pcapng
+    (packet capture is for sniffing traffic, not for fetching a web page).
+
+    Args:
+        url: Full URL to fetch (e.g. http://192.168.1.1/ or http://host/index.html).
+        max_chars: Maximum number of body characters to return (default: 20000).
+        timeout_sec: Request timeout in seconds (default: 20).
+
+    Returns:
+        Dict with status_code, headers, content (truncated), content_length.
+    """
+    ps_cmd = f"""
+try {{
+    $response = Invoke-WebRequest -Uri '{url}' -UseBasicParsing -ErrorAction Stop -TimeoutSec {timeout_sec}
+    $headers = @{{}}
+    $response.Headers.GetEnumerator() | ForEach-Object {{ $headers[$_.Key] = $_.Value }}
+    @{{
+        StatusCode = [int]$response.StatusCode
+        Headers = $headers
+        Content = $response.Content
+    }} | ConvertTo-Json -Depth 4 -Compress
+}} catch {{
+    @{{ Error = $_.Exception.Message }} | ConvertTo-Json -Compress
+}}
+"""
+    result = _run_ps(ps_cmd, timeout=timeout_sec + 10)
+    if result.get("success") and result.get("stdout"):
+        try:
+            data = json.loads(result["stdout"])
+        except json.JSONDecodeError:
+            return {"success": True, "url": url, "raw": result["stdout"][:max_chars]}
+        if "Error" in data:
+            return {"success": False, "url": url, "error": data["Error"]}
+        content = data.get("Content") or ""
+        if not isinstance(content, str):
+            content = str(content)
+        truncated = len(content) > max_chars
+        return {
+            "success": True,
+            "url": url,
+            "status_code": data.get("StatusCode"),
+            "headers": data.get("Headers", {}),
+            "content_length": len(content),
+            "truncated": truncated,
+            "content": content[:max_chars],
+        }
+    return {"success": False, "url": url, "error": result.get("error") or result.get("stderr", "HTTP GET failed")}
+
+
 def try_http_login(
     url: str,
     user: str,
