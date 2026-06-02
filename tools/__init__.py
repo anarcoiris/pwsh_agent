@@ -234,8 +234,7 @@ TOOLS_SCHEMA += [
                     "target": {"type": "string", "description": "Affected host, URL, or file path (optional)."},
                     "evidence": {"type": "string", "description": "Raw evidence snippet (output, log, etc.) (optional)."},
                     "recommendation": {"type": "string", "description": "Suggested remediation steps (optional)."},
-                    "specialist": {"type": "string", "description": "Active specialist mode at time of finding (default: lead)."},
-                    "session_id": {"type": "string", "description": "Session id to tag this finding (optional; defaults to active session)."}
+                    "specialist": {"type": "string", "description": "Active specialist mode at time of finding (default: lead)."}
                 },
                 "required": ["title", "severity", "description"]
             }
@@ -259,15 +258,12 @@ TOOLS_SCHEMA += [
         "type": "function",
         "function": {
             "name": "report_generate",
-            "description": "Generate a Markdown report from findings persisted with finding_create. Default scope=session (THIS session only — never dumps old engagement findings). Do NOT use for simple fetch/analyze tasks unless you recorded findings this session; summarize in chat instead. Use scope=all only when the user explicitly wants a full historical engagement report.",
+            "description": "Generate a structured Markdown engagement report from all findings in the local database, sorted by severity.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "output_format": {"type": "string", "description": "Output format: markdown | text (default: markdown)."},
-                    "title": {"type": "string", "description": "Report title."},
-                    "scope": {"type": "string", "description": "session (default) | all — session limits to current session findings only."},
-                    "session_id": {"type": "string", "description": "Session id for scope=session (optional; defaults to active session)."},
-                    "task_summary": {"type": "string", "description": "Optional analysis text when no DB findings exist (ad-hoc task report)."}
+                    "title": {"type": "string", "description": "Report title (default: 'Pulse Agent Engagement Report')."}
                 }
             }
         }

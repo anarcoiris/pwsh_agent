@@ -147,14 +147,9 @@ def _get_db():
             evidence TEXT,
             recommendation TEXT,
             created_at TEXT NOT NULL,
-            specialist TEXT DEFAULT 'lead',
-            session_id TEXT DEFAULT ''
+            specialist TEXT DEFAULT 'lead'
         )
     """)
-    try:
-        conn.execute("ALTER TABLE findings ADD COLUMN session_id TEXT DEFAULT ''")
-    except sqlite3.OperationalError:
-        pass
     conn.commit()
     return conn
 
@@ -166,8 +161,7 @@ def finding_create(
     target: str = "",
     evidence: str = "",
     recommendation: str = "",
-    specialist: str = "lead",
-    session_id: str = "",
+    specialist: str = "lead"
 ) -> dict:
     """
     Create and persist a new security finding to the local SQLite database.
@@ -202,10 +196,9 @@ def finding_create(
     # endregion
     try:
         conn = _get_db()
-        sid = (session_id or "").strip()
         cur = conn.execute(
-            "INSERT INTO findings (title, severity, target, description, evidence, recommendation, created_at, specialist, session_id) VALUES (?,?,?,?,?,?,?,?,?)",
-            (title, sev, target, description, evidence, recommendation, created_at, specialist, sid)
+            "INSERT INTO findings (title, severity, target, description, evidence, recommendation, created_at, specialist) VALUES (?,?,?,?,?,?,?,?)",
+            (title, sev, target, description, evidence, recommendation, created_at, specialist)
         )
         conn.commit()
         finding_id = cur.lastrowid
@@ -250,56 +243,22 @@ def finding_list(severity_filter: str = "", limit: int = 50) -> dict:
         return {"success": False, "error": str(e)}
 
 
-def report_generate(
-    output_format: str = "markdown",
-    title: str = "Pulse Agent Engagement Report",
-    scope: str = "session",
-    session_id: str = "",
-    task_summary: str = "",
-) -> dict:
+def report_generate(output_format: str = "markdown", title: str = "Pulse Agent Engagement Report") -> dict:
     """
-    Generate a structured engagement report from persisted findings.
+    Generate a structured engagement report from all findings in the local database.
 
     Args:
         output_format: Output format — markdown | text (default: markdown).
-        title: Report title.
-        scope: ``session`` (default) — only findings from the current session;
-               ``all`` — entire findings database (legacy engagement reports).
-        session_id: Session id for ``scope=session`` (``YYYYMMDD_HHMMSS``).
-        task_summary: When no session findings exist, optional free-text summary
-                      for an ad-hoc task report (e.g. HTTP fetch analysis).
+        title: Report title (default: 'Pulse Agent Engagement Report').
 
     Returns:
         Dict with the report file path and summary.
     """
     try:
-        from core.session_paths import load_active_session_id, session_start_iso
-
-        sid = (session_id or "").strip() or load_active_session_id()
-        scope_norm = (scope or "session").strip().lower()
-
         conn = _get_db()
-        if scope_norm == "all":
-            rows = conn.execute(
-                "SELECT id, title, severity, target, description, evidence, recommendation, created_at, specialist, session_id "
-                "FROM findings ORDER BY CASE severity WHEN 'CRITICAL' THEN 1 WHEN 'HIGH' THEN 2 WHEN 'MEDIUM' THEN 3 WHEN 'LOW' THEN 4 ELSE 5 END, id"
-            ).fetchall()
-        else:
-            start_iso = session_start_iso(sid)
-            if start_iso:
-                rows = conn.execute(
-                    "SELECT id, title, severity, target, description, evidence, recommendation, created_at, specialist, session_id "
-                    "FROM findings WHERE (session_id = ? OR (session_id = '' AND created_at >= ?)) "
-                    "ORDER BY CASE severity WHEN 'CRITICAL' THEN 1 WHEN 'HIGH' THEN 2 WHEN 'MEDIUM' THEN 3 WHEN 'LOW' THEN 4 ELSE 5 END, id",
-                    (sid, start_iso),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT id, title, severity, target, description, evidence, recommendation, created_at, specialist, session_id "
-                    "FROM findings WHERE session_id = ? "
-                    "ORDER BY CASE severity WHEN 'CRITICAL' THEN 1 WHEN 'HIGH' THEN 2 WHEN 'MEDIUM' THEN 3 WHEN 'LOW' THEN 4 ELSE 5 END, id",
-                    (sid,),
-                ).fetchall()
+        rows = conn.execute(
+            "SELECT id, title, severity, target, description, evidence, recommendation, created_at, specialist FROM findings ORDER BY CASE severity WHEN 'CRITICAL' THEN 1 WHEN 'HIGH' THEN 2 WHEN 'MEDIUM' THEN 3 WHEN 'LOW' THEN 4 ELSE 5 END, id"
+        ).fetchall()
         conn.close()
 
         # region agent log
@@ -307,8 +266,6 @@ def report_generate(
             from core.debug_log import trace
             trace("tools.intel.report_generate", "findings pulled from DB", {
                 "requested_title": title,
-                "scope": scope_norm,
-                "session_id": sid,
                 "rows": len(rows),
                 "findings": [
                     {"title": r[1], "severity": r[2], "target": r[3], "created_at": r[7], "specialist": r[8]}
@@ -320,43 +277,7 @@ def report_generate(
         # endregion
 
         if not rows:
-            summary = (task_summary or "").strip()
-            if not summary:
-                return {
-                    "success": False,
-                    "error": (
-                        f"No findings recorded for session '{sid}' (scope=session). "
-                        "Do NOT call report_generate for fetch/analyze tasks unless you first "
-                        "persist findings with finding_create, or pass task_summary with your analysis. "
-                        "Otherwise summarize results in your reply to the user."
-                    ),
-                    "scope": scope_norm,
-                    "session_id": sid,
-                }
-            # Ad-hoc task report (no DB findings)
-            now = datetime.now(timezone.utc)
-            date_str = now.strftime("%Y-%m-%d %H:%M UTC")
-            report_dir = app_root() / "output"
-            report_dir.mkdir(parents=True, exist_ok=True)
-            fname = f"report_{now.strftime('%Y%m%d_%H%M%S')}.md"
-            report_path = report_dir / fname
-            report_text = (
-                f"# {title}\n\n"
-                f"**Generated:** {date_str}  \n"
-                f"**Session:** `{sid}`  \n"
-                f"**Scope:** task summary (no formal findings in DB for this session)\n\n"
-                f"---\n\n## Task Summary\n\n{summary}\n"
-            )
-            with open(report_path, "w", encoding="utf-8") as f:
-                f.write(report_text)
-            return {
-                "success": True,
-                "report_path": str(report_path),
-                "findings_count": 0,
-                "severity_summary": {},
-                "title": title,
-                "scope": "task_summary",
-            }
+            return {"success": False, "error": "No findings in database. Create findings first with finding_create."}
 
         now = datetime.now(timezone.utc)
         date_str = now.strftime("%Y-%m-%d %H:%M UTC")
@@ -375,8 +296,7 @@ def report_generate(
             "## Executive Summary\n",
         ]
 
-        for row in rows:
-            sev = row[2]
+        for _id, t, sev, target, desc, evid, rec, ts, spec in rows:
             severity_counts[sev] = severity_counts.get(sev, 0) + 1
 
         for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]:
@@ -386,7 +306,7 @@ def report_generate(
 
         lines.append("\n---\n\n## Findings\n")
 
-        for _id, t, sev, target, desc, evid, rec, ts, spec, _sid in rows:
+        for _id, t, sev, target, desc, evid, rec, ts, spec in rows:
             sev_emoji = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🔵", "INFO": "⚪"}.get(sev, "⚪")
             lines.append(f"### [{sev_emoji} {sev}] {t}")
             if target:
@@ -408,9 +328,7 @@ def report_generate(
             "report_path": str(report_path),
             "findings_count": len(rows),
             "severity_summary": severity_counts,
-            "title": title,
-            "scope": scope_norm,
-            "session_id": sid,
+            "title": title
         }
     except Exception as e:
         return {"success": False, "error": str(e)}

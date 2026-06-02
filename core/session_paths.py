@@ -18,15 +18,6 @@ def generate_session_id() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
 
-def session_start_iso(session_id: str) -> str | None:
-    """Parse ``YYYYMMDD_HHMMSS`` session ids into an ISO-8601 UTC timestamp."""
-    m = re.fullmatch(r"(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})", (session_id or "").strip())
-    if not m:
-        return None
-    y, mo, d, h, mi, s = m.groups()
-    return f"{y}-{mo}-{d}T{h}:{mi}:{s}+00:00"
-
-
 def sessions_state_root() -> Path:
     return app_root() / "state" / "sessions"
 
