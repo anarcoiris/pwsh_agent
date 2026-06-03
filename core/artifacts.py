@@ -141,9 +141,10 @@ def find_file(name: str, search_root: Path | None = None) -> dict:
 
     # Rank recommendations: keep full match list for visibility, but suggest best operational path.
     ranked = sorted(matches, key=lambda p: _score_match(p, pattern), reverse=True)
+    ranked = _filter_visible_matches(ranked)
     recommended = ranked[0] if ranked else None
 
-    if not matches:
+    if not ranked:
         err = f"No files matching pattern '{pattern}'."
         if any(ch in pattern for ch in "*?[]"):
             err += (
@@ -167,6 +168,15 @@ def find_file(name: str, search_root: Path | None = None) -> dict:
 
     return {
         "success": True,
-        "matches": matches[:20],
+        "matches": ranked[:20],
         "recommended": recommended,
     }
+
+
+def _filter_visible_matches(matches: list[str]) -> list[str]:
+    try:
+        from core.session_visibility import filter_session_paths
+
+        return filter_session_paths(matches)
+    except Exception:
+        return matches

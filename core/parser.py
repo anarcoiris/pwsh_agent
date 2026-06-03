@@ -137,7 +137,7 @@ def _extract_code_block_tool_calls(content: str, user_context: str = "") -> list
 
 
 def _pick_best_tool_calls(calls: list[dict], limit: int = 1) -> list[dict]:
-    """Prefer actionable tools over sequentialthinking; enforce one call per turn."""
+    """Return all append_note calls plus at most one highest-priority action tool."""
     if not calls:
         return []
     priority = {
@@ -152,6 +152,22 @@ def _pick_best_tool_calls(calls: list[dict], limit: int = 1) -> list[dict]:
     def sort_key(tc: dict) -> tuple:
         name = tc.get("function", tc).get("name", "")
         return (priority.get(name, 10), name)
+
+    notes: list[dict] = []
+    actions: list[dict] = []
+    for tc in calls:
+        name = tc.get("function", tc).get("name", "")
+        if name == "append_note":
+            notes.append(tc)
+        else:
+            actions.append(tc)
+
+    ranked_actions = sorted(actions, key=sort_key)
+    if notes or ranked_actions:
+        result = list(notes)
+        if ranked_actions:
+            result.append(ranked_actions[0])
+        return result
 
     ranked = sorted(calls, key=sort_key)
     return ranked[:limit]

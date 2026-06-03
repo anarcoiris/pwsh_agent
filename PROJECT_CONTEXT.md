@@ -14,6 +14,6 @@ Boundary policy:
 
 Execution:
 - Standard executions must funnel through `agent.py`.
-- Ollama context: `config.yaml` sets `num_ctx: 24576` and `num_predict: 3072` (4096 for synthesis). Reload the model with context length ≥24576 if the server was started with a smaller window.
+- Ollama context: `config.yaml` sets `num_ctx: 8192` and `num_predict: 3072` (4096 for synthesis). Agent trim budgets (`max_context_tokens`, `reserve_generation_tokens`, `reserve_injection_tokens`) are aligned to the same 8192 window so persisted history + injections fit what Ollama receives. Reload the model with context length ≥8192 if the server was started with a smaller window.
 - Tool executions are audited by `audit.py` to `state/audit_trail/`.
 - Memory logs are appended to `state/memory/`.

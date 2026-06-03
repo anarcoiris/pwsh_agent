@@ -110,15 +110,13 @@ def host_exec(command: str, timeout: int = 120) -> dict:
         # byte (e.g. 0x81 from a router web page or gzipped/binary output). That
         # killed the subprocess reader thread, left stdout=None, and crashed the
         # agent loop on a downstream .strip(). utf-8 + replace is decode-safe.
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-            **_subprocess_run_kwargs(),
-        )
+        from core.powershell_exec import run_powershell
+
+        raw = run_powershell(command, timeout=timeout)
+        result = type("R", (), {})()
+        result.returncode = raw.get("exit_code", -1)
+        result.stdout = raw.get("stdout", "")
+        result.stderr = raw.get("stderr", "") or raw.get("error", "")
         duration = int((time.time() - start_time) * 1000)
         return {
             "exit_code": result.returncode,
@@ -345,6 +343,14 @@ def read_file(path: str, line_start: int = 1, line_count: int = None) -> dict:
         if resolve_err:
             return {"success": False, "error": resolve_err}
         file_path = resolved if resolved else Path(path).resolve()
+        try:
+            from core.session_visibility import path_visibility_error
+
+            vis_err = path_visibility_error(file_path)
+            if vis_err:
+                return {"success": False, "error": vis_err}
+        except Exception:
+            pass
         if not file_path.exists():
             return {"success": False, "error": f"File '{path}' does not exist."}
         if not file_path.is_file():
@@ -462,6 +468,14 @@ def grep_file(
         if resolve_err:
             return {"success": False, "error": resolve_err}
         file_path = resolved if resolved else Path(path).resolve()
+        try:
+            from core.session_visibility import path_visibility_error
+
+            vis_err = path_visibility_error(file_path)
+            if vis_err:
+                return {"success": False, "error": vis_err}
+        except Exception:
+            pass
         if not file_path.exists():
             return {"success": False, "error": f"File '{path}' does not exist."}
         if not file_path.is_file():

@@ -68,6 +68,25 @@ from core.working_state import (
     build_current_state,
     load_working_memory,
     save_working_memory,
+    save_current_state,
+)
+from core.prompt_pack import PromptPack, PromptBudgets
+from core.specialists import (
+    execute_delegate_to,
+    suggested_agent_for_domain,
+    suggest_agent_for_tool,
+    tool_allowed,
+    scope_advisory_message,
+)
+from core.session_visibility import (
+    set_visibility_context,
+    unlock_from_message,
+)
+from core.session_handoff import (
+    format_handoff_for_state,
+    load_handoff,
+    seal_handoff,
+    list_sealed_handoffs,
 )
 from core.chat_goals import ChatGoals, ChatGoalGuard, ChatGoalRegistry
 from core.write_guard import WriteGuard
@@ -78,6 +97,18 @@ from core.mission_evaluator import MissionEvaluator
 from core.intent_spec import IntentFormalizer, build_fallback_spec, save_intent_spec
 
 logger = logging.getLogger("pwsh_agent.agent")
+
+_FORBID_NETWORK_TOOLS = frozenset({
+    "port_scan",
+    "ping_sweep",
+    "dns_lookup",
+    "capture_packets",
+    "list_network_interfaces",
+    "http_headers_check",
+    "ssl_analysis",
+})
+
+_CHAT_REPORTING_TOOLS = frozenset({"report_generate", "finding_list"})
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -98,7 +129,7 @@ class OllamaAdapter:
         model: str,
         parser: AgentOutputParser,
         *,
-        num_ctx: int = 24576,
+        num_ctx: int = 8192,
         num_predict: int = 3072,
         injection_budget_chars: int = 8000,
     ):
@@ -121,6 +152,8 @@ class OllamaAdapter:
         session_snippet: str | None = None,
         plan_block: str | None = None,
         current_state: str | None = None,
+        prompt_pack_mode: bool = False,
+        active_agent: str = "lead",
     ) -> dict[str, Any]:
         try:
             for injection in ContextRouter.build_injections(
@@ -131,6 +164,8 @@ class OllamaAdapter:
                 plan_block=plan_block,
                 current_state=current_state,
                 injection_budget_chars=self.injection_budget_chars,
+                prompt_pack_mode=prompt_pack_mode,
+                active_agent=active_agent,
             ):
                 messages = messages + [injection]
         except Exception as e:
@@ -168,6 +203,7 @@ class OllamaAdapter:
 
         for attempt in range(1, max_retries + 1):
             try:
+                start_t = time.time()
                 response = await self.client.chat(
                     model=self.model,
                     messages=messages,
@@ -175,6 +211,19 @@ class OllamaAdapter:
                     options=_options,
                     stream=False,
                 )
+                latency_ms = int((time.time() - start_t) * 1000)
+                
+                try:
+                    from core.debug_log import log_llm_interaction
+                    log_llm_interaction(
+                        model=self.model,
+                        latency_ms=latency_ms,
+                        messages=messages,
+                        response_text=response.message.content or "[(tool_calls)]",
+                        tools_schema=tools_schema
+                    )
+                except Exception:
+                    pass
 
                 msg: dict[str, Any] = {
                     "role":    response.message.role,
@@ -252,10 +301,10 @@ class ReActAgent:
 
         ollama_cfg = self.config.get("ollama", {})
         self.base_url      = ollama_cfg.get("base_url", "http://localhost:11435")
-        self.default_model = ollama_cfg.get("default_model", "qwen2.5-coder:7b")
+        self.default_model = ollama_cfg.get("default_model", "qwen2.5-coder:7b-instruct")
         self.conversational_model = ollama_cfg.get("conversational_model")
         self.evaluator_temperature = float(ollama_cfg.get("evaluator_temperature", 0.1))
-        self.num_ctx = int(ollama_cfg.get("num_ctx", 24576))
+        self.num_ctx = int(ollama_cfg.get("num_ctx", 8192))
         self.num_predict = int(ollama_cfg.get("num_predict", 3072))
         self.num_predict_synthesis = int(ollama_cfg.get("num_predict_synthesis", 4096))
 
@@ -277,10 +326,27 @@ class ReActAgent:
             agent_cfg.get("reserve_injection_tokens", max(1024, self.injection_budget_chars // 4))
         )
 
+        self.prompt_pack_mode = bool(agent_cfg.get("prompt_pack_mode", False))
+        self.specialist_soft_scope = bool(
+            agent_cfg.get("specialist_soft_scope", self.prompt_pack_mode)
+        )
+        self.session_fence_mode = bool(
+            agent_cfg.get("session_fence_mode", self.prompt_pack_mode)
+        )
+        self.prompt_budgets = PromptBudgets.from_config(agent_cfg.get("prompt_budgets"))
+        self.prompt_pack = PromptPack(budgets=self.prompt_budgets)
+
         ResultCompactor.configure_max_chars(self.max_tool_result_chars)
 
         # ── Specialist & safety state ──────────────────────────────────────
-        self.active_specialist: str = "lead"
+        self.active_agent: str = "lead"
+        self.active_specialist: str = "lead"  # legacy alias; kept in sync with active_agent
+        self._handoff_brief: str = ""
+        self._return_to_lead_when: str = ""
+        self._handoff_complete: bool = False
+        self._stop_tool_batch: bool = False
+        self._unlocked_sessions: set[str] = set()
+        self._selected_prior_session: str | None = None
         self.network_mode: str      = "SANDBOX"
 
         # ── Core engines ───────────────────────────────────────────────────
@@ -294,6 +360,7 @@ class ReActAgent:
         for name in tools.__all__:
             if name not in ("SequentialThinkingEngine", "TOOLS_SCHEMA", "sequentialthinking"):
                 self.tools_registry[name] = getattr(tools, name)
+        self.tools_registry["delegate_to"] = execute_delegate_to
 
         self.parser  = AgentOutputParser(self.tools_registry)
         self.adapter = OllamaAdapter(
@@ -390,6 +457,16 @@ class ReActAgent:
 
     def _init_system_prompt(self):
         """Build the full system prompt and seed the context manager."""
+        if self.prompt_pack_mode:
+            prompt = self.prompt_pack.assemble_system(
+                active_agent=self.active_agent,
+                network_mode=self.network_mode,
+                session_id=self.session_id,
+            )
+            self.ctx_manager.clear_history()
+            self.ctx_manager.add_message({"role": "system", "content": prompt})
+            return
+
         overlays = {
             "lead": (
                 "ROLE OVERLAY: LEAD / ORCHESTRATOR\n"
@@ -441,7 +518,10 @@ class ReActAgent:
 
             "COGNITIVE WORKFLOW (ReAct):\n"
             "1. Plan briefly (one sequentialthinking call max), then act. Run tools one at a time and inspect each result before the next.\n"
-            f"2. Progress notes: append_note on `{plan_path}`/`{status_path}` (never write_file for status). Deliverables: write_file to the exact user path. Per-task notes: append_note under workspace/sessions/{self.session_id}/scratchpads/.\n"
+            "2. Progress notes: Use append_note on the appropriate path. To avoid redundancy, each note has a strict domain. Do NOT duplicate contents across them:\n"
+            f"   - Plan (`{plan_path}`): High-level strategy, milestones, and next steps. No logs, credentials, or tool output.\n"
+            f"   - Status (`{status_path}`): Completed steps, blockers, and errors (never write_file to status). No raw data or detailed plans.\n"
+            f"   - Scratchpad (`workspace/sessions/{self.session_id}/scratchpads/`): Raw CLI logs, code snippets, credentials, and temporary working data.\n"
             "3. Register significant discoveries with finding_create. In mission mode, declare MISSION_COMPLETE only after producing evidence.\n\n"
 
             "TOOL CALL FORMAT:\n"
@@ -458,7 +538,7 @@ class ReActAgent:
 
             "CRITICAL RULES:\n"
             "- Do NOT invent facts; verify with a tool. Do NOT claim a file was created until write_file succeeded on the target path.\n"
-            "- Emit ONE tool call per turn; never repeat an identical call. If a tool fails, investigate with find_file/read_file/grep_file/host_exec before retrying.\n"
+            "- Emit ONE ACTION tool call per turn (you may include multiple append_note calls in the same turn). Never repeat an identical action call. If a tool fails, investigate with find_file/read_file/grep_file/host_exec before retrying.\n"
             "- In chat mode: NEVER emit [SYSTEM] Task complete, [STATUS], or **Next Steps** prose without a <tool_call> block in the same turn.\n"
             f"- Active session id: {self.session_id}. Prior sessions under workspace/sessions/ — read them only when the user asks for older work.\n"
             "- host_exec is a LAST RESORT; prefer specialized tools (port_scan, dns_lookup, analyze_pcapng, etc.).\n"
@@ -466,6 +546,68 @@ class ReActAgent:
 
         self.ctx_manager.clear_history()
         self.ctx_manager.add_message({"role": "system", "content": prompt})
+
+    def _refresh_system_prompt(self) -> None:
+        """Update pinned system message without clearing conversation history."""
+        if not self.prompt_pack_mode:
+            return
+        prompt = self.prompt_pack.assemble_system(
+            active_agent=self.active_agent,
+            network_mode=self.network_mode,
+            session_id=self.session_id,
+        )
+        if self.ctx_manager.has_system():
+            self.ctx_manager.messages[0] = {"role": "system", "content": prompt}
+        else:
+            self.ctx_manager.messages.insert(0, {"role": "system", "content": prompt})
+
+    def _declared_intent_dict(self) -> dict[str, Any]:
+        spec = getattr(self, "_intent_spec", None)
+        if spec is None:
+            return {}
+        return {
+            "domain": spec.domain,
+            "summary": spec.summary,
+            "objectives": list(spec.objectives or []),
+            "targets": list(spec.targets or []),
+            "success_criteria": list(spec.success_criteria or []),
+            "constraints": list(spec.constraints or []),
+            "suggested_agent": suggested_agent_for_domain(spec.domain),
+        }
+
+    def _tools_schema_for_turn(self) -> list[dict[str, Any]]:
+        if self.prompt_pack_mode:
+            return self.prompt_pack.schemas_for_agent(self.active_agent)
+        return tools.TOOLS_SCHEMA
+
+    def _reset_handoff_state(self) -> None:
+        self.active_agent = "lead"
+        self.active_specialist = "lead"
+        self._handoff_brief = ""
+        self._return_to_lead_when = ""
+        self._handoff_complete = False
+        self._stop_tool_batch = False
+
+    def _sync_visibility_context(self) -> None:
+        set_visibility_context(
+            active_session_id=self.session_id,
+            unlocked=self._unlocked_sessions,
+            fence_enabled=self.session_fence_mode,
+        )
+
+    def _apply_session_unlocks(self, text: str) -> None:
+        found = unlock_from_message(text or "")
+        if found:
+            self._unlocked_sessions.update(found)
+
+    def select_prior_session(self, session_id: str | None) -> None:
+        sid = (session_id or "").strip()
+        self._selected_prior_session = sid or None
+        if sid:
+            self._unlocked_sessions.add(sid)
+
+    def clear_prior_session_selection(self) -> None:
+        self._selected_prior_session = None
 
     # ── Public interface ───────────────────────────────────────────────────
 
@@ -476,6 +618,10 @@ class ReActAgent:
     def new_session(self) -> str:
         """Start a new session id; preserve prior session state and workspace files."""
         self.ctx_manager.save_state()
+        try:
+            seal_handoff(self.session_id, outcome="partial")
+        except Exception:
+            pass
         previous = self.session_id
         self.session_id = generate_session_id()
         save_active_session(self.session_id, previous=previous)
@@ -493,6 +639,9 @@ class ReActAgent:
         self._anchor_query = ""
         self.thinking_engine.reset()
         self.retry_orchestrator.reset()
+        self._selected_prior_session = None
+        self._unlocked_sessions = set()
+        self._reset_handoff_state()
         self._init_system_prompt()
         return self.session_id
 
@@ -569,6 +718,56 @@ class ReActAgent:
 
         return refs[:8]
 
+    def _init_turn_state(self, mission_text: str) -> None:
+        """Load plan and working memory for a mission or chat turn."""
+        self._task_plan = load_plan_state(self.session_id, mission_text) or TaskPlanTracker(
+            mission_text
+        )
+        self._working_memory = load_working_memory(self.session_id)
+        self._last_tool_head = ""
+
+    def _build_turn_context(self, *, mission_text: str, draft: str | None = None) -> str:
+        """Single canonical CURRENT STATE packet for mission and chat loops."""
+        if not getattr(self, "_working_memory", None):
+            self._working_memory = load_working_memory(self.session_id)
+        plan = getattr(self, "_task_plan", None)
+        plan_compact = plan.compact() if plan and plan.steps else None
+        readapt = ""
+        if plan and plan.needs_readaptation():
+            readapt = plan.readaptation_directive()
+        state_kwargs: dict[str, Any] = {
+            "mission": mission_text,
+            "plan": plan_compact,
+            "working_memory": self._working_memory,
+            "last_tool_result": getattr(self, "_last_tool_head", "") or "",
+            "draft": draft or "",
+            "facts_block": summarize_facts(self.session_id, max_chars=500),
+            "artifact_refs": self._artifact_refs(),
+            "readaptation": readapt,
+        }
+        if self.prompt_pack_mode:
+            state_kwargs.update(
+                active_agent=self.active_agent,
+                handoff_brief=self._handoff_brief,
+                return_to_lead_when=self._return_to_lead_when,
+                declared_intent=self._declared_intent_dict(),
+                handoff_complete=self._handoff_complete,
+                max_chars=self.prompt_budgets.current_state_tokens * 4,
+            )
+            plan = getattr(self, "_task_plan", None)
+            if plan and plan.steps:
+                pc = plan.compact()
+                state_kwargs["manager_plan"] = pc.get("manager_plan")
+                state_kwargs["current_task"] = pc.get("current_task")
+            if self._selected_prior_session:
+                prior = format_handoff_for_state(load_handoff(self._selected_prior_session))
+                if prior:
+                    state_kwargs["prior_handoff"] = prior
+        block = build_current_state(**state_kwargs)
+        if self.prompt_pack_mode and block:
+            save_current_state(self.session_id, block)
+        return block
+
     # ── Tool execution ─────────────────────────────────────────────────────
 
     async def _execute_tool(
@@ -584,6 +783,9 @@ class ReActAgent:
 
         Returns (did_execute: bool, tools_executed_delta: int).
         """
+        self._sync_visibility_context()
+        scope_advisory = ""
+
         # Normalise args
         tool_args = ArgumentNormalizer.normalize(tool_name, tool_args)
 
@@ -600,6 +802,46 @@ class ReActAgent:
                 tool_name, tool_args = new_name, new_args
         except Exception:
             pass
+
+        if self.prompt_pack_mode and tool_name == "delegate_to" and self.active_agent != "lead":
+            block_err = "Blocked: only LEAD may call delegate_to."
+            if step_callback:
+                step_callback("AGENT_TOOL_CALL", {"tool": tool_name, "args": tool_args})
+                step_callback("AGENT_TOOL_RESULT", {
+                    "tool": tool_name,
+                    "result": {"success": False, "error": block_err},
+                })
+            self.ctx_manager.add_message({
+                "role": "tool",
+                "name": tool_name,
+                "content": json.dumps({"success": False, "error": block_err}),
+            })
+            return False, 0
+
+        if (
+            self.prompt_pack_mode
+            and tool_name != "delegate_to"
+            and not tool_allowed(self.active_agent, tool_name)
+        ):
+            if self.specialist_soft_scope:
+                scope_advisory = scope_advisory_message(tool_name, self.active_agent)
+            else:
+                block_err = (
+                    f"Blocked: {tool_name} is not available to {self.active_agent}. "
+                    f"Suggested agent: {suggest_agent_for_tool(tool_name)!r}."
+                )
+                if step_callback:
+                    step_callback("AGENT_TOOL_CALL", {"tool": tool_name, "args": tool_args})
+                    step_callback("AGENT_TOOL_RESULT", {
+                        "tool": tool_name,
+                        "result": {"success": False, "error": block_err},
+                    })
+                self.ctx_manager.add_message({
+                    "role": "tool",
+                    "name": tool_name,
+                    "content": json.dumps({"success": False, "error": block_err}),
+                })
+                return False, 0
 
         if tool_name == "run_script" and tool_args.get("script_path"):
             self._last_script_path = str(tool_args["script_path"])
@@ -653,15 +895,66 @@ class ReActAgent:
             if pending:
                 tool_args.setdefault("deliverables", pending)
 
+        if tool_name in ("finding_create", "finding_list", "report_generate"):
+            tool_args = dict(tool_args)
+            tool_args.setdefault("session_id", self.session_id)
+        if tool_name in ("finding_list", "report_generate"):
+            tool_args.setdefault("scope", "session")
+
+        if tool_name == "try_http_login":
+            from core.credential_inputs import reconcile_login_args
+            tool_args = dict(tool_args)
+            creds = getattr(self, "_web_auth_credentials", {}) or {}
+            tool_args, _ = reconcile_login_args(tool_args, creds)
+
+        if (
+            getattr(self, "_in_chat_turn", False)
+            and tool_name in _CHAT_REPORTING_TOOLS
+            and getattr(self, "_session_findings_count", 0) == 0
+        ):
+            anchor = getattr(self, "_anchor_query", "") or ""
+            user_wants_report = bool(
+                re.search(r"\b(?:engagement\s+)?report\b|\ball\s+findings\b", anchor, re.I)
+            )
+            if not user_wants_report:
+                block_err = (
+                    f"Blocked: {tool_name} — no findings were recorded this session with "
+                    "finding_create. Summarize the task result in chat instead; do not pull "
+                    "historical engagement findings from prior sessions."
+                )
+                if step_callback:
+                    step_callback("AGENT_TOOL_CALL", {"tool": tool_name, "args": tool_args})
+                    step_callback("AGENT_TOOL_RESULT", {
+                        "tool": tool_name,
+                        "result": {"success": False, "error": block_err},
+                    })
+                self.ctx_manager.add_message({
+                    "role": "tool",
+                    "name": tool_name,
+                    "content": json.dumps({"success": False, "error": block_err}),
+                })
+                return False, 0
+
         tool_name, tool_args, redirect_note = ExecutionPolicy.apply(tool_name, tool_args)
 
-        tool_name, tool_args, block_err = WriteGuard.apply(
-            tool_name,
-            tool_args,
-            self._active_intent,
-            session_id=self.session_id,
-            pending_deliverables=pending,
-        )
+        block_err = ""
+        if (
+            self._active_intent
+            and self._active_intent.forbid_network
+            and tool_name in _FORBID_NETWORK_TOOLS
+        ):
+            block_err = (
+                f"Blocked: {tool_name} is not allowed — user requested no network reconnaissance."
+            )
+
+        if not block_err:
+            tool_name, tool_args, block_err = WriteGuard.apply(
+                tool_name,
+                tool_args,
+                self._active_intent,
+                session_id=self.session_id,
+                pending_deliverables=pending,
+            )
         if not block_err:
             # Chat goals track per-tool success in _chat_tool_events (updated each
             # tool). _chat_tools_executed is only synced at step boundaries and
@@ -825,6 +1118,13 @@ class ReActAgent:
 
         if isinstance(result, dict) and redirect_note:
             result["redirect_note"] = redirect_note
+
+        if isinstance(result, dict) and scope_advisory:
+            result["scope_advisory"] = scope_advisory
+            result["suggested_agent"] = suggest_agent_for_tool(tool_name)
+            result["active_agent"] = self.active_agent
+            if not result.get("redirect_note"):
+                result["redirect_note"] = scope_advisory
 
         # Auto-recover missing PCAP path in chat hash/extract workflow.
         if (
@@ -1330,7 +1630,52 @@ class ReActAgent:
             if re.search(r"(login|password|xmlobj)", str(result.get("content", "")), re.I):
                 self._pcap_objective_met = True
 
+        if tool_name == "finding_create" and isinstance(result, dict) and result.get("success"):
+            self._session_findings_count = getattr(self, "_session_findings_count", 0) + 1
+
         success_exec = not (isinstance(result, dict) and result.get("success") is False)
+
+        if tool_name == "delegate_to" and isinstance(result, dict) and result.get("success"):
+            self.active_agent = str(result.get("active_agent", "lead"))
+            self.active_specialist = self.active_agent
+            self._handoff_brief = str(result.get("handoff_brief", ""))
+            self._return_to_lead_when = str(result.get("success_criteria", ""))
+            self._handoff_complete = False
+            plan = getattr(self, "_task_plan", None)
+            if plan and plan.current_step:
+                from core.task_plan import StepStatus, save_plan_state
+
+                cur = plan.current_step
+                cur.delegate_brief = self._handoff_brief
+                cur.success_criteria = self._return_to_lead_when
+                cur.status = StepStatus.IN_PROGRESS
+                try:
+                    save_plan_state(self.session_id, plan)
+                except Exception:
+                    pass
+            self._refresh_system_prompt()
+            self._stop_tool_batch = True
+        elif (
+            self.prompt_pack_mode
+            and self.active_agent != "lead"
+            and tool_name != "delegate_to"
+            and success_exec
+        ):
+            prior_agent = self.active_agent
+            self._handoff_complete = True
+            self.active_agent = "lead"
+            self.active_specialist = "lead"
+            plan = getattr(self, "_task_plan", None)
+            if plan and plan.current_step:
+                try:
+                    from core.task_plan import StepStatus, save_plan_state
+
+                    if plan.current_step.assigned_agent == prior_agent:
+                        plan.current_step.status = StepStatus.DONE
+                    save_plan_state(self.session_id, plan)
+                except Exception:
+                    pass
+            self._refresh_system_prompt()
 
         # Phase 2 STRUCTURED UPDATE: refresh volatile working memory + last-tool
         # head so the NEXT CURRENT STATE reflects this step, instead of appending
@@ -1374,8 +1719,12 @@ class ReActAgent:
         if not self.ctx_manager.has_system():
             self._init_system_prompt()
 
+        self._reset_handoff_state()
         self._cancel_event.clear()
         self._anchor_query = user_prompt
+        self._apply_session_unlocks(user_prompt)
+        from core.credential_inputs import extract_web_auth_credentials
+        self._web_auth_credentials = extract_web_auth_credentials(user_prompt)
         self._active_intent = TaskIntentExtractor.parse(user_prompt)
         self.ctx_manager.add_message({"role": "user", "content": user_prompt})
         self._mission_goals = ChatGoalRegistry.match_message(user_prompt)
@@ -1390,6 +1739,10 @@ class ReActAgent:
                 "content": self._mission_goals.context_directive(),
             })
 
+        self._init_turn_state(user_prompt)
+        evaluator_nudges = 0
+        max_evaluator_nudges = 1
+
         tools_executed: int  = 0
         tools_called: set    = set()
         consecutive_empty: int = 0
@@ -1400,8 +1753,8 @@ class ReActAgent:
                 final_answer = "[Mission cancelled by user.]"
                 break
 
-            # Trim context before each LLM call
             self.ctx_manager.trim_context()
+            current_state = self._build_turn_context(mission_text=user_prompt)
 
             if step_callback:
                 step_callback(
@@ -1409,13 +1762,15 @@ class ReActAgent:
                     f"Step {step + 1}/{self.max_steps} | Tools: {tools_executed} | Thinking…",
                 )
 
-            # LLM call
             try:
                 response = await self.adapter.chat(
-                    messages=self.ctx_manager.get_messages(),
-                    tools_schema=tools.TOOLS_SCHEMA,
+                    messages=self.ctx_manager.messages_for_llm(self.history_window_turns),
+                    tools_schema=self._tools_schema_for_turn(),
                     task_intent=self._active_intent,
                     anchor_query=self._anchor_query,
+                    current_state=current_state or None,
+                    prompt_pack_mode=self.prompt_pack_mode,
+                    active_agent=self.active_agent,
                 )
             except Exception as e:
                 err = f"Ollama error: {e}"
@@ -1516,6 +1871,7 @@ class ReActAgent:
             if tool_calls:
                 consecutive_empty = 0
                 self.retry_orchestrator.reset()
+                self._stop_tool_batch = False
                 for tc in tool_calls:
                     func     = tc.get("function", tc)
                     name     = func.get("name", tc.get("name", ""))
@@ -1532,6 +1888,8 @@ class ReActAgent:
                         name, args, tools_called, step_callback
                     )
                     tools_executed += delta
+                    if self._stop_tool_batch:
+                        break
                     if did_exec:
                         self._mission_tools_executed.append(name)
                         if isinstance(self.ctx_manager.get_messages()[-1].get("content", ""), str):
@@ -1554,6 +1912,29 @@ class ReActAgent:
                                 self._mission_goals.pending(self._mission_tools_executed)
                             )
                         )
+
+                plan = getattr(self, "_task_plan", None)
+                if plan and plan.steps and plan.needs_readaptation():
+                    if self.mission_evaluator and evaluator_nudges < max_evaluator_nudges:
+                        evaluator_nudges += 1
+                        try:
+                            eval_data = await self.mission_evaluator.evaluate(
+                                user_prompt,
+                                self._mission_tools_executed,
+                                recent_result_heads or [
+                                    self.ctx_manager.get_messages()[-1].get("content", "")[:240]
+                                ],
+                                plan.all_done,
+                            )
+                            hint = str(eval_data.get("hint", "")).strip()
+                            if hint:
+                                plan.record_strategy(hint)
+                                cur = plan.current_step
+                                if cur:
+                                    plan.append_scratchpad(self.session_id, cur.id, hint)
+                        except Exception:
+                            pass
+                    continue
 
                 if self._mission_tracker and self._mission_tracker.needs_stall_recovery():
                     self._add_nudge(self._mission_tracker.stall_directive())
@@ -1656,7 +2037,9 @@ class ReActAgent:
         try:
             from core.memory import log_daily_execution
             steps_executed = (step + 1) if "step" in locals() else 0
-            f_count = len(tools.finding_list().get("findings", []))
+            f_count = len(
+                tools.finding_list(session_id=self.session_id, scope="session").get("findings", [])
+            )
             log_daily_execution(
                 session_id=self.session_id,
                 specialist=self.active_specialist,
@@ -1678,17 +2061,9 @@ class ReActAgent:
 
     # ── Chat turn (interactive) ────────────────────────────────────────────
 
-    async def _compute_intent_spec_shadow(self, message: str) -> None:
-        """Compute and persist an IntentSpec for the turn.
-
-        The deterministic fallback is computed synchronously (instant) and used
-        for this turn. If an LLM formalizer is configured, it refines the spec in
-        the BACKGROUND so a slow/unavailable model never stalls the turn. The
-        refined spec is persisted/logged for validation but does not retro-gate
-        the current turn.
+    async def _compute_intent_spec(self, message: str) -> None:
+        """Compute and persist an IntentSpec for the turn synchronously.
         """
-        if not self.intent_shadow_mode:
-            return
         try:
             spec = build_fallback_spec(message)
         except Exception:
@@ -1696,19 +2071,20 @@ class ReActAgent:
             return
 
         self._intent_spec = spec
-        self._log_intent_spec(message, spec)
-        try:
-            save_intent_spec(self.session_id, spec)
-        except Exception:
-            pass
 
         if self.intent_formalizer is not None:
             try:
-                self._intent_refine_task = asyncio.create_task(
-                    self._refine_intent_spec_bg(message)
-                )
+                refined = await self.intent_formalizer.formalize(message)
+                if refined is not None and refined.source != "fallback":
+                    self._intent_spec = refined
             except Exception:
                 pass
+
+        self._log_intent_spec(message, self._intent_spec)
+        try:
+            save_intent_spec(self.session_id, self._intent_spec)
+        except Exception:
+            pass
 
     async def _refine_intent_spec_bg(self, message: str) -> None:
         """Background LLM refinement of the intent spec (best-effort)."""
@@ -1789,10 +2165,12 @@ class ReActAgent:
         if not self.ctx_manager.has_system():
             self._init_system_prompt()
 
+        self._reset_handoff_state()
+
         def log_chat_mem(outcome_val: str, steps_val: int):
             try:
                 from core.memory import log_daily_execution
-                f_count = len(tools.finding_list().get("findings", []))
+                f_count = getattr(self, "_session_findings_count", 0)
                 log_daily_execution(
                     session_id=self.session_id,
                     specialist=self.active_specialist,
@@ -1805,6 +2183,7 @@ class ReActAgent:
                 pass
 
         raw_message = message
+        self._apply_session_unlocks(raw_message)
         # Detect confirmation phrases and add execution directive
         if any(w in message.lower() for w in
                ["yes", "ok", "do it", "go ahead", "execute", "proceed", "run it"]):
@@ -1813,8 +2192,12 @@ class ReActAgent:
         self.retry_orchestrator.reset()
         self._anchor_query = raw_message
         self.parser.set_user_context(raw_message)
+        from core.credential_inputs import extract_web_auth_credentials
+        self._web_auth_credentials = extract_web_auth_credentials(raw_message)
+        self._session_findings_count = 0
+        self._in_chat_turn = True
         self._active_intent = TaskIntentExtractor.parse(message)
-        await self._compute_intent_spec_shadow(raw_message)
+        await self._compute_intent_spec(raw_message)
         self._chat_tool_events = []
         self._credential_pairs = []
         self._crack_results = []
@@ -1827,26 +2210,45 @@ class ReActAgent:
                 "Write each with write_file before any progress notes.\n"
             )
 
-        chat_directive = (
-            "[CHAT MODE] Focus ONLY on the user's request below. "
-            "Do NOT declare MISSION_COMPLETE or generate engagement/final reports. "
-            "Do NOT run network recon tools unless explicitly requested. "
-            f"Use append_note on `{plan_note_rel(self.session_id)}` for progress — never write_file for status lines. "
-            "sequentialthinking is optional in chat (max one planning thought); prefer action tools. "
-            "Complete the user's task before stopping — append_note alone is not completion. "
-            f"{deliverable_hint}\n"
-        )
+        chat_directive = ""
+        if not self.prompt_pack_mode:
+            chat_directive = (
+                "[CHAT MODE] Focus ONLY on the user's request below. "
+                "Do NOT declare MISSION_COMPLETE or call report_generate/finding_list unless "
+                "you used finding_create this session (or the user explicitly asked for a report). "
+                "Do NOT run network recon tools unless explicitly requested. "
+                f"Use append_note on `{plan_note_rel(self.session_id)}` for progress — never write_file for status lines. "
+                "sequentialthinking is optional in chat (max one planning thought); prefer action tools. "
+                "Complete the user's task before stopping — append_note alone is not completion. "
+                f"{deliverable_hint}\n"
+            )
         self.ctx_manager.add_message({"role": "user", "content": chat_directive + message})
 
-        if self.intent_inject_context:
+        if self.intent_inject_context and not self.prompt_pack_mode:
             intent_block = self._intent_context_block()
             if intent_block:
                 self.ctx_manager.add_message({"role": "user", "content": intent_block})
 
-        chat_goals = ChatGoalRegistry.match_message(message)
+        match_text = message
+        spec = getattr(self, "_intent_spec", None)
+        intent_domain: str | None = None
+        if spec:
+            intent_domain = spec.domain
+        if spec and spec.source != "fallback":
+            match_text = f"{spec.summary} {spec.domain}"
+
+        if spec and spec.inputs.get("user"):
+            self._web_auth_credentials.setdefault("user", spec.inputs["user"])
+        if spec and spec.inputs.get("password"):
+            self._web_auth_credentials.setdefault("password", spec.inputs["password"])
+
+        chat_goals = ChatGoalRegistry.match_message(
+            raw_message,
+            intent_domain=intent_domain,
+        )
         if not chat_goals:
             chat_goals = ChatGoalRegistry.match_session(
-                self.ctx_manager.get_messages(), message
+                self.ctx_manager.get_messages(), match_text
             )
         self._chat_goals = chat_goals
         # #region agent log
@@ -1869,10 +2271,7 @@ class ReActAgent:
         # #endregion
         self._last_pcap_summary: str | None = None
         self._pcap_objective_met: bool = False
-        self._task_plan = load_plan_state(self.session_id, message) or TaskPlanTracker(message)
-        # Phase 2: load volatile working memory and reset the per-turn tool head.
-        self._working_memory = load_working_memory(self.session_id)
-        self._last_tool_head = ""
+        self._init_turn_state(message)
         self._rehydrate_credential_pairs()
 
         if chat_goals and chat_goals.context_directive():
@@ -1913,26 +2312,12 @@ class ReActAgent:
         for step in range(12):
             self._chat_tools_executed = list(tools_executed_names)
 
-            # Phase 2: one canonical CURRENT STATE injection replaces the separate
-            # session snippet + plan status blocks. Rebuilt each step so it always
-            # reflects the latest facts/plan/working-memory; never persisted to
-            # history. The long checklist lives only on disk (plan_state).
-            plan_compact = self._task_plan.compact() if self._task_plan.steps else None
             draft = ""
             if self._pcap_draft:
                 draft = self._pcap_draft
                 self._pcap_draft = None
-            current_state = build_current_state(
-                mission=raw_message,
-                plan=plan_compact,
-                working_memory=self._working_memory,
-                last_tool_result=self._last_tool_head,
-                draft=draft,
-                facts_block=summarize_facts(self.session_id, max_chars=500),
-                artifact_refs=self._artifact_refs(),
-            )
-
             self.ctx_manager.trim_context()
+            current_state = self._build_turn_context(mission_text=raw_message, draft=draft or None)
             # #region agent log
             try:
                 from core.debug_log import debug_log
@@ -1953,10 +2338,12 @@ class ReActAgent:
             # #endregion
             response = await self.adapter.chat(
                 messages=self.ctx_manager.messages_for_llm(self.history_window_turns),
-                tools_schema=tools.TOOLS_SCHEMA,
+                tools_schema=self._tools_schema_for_turn(),
                 task_intent=self._active_intent,
                 anchor_query=self._anchor_query,
                 current_state=current_state or None,
+                prompt_pack_mode=self.prompt_pack_mode,
+                active_agent=self.active_agent,
             )
 
             msg     = response.get("message", {})
@@ -2031,6 +2418,7 @@ class ReActAgent:
                 consecutive_no_tool = 0
                 batch_executed = False
                 batch_only_notes = bool(tool_calls)
+                self._stop_tool_batch = False
                 # #region agent log
                 try:
                     from core.debug_log import debug_log_session
@@ -2067,6 +2455,8 @@ class ReActAgent:
                     if name != "append_note":
                         batch_only_notes = False
                     did_exec, _ = await self._execute_tool(name, args, tools_called, step_callback)
+                    if self._stop_tool_batch:
+                        break
                     if did_exec:
                         batch_executed = True
                         tools_executed_names.append(name)
@@ -2167,8 +2557,8 @@ class ReActAgent:
                                     self._task_plan.append_scratchpad(self.session_id, cur.id, hint)
                         except Exception:
                             pass
-                    # Readaptation/evaluator guidance is surfaced via plan_block on
-                    # the next step (strategy notes + last failure), not persisted.
+                    # Readaptation/evaluator guidance is surfaced via CURRENT STATE
+                    # (readaptation section + strategy notes), not persisted.
                     continue
             else:
                 consecutive_no_tool += 1
@@ -2497,6 +2887,8 @@ class ReActAgent:
         intent_snapshot = self._active_intent
         self._active_intent = None
         self._anchor_query = ""
+        self._in_chat_turn = False
+        self._web_auth_credentials = {}
         self._chat_goals = None
         self._chat_tools_executed = []
         self._pcap_objective_met = False
@@ -3033,7 +3425,7 @@ class ReActAgent:
         # Grounding: pull findings count from DB
         grounding = ""
         try:
-            f_data = tools.finding_list().get("findings", [])
+            f_data = tools.finding_list(session_id=self.session_id, scope="session").get("findings", [])
             grounding = (
                 f"\n[FINDINGS INVENTORY]\n"
                 f"Total findings in DB: {len(f_data)}\n"
@@ -3054,16 +3446,20 @@ class ReActAgent:
             "### Next Steps"
         )
         self.ctx_manager.add_message({"role": "user", "content": synthesis_prompt})
+        self.ctx_manager.trim_context()
+        mission_text = self._anchor_query or ""
+        current_state = self._build_turn_context(mission_text=mission_text)
 
         try:
             response = await self.adapter.chat(
-                messages=self.ctx_manager.get_messages(),
+                messages=self.ctx_manager.messages_for_llm(self.history_window_turns),
                 tools_schema=None,
                 options={
                     "temperature": 0.2,
                     "num_predict": self.num_predict_synthesis,
                 },
                 anchor_query=self._anchor_query,
+                current_state=current_state or None,
             )
             final = response.get("message", {}).get("content", "Mission complete.")
         except Exception:

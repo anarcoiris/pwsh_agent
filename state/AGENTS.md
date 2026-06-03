@@ -1,48 +1,58 @@
-# AGENTS.md - Specialization and Guidelines
+# AGENTS — Specialist Roster & Handoff Rules
 
-This file governs your execution roles, cognitive personas, and internal operating rules.
+Six specialists. Each tool belongs to exactly one agent. LEAD orchestrates; others execute domain work.
 
-## 👥 Dynamic Personas (Specialists)
+## LEAD manager workflow
 
-You can swap into specific personas during a session. Each mode adjusts your system prompt focus:
+1. **Plan first** — one `sequentialthinking` max, then `append_note` on the session plan with numbered tasks.
+2. **Assign agent per task** — each task line: `agent=web|workspace|forensic|recon|crypto|lead`.
+3. **One delegate per turn** — call `delegate_to(agent, brief, success_criteria)` for the **current** task only. Emit **no other tool calls** in that turn.
+4. **Review on return** — when `[HANDOFF COMPLETE]` appears in CURRENT STATE, update plan/status, then delegate the next task or conclude.
 
-### 1. Lead / Orchestrator (`lead`)
-- **Focus**: Strategic planning, findings collation, and final reports generation.
-- **Behavior**: Keeps the big picture in mind. Avoids getting trapped in minor command errors.
+## Roster
 
-### 2. Network & Packet Specialist (`network`)
-- **Focus**: Local interfaces, socket analysis, PCAP traces, and protocol mapping.
-- **Behavior**: Prefers capturing traffic and checking interface configuration. Uses `Test-NetConnection`, `tshark`, or `capture_packets`.
+**lead** — Orchestrator. Plans, delegates, records findings, generates reports. Tools: sequentialthinking, delegate_to, append_note, finding_create, finding_list, report_generate.
 
-### 3. Reverse Engineering (RE) Specialist (`re`)
-- **Focus**: Static/dynamic binary analysis, disassembling, strings extraction, and script debugging.
-- **Behavior**: Uses local reversing tools, disassemblers, and file parsers.
+**workspace** — Files and scripts. Read/write/search files, run scripts. Use for code_build, code_review, scripting, file_ops, sysadmin file tasks.
 
-### 4. Exploit Dev / Auditor (`exploit`)
-- **Focus**: Penetration audits, brute force scripts, cryptographic strength analysis, and security verification.
-- **Behavior**: Runs credential audits, local password strength checkers, and evaluates configurations.
+**web** — HTTP and authentication. Fetch pages, test logins, inspect headers/TLS. Use for web_auth only.
 
-## 📁 Memory Rules
-- Store all daily execution logs under `state/memory/YYYY-MM-DD.md`.
-- Keep the curated long-term system status inside `state/MEMORY.md`.
+**recon** — Active scanning. DNS, ping sweep, port scan, system info, CVE lookup.
 
-## 🔧 Tool Execution Pipeline (2026-05-30 baseline)
+**forensic** — PCAP pipeline. List interfaces, capture packets, analyze pcapng, find_tshark.
 
-The console agent does **not** call `mcp_server.py` for `sequentialthinking`; it uses in-process Python tools.
+**crypto** — Hash and encoding. crack_hash, hash_identify, encode_decode.
 
-| Tool | Use for |
-|------|---------|
-| `write_file` | Code deliverables (`.py`, `.ps1`), reports, any full file body |
-| `append_note` | Progress lines only — `workspace/plan.md`, `workspace/status.md`, `workspace/session_log.md` |
-| `read_file` / `run_script` / `host_exec` | Verification and execution (`.py` → `run_script`; PowerShell → `host_exec`) |
+## Routing table (advisory)
 
-**Rules enforced in code (do not bypass):**
+| Domain | First delegate |
+|--------|----------------|
+| general, mixed, reporting, conversation | lead |
+| code_build, code_review, scripting, file_ops, sysadmin | workspace |
+| web_auth | web |
+| recon | recon |
+| pcap | forensic |
+| hash (crack) | crypto |
 
-1. Parser extracts tool calls from bare JSON and fenced blocks (Ollama rarely emits native `tool_calls`).
-2. `WriteGuard` redirects short `write_file` notes on `workspace/plan.md` → `append_note`.
-3. `WriteGuard` blocks `write_file` to plan.md when user asked for a `.py` deliverable that is not on disk yet.
-4. `ExecutionPolicy` redirects `host_exec` python/`-File *.py` → `run_script` (venv python).
-5. `ContextRouter` injects tool playbooks from `knowledge/` (not prompt essays).
-6. `chat_turn` ends with disk verification; no false warnings for qualified deliverable paths.
+## Handoff contract
 
-Before changing `core/parser.py`, `agent.py`, `core/rag.py`, `core/context_router.py`, or `tools_legacy.py`, run all tests listed in `MEMORY.md` → Task Closure.
+- LEAD calls `delegate_to` before specialist work (recommended). Wrong-scope tools still run with a scope advisory suggesting the correct agent.
+- Specialists cannot call `delegate_to`. Control returns to LEAD automatically after one specialist action.
+- Do not call `delegate_to(agent='lead')`.
+
+## Cross-session context
+
+- Prior sessions are not browsable by default. Use sealed handoff summaries via `session pick <id>` in console.
+- LEAD reads handoff summaries, not raw prior session folders.
+
+## Anti-patterns
+
+- No PCAP tools on web_auth tasks.
+- No report_generate without finding_create first.
+- append_note is LEAD-only (specialists return facts via tool results).
+
+## Progress notes (LEAD)
+
+- Plan: strategy and numbered tasks with assigned agents.
+- Status: completed steps and blockers.
+- Scratchpad: raw logs and temporary data.

@@ -13,7 +13,6 @@ from core.llm_utils import DynamicContextBuilder
 from core.query_anchor import resolve_anchor_query, strip_directives
 from core.rag import get_rag_context, get_rag_context_for_tools
 from core.task_intent import TaskIntent
-from core.tool_index import DEFAULT_STATIC_MAX_CHARS, get_static_tool_routing
 
 logger = logging.getLogger("pwsh_agent.core.context_router")
 
@@ -41,7 +40,6 @@ for _group in (
     for _tool in _group:
         _TOOL_GROUP_MAP[_tool] = _frozen
 
-_STATIC_ROUTING_HEADER = "### TOOL ROUTING (static reference) ###"
 _DOMAIN_MAX_CHARS = 2000
 _PLAYBOOK_MAX_CHARS = 2000
 _SESSION_CTX_HEADER = "### SESSION CONTEXT ###"
@@ -66,6 +64,9 @@ class ContextRouter:
         plan_block: str | None = None,
         current_state: str | None = None,
         injection_budget_chars: int = 8000,
+        *,
+        prompt_pack_mode: bool = False,
+        active_agent: str = "lead",
     ) -> list[dict[str, str]]:
         injections: list[dict[str, str]] = []
 
@@ -89,16 +90,20 @@ class ContextRouter:
                     "content": f"{_PLAN_CTX_HEADER}\n{plan_block}\n{'#' * len(_PLAN_CTX_HEADER)}",
                 })
 
-        static_routing = get_static_tool_routing(max_chars=DEFAULT_STATIC_MAX_CHARS)
-        if static_routing:
-            injections.append({
-                "role": "system",
-                "content": (
-                    f"{_STATIC_ROUTING_HEADER}\n"
-                    f"{static_routing}\n"
-                    f"{'#' * len(_STATIC_ROUTING_HEADER)}"
-                ),
-            })
+        if prompt_pack_mode:
+            tool_names = cls._schemas_for_active_agent(active_agent)
+            if tool_names:
+                schemas_json = cls._get_tool_schemas(tool_names, max_chars=4800)
+                if schemas_json:
+                    injections.append({
+                        "role": "system",
+                        "content": (
+                            "### RELATED TOOL SCHEMAS ###\n"
+                            f"{schemas_json}\n"
+                            "#############################"
+                        ),
+                    })
+            return injections
 
         phase_hint = DynamicContextBuilder.build_context(messages, anchor_query=query or None)
         phase_label = cls._detect_phase_label(phase_hint, task_intent)
@@ -126,10 +131,24 @@ class ContextRouter:
                     "role": "system",
                     "content": f"{header}\n{playbooks}\n{'#' * len(header)}",
                 })
+            
+            schemas_json = cls._get_tool_schemas(tool_names)
+            if schemas_json:
+                injections.append({
+                    "role": "system",
+                    "content": (
+                        "### RELATED TOOL SCHEMAS ###\n"
+                        f"{schemas_json}\n"
+                        "#############################"
+                    ),
+                })
 
         total = sum(len(i.get("content", "")) for i in injections)
         if total > injection_budget_chars:
             injections = [i for i in injections if "TOOL PLAYBOOKS" not in i.get("content", "")]
+            total = sum(len(i.get("content", "")) for i in injections)
+        if total > injection_budget_chars:
+            injections = [i for i in injections if "RELATED TOOL SCHEMAS" not in i.get("content", "")]
             total = sum(len(i.get("content", "")) for i in injections)
         if total > injection_budget_chars:
             injections = [
@@ -147,8 +166,39 @@ class ContextRouter:
         return injections
 
     @staticmethod
+    def _schemas_for_active_agent(active_agent: str) -> list[str]:
+        from core.specialists import SPECIALIST_REGISTRY
+
+        return sorted(SPECIALIST_REGISTRY.get(active_agent, SPECIALIST_REGISTRY["lead"]))
+
+    @staticmethod
     def _strip_directives(text: str) -> str:
         return strip_directives(text)
+
+    @classmethod
+    def _get_tool_schemas(cls, tool_names: list[str], max_chars: int = 2400) -> str:
+        """Find and format the schemas for the requested tools from TOOLS_SCHEMA."""
+        try:
+            import tools
+            schemas = []
+            current_len = 0
+            for name in tool_names:
+                schema = next((s for s in tools.TOOLS_SCHEMA if s.get("function", {}).get("name") == name), None)
+                if schema:
+                    serialized = json.dumps(schema, indent=2)
+                    if current_len + len(serialized) + 10 > max_chars:
+                        if not schemas:
+                            # Fallback if a single schema is extremely large
+                            return json.dumps(schema)[:max_chars]
+                        break
+                    schemas.append(schema)
+                    current_len += len(serialized) + 2
+            if not schemas:
+                return ""
+            return json.dumps(schemas, indent=2)
+        except Exception as e:
+            logger.warning("Error getting tool schemas: %s", e)
+            return ""
 
     @classmethod
     def _detect_phase_label(cls, phase_hint: str, intent: TaskIntent | None) -> str:
@@ -210,7 +260,8 @@ class ContextRouter:
         query: str,
         phase_label: str,
     ) -> list[str]:
-        tools: set[str] = set()
+        primary_tools: list[str] = []
+        secondary_tools: list[str] = []
         lower = query.lower()
 
         # ── Primary: capability-driven routing (Phase 2) ──────────────────
@@ -222,42 +273,37 @@ class ContextRouter:
                 from core.intent_spec import build_fallback_spec
                 from core.capabilities import tools_for_capabilities, tools_for_domain
                 spec = build_fallback_spec(query)
-                tools.update(tools_for_capabilities(spec.capabilities))
-                tools.update(tools_for_domain(spec.domain))
+                primary_tools.extend(tools_for_capabilities(spec.capabilities))
+                secondary_tools.extend(tools_for_domain(spec.domain))
             except Exception:
                 pass
 
         if intent and intent.is_dev_task:
-            tools.update(_DEV_TOOLS)
-
-        if phase_label == "DEVELOPMENT":
-            tools.update(_DEV_TOOLS)
-        elif phase_label == "RECON":
-            tools.update(_RECON_TOOLS)
-        elif phase_label in ("NETWORK", "ENUM"):
-            tools.update(_NETWORK_TOOLS)
+            primary_tools.extend(_DEV_TOOLS)
 
         # ── Secondary: low-priority keyword fallback ──────────────────────
         # Note: "password" is intentionally NOT a trigger for exploit/hash
         # tools — testing a known password is web_auth, not hash cracking.
         if re.search(r"\b(pcap|tshark|wireshark|capture|packet)\b", lower):
-            tools.update(_NETWORK_TOOLS)
+            secondary_tools.extend(_NETWORK_TOOLS)
         if re.search(r"\b(hash|crack|sha-?256|sha-?512|md5|digest|hashpro|haspro)\b", lower):
-            tools.update(_EXPLOIT_TOOLS)
+            secondary_tools.extend(_EXPLOIT_TOOLS)
         if re.search(r"\b(log\s?in|login|sign\s?in|authenticate|credential)\b", lower):
-            tools.update(_WEB_TOOLS)
-            tools.add("try_http_login")
+            secondary_tools.extend(_WEB_TOOLS)
+            primary_tools.append("try_http_login")
         if re.search(r"\b(cve|vulnerability|vulnerabilities)\b", lower):
-            tools.update(_INTEL_TOOLS)
+            secondary_tools.extend(_INTEL_TOOLS)
         if re.search(r"\b(finding|findings|report)\b", lower):
-            tools.update(_REPORTING_TOOLS)
+            secondary_tools.extend(_REPORTING_TOOLS)
         if re.search(r"\b(header|headers|hsts|csp|tls|ssl|certificate|cert)\b", lower):
-            tools.update(_WEB_TOOLS)
+            secondary_tools.extend(_WEB_TOOLS)
         if re.search(r"\b(base64|encode|decode|hex|rot13|utf8)\b", lower):
-            tools.update(_EXPLOIT_TOOLS)
+            secondary_tools.extend(_EXPLOIT_TOOLS)
 
         if _VAGUE_CONTINUE_RE.search(lower):
-            cls._apply_recent_tool_bias(tools, messages)
+            temp_set = set()
+            cls._apply_recent_tool_bias(temp_set, messages)
+            secondary_tools.extend(temp_set)
 
         for msg in reversed(messages[-12:]):
             if msg.get("role") != "tool":
@@ -274,10 +320,17 @@ class ContextRouter:
                 or payload.get("exit_code", 0) not in (0, None)
             )
             if failed:
-                tools.update(["run_script", "host_exec"])
+                primary_tools.extend(["run_script", "host_exec"])
                 break
 
-        return sorted(tools)
+        # De-duplicate while preserving primary priority order
+        seen = set()
+        ordered_tools = []
+        for t in primary_tools + secondary_tools:
+            if t not in seen:
+                seen.add(t)
+                ordered_tools.append(t)
+        return ordered_tools
 
     @staticmethod
     def _playbook_header(phase_label: str) -> str:

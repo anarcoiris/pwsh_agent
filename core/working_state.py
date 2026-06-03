@@ -23,7 +23,7 @@ from typing import Any
 # Budget: a small 7B benefits from a tight, predictable state block. The token
 # figure is the contract; the char figure is the cheap fallback when no
 # tokenizer is available (~4 chars/token heuristic, matching core/context.py).
-MAX_CURRENT_STATE_TOKENS = 768
+MAX_CURRENT_STATE_TOKENS = 1500
 MAX_CURRENT_STATE_CHARS = MAX_CURRENT_STATE_TOKENS * 4
 
 _HEADER = "### CURRENT STATE ###"
@@ -121,6 +121,52 @@ def _facts_to_lines(facts_block: str) -> str:
     return text
 
 
+def current_state_file(session_id: str) -> Path:
+    from core.session_paths import session_state_dir
+
+    return session_state_dir(session_id) / "CURRENT_STATE.md"
+
+
+def save_current_state(session_id: str, content: str) -> Path | None:
+    """Persist CURRENT STATE block to the session directory."""
+    text = (content or "").strip()
+    if not text:
+        return None
+    path = current_state_file(session_id)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text + "\n", encoding="utf-8")
+        return path
+    except OSError:
+        return None
+
+
+def _format_declared_intent(declared: dict[str, Any] | None) -> str:
+    if not declared:
+        return ""
+    lines: list[str] = []
+    if declared.get("domain"):
+        lines.append(f"domain={declared['domain']}")
+    if declared.get("summary"):
+        lines.append(f"goal={declared['summary']}")
+    objs = declared.get("objectives") or []
+    if objs:
+        lines.append("objectives=" + "; ".join(str(o) for o in objs[:6]))
+    targets = declared.get("targets") or []
+    if targets:
+        lines.append("targets=" + ", ".join(str(t) for t in targets[:6]))
+    criteria = declared.get("success_criteria") or []
+    if criteria:
+        lines.append("done_when=" + "; ".join(str(c) for c in criteria[:4]))
+    constraints = declared.get("constraints") or []
+    if constraints:
+        lines.append("constraints=" + "; ".join(str(c) for c in constraints[:4]))
+    suggested = declared.get("suggested_agent")
+    if suggested:
+        lines.append(f"suggested_delegate={suggested}")
+    return "\n".join(lines)
+
+
 def build_current_state(
     *,
     mission: str = "",
@@ -130,18 +176,25 @@ def build_current_state(
     draft: str = "",
     facts_block: str = "",
     artifact_refs: list[str] | None = None,
+    readaptation: str = "",
+    active_agent: str = "",
+    handoff_brief: str = "",
+    return_to_lead_when: str = "",
+    declared_intent: dict[str, Any] | None = None,
+    handoff_complete: bool = False,
+    manager_plan: list[str] | None = None,
+    current_task: dict[str, str] | None = None,
+    prior_handoff: str = "",
     max_chars: int = MAX_CURRENT_STATE_CHARS,
 ) -> str:
     """Compose the single canonical CURRENT STATE block with a hard budget.
 
     Fixed section order (contract, so the small model always sees the same
-    priorities): MISSION -> NEXT ACTION -> LAST FAILURE -> LAST TOOL RESULT ->
-    DRAFT -> WORKING MEMORY -> COMPACT FACTS -> ARTIFACT REFS.
+    priorities): ACTIVE AGENT -> HANDOFF -> MISSION -> DECLARED INTENT ->
+    NEXT ACTION -> LAST FAILURE -> READAPTATION -> LAST TOOL RESULT -> DRAFT ->
+    WORKING MEMORY -> COMPACT FACTS -> ARTIFACT REFS.
 
-    Truncation happens after composing, honoring the fixed order: high-priority
-    sections (mission/next action/last failure) are preserved first; lower
-    sections are dropped or truncated to fit. We never trust a single component
-    to behave — the budget is enforced centrally here.
+    active_agent and handoff_brief always win truncation (high priority).
     """
     plan = plan or {}
     wm = working_memory or WorkingMemory()
@@ -152,8 +205,44 @@ def build_current_state(
     # (header, body) sections in fixed priority order.
     sections: list[tuple[str, str]] = []
 
+    agent = (active_agent or "").strip()
+    if agent:
+        agent_body = f"active_agent={agent}"
+        if handoff_complete:
+            agent_body += "\n[HANDOFF COMPLETE — review and delegate or conclude]"
+        sections.append(("ACTIVE AGENT", agent_body))
+
+    if prior_handoff.strip():
+        sections.append(("PRIOR HANDOFF", prior_handoff.strip()[:700]))
+
+    if manager_plan:
+        sections.append(("MANAGER PLAN", "\n".join(manager_plan[:12])))
+
+    ct = current_task or {}
+    if ct.get("id"):
+        ct_lines = [
+            f"task={ct.get('id', '')}",
+            f"agent={ct.get('assigned_agent', '')}",
+            f"label={ct.get('label', '')}",
+        ]
+        if ct.get("brief"):
+            ct_lines.append(f"brief={ct['brief']}")
+        if ct.get("success_criteria"):
+            ct_lines.append(f"done_when={ct['success_criteria']}")
+        sections.append(("CURRENT TASK", "\n".join(ct_lines)))
+
+    if handoff_brief.strip():
+        sections.append(("HANDOFF", handoff_brief.strip()[:800]))
+
+    if return_to_lead_when.strip():
+        sections.append(("RETURN TO LEAD", return_to_lead_when.strip()[:400]))
+
     if mission.strip():
         sections.append(("MISSION", mission.strip()[:600]))
+
+    intent_lines = _format_declared_intent(declared_intent)
+    if intent_lines:
+        sections.append(("DECLARED INTENT", intent_lines))
 
     na_lines: list[str] = []
     if next_action:
@@ -169,6 +258,9 @@ def build_current_state(
 
     if last_failure:
         sections.append(("LAST FAILURE", last_failure))
+
+    if readaptation.strip():
+        sections.append(("READAPTATION", readaptation.strip()[:1200]))
 
     if last_tool_result.strip():
         sections.append(("LAST TOOL RESULT", last_tool_result.strip()))

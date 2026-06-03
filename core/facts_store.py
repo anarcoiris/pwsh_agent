@@ -37,6 +37,13 @@ def _default() -> dict[str, Any]:
         "artifacts": [],
         "dns": [],
         "web": {},
+        "handoff": {
+            "sealed": False,
+            "domain": "",
+            "report_path": "",
+            "findings_count": 0,
+            "finding_heads": [],
+        },
     }
 
 
@@ -172,6 +179,18 @@ def update_from_tool(session_id: str, tool_name: str, result: dict[str, Any], ar
             return save_facts(session_id, facts)
         return None
 
+    if tool_name == "finding_create" and isinstance(result, dict) and result.get("success"):
+        ho = facts.setdefault("handoff", _default()["handoff"])
+        ho["findings_count"] = int(ho.get("findings_count", 0)) + 1
+        heads = list(ho.get("finding_heads") or [])
+        title = _clip(args.get("title") or result.get("title") or "", 80)
+        sev = _clip(args.get("severity") or result.get("severity") or "", 20)
+        entry = {"title": title, "severity": sev}
+        if entry not in heads:
+            heads.append(entry)
+        ho["finding_heads"] = heads[:12]
+        return save_facts(session_id, facts)
+
     if tool_name in ("write_file", "report_generate"):
         path = args.get("path") or result.get("path") or result.get("report_path") or ""
         path = str(path).replace("\\", "/").strip()
@@ -180,7 +199,17 @@ def update_from_tool(session_id: str, tool_name: str, result: dict[str, Any], ar
             entry = {"tool": tool_name, "path": _clip(path)}
             if not any(a.get("path") == entry["path"] for a in arts if isinstance(a, dict)):
                 arts.append(entry)
-                return save_facts(session_id, facts)
+            if tool_name == "report_generate":
+                ho = facts.setdefault("handoff", _default()["handoff"])
+                ho["report_path"] = _clip(path)
+                try:
+                    from core.session_handoff import seal_handoff
+
+                    seal_handoff(session_id, outcome="completed")
+                    ho["sealed"] = True
+                except Exception:
+                    pass
+            return save_facts(session_id, facts)
         return None
 
     if tool_name == "crack_hash":

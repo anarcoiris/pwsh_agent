@@ -102,6 +102,18 @@ def test_parse_extract_and_crack_steps():
     assert "crack_hash" in ids
 
 
+def test_readaptation_directive_on_failure():
+    plan = TaskPlanTracker("save values to pwd.txt and crack hash")
+    plan.register_tool(
+        "write_file",
+        {"success": True},
+        {"path": "workspace/pwd.txt", "content": "user:password\nxmlObj:salt"},
+    )
+    directive = plan.readaptation_directive()
+    assert "PLAN READAPTATION" in directive
+    assert plan.needs_readaptation()
+
+
 def test_placeholder_write_marks_failed():
     plan = TaskPlanTracker("save values to pwd.txt and crack hash")
     plan.register_tool(

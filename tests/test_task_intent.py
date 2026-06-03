@@ -27,6 +27,14 @@ def test_pending_deliverables():
     assert "watcher/watcher.py" in pending
 
 
+def test_forbid_network_tool_set():
+    from agent import _FORBID_NETWORK_TOOLS
+
+    assert "port_scan" in _FORBID_NETWORK_TOOLS
+    assert "analyze_pcapng" not in _FORBID_NETWORK_TOOLS
+    assert "read_file" not in _FORBID_NETWORK_TOOLS
+
+
 def test_is_progress_note():
     assert TaskIntentExtractor.is_progress_note("Mission complete: script verified")
     assert not TaskIntentExtractor.is_progress_note("import os\ndef main(): pass")

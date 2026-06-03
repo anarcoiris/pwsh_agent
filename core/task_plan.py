@@ -26,6 +26,9 @@ class TaskStep:
     tool_hint: str
     status: StepStatus = StepStatus.PENDING
     note: str = ""
+    assigned_agent: str = "lead"
+    success_criteria: str = ""
+    delegate_brief: str = ""
 
 
 _PLACEHOLDER_PWD = re.compile(
@@ -109,11 +112,19 @@ class TaskPlanTracker:
                     "read_credentials",
                     "Read the referenced credential/password file",
                     "read_file",
+                    assigned_agent="workspace",
                 ))
+            steps.append(TaskStep(
+                "fetch_page",
+                "GET target URL and inspect HTML/XML response",
+                "http_get",
+                assigned_agent="web",
+            ))
             steps.append(TaskStep(
                 "attempt_login",
                 "Attempt authentication against the target endpoint",
                 "try_http_login",
+                assigned_agent="web",
             ))
             return steps
 
@@ -370,6 +381,29 @@ class TaskPlanTracker:
             "done_steps": [s.id for s in self.steps if s.status == StepStatus.DONE],
             "last_failure": (self.last_failure or "")[:200],
             "strategy": self.strategy_notes[-1] if self.strategy_notes else "",
+            "manager_plan": self.manager_plan_lines(),
+            "current_task": self.current_task_block(),
+        }
+
+    def manager_plan_lines(self) -> list[str]:
+        lines: list[str] = []
+        for s in self.steps:
+            lines.append(
+                f"task={s.id} agent={s.assigned_agent} status={s.status.value} "
+                f"label={s.label[:80]}"
+            )
+        return lines
+
+    def current_task_block(self) -> dict[str, str]:
+        cur = self.current_step
+        if not cur:
+            return {}
+        return {
+            "id": cur.id,
+            "assigned_agent": cur.assigned_agent,
+            "label": cur.label[:120],
+            "brief": (cur.delegate_brief or cur.label)[:200],
+            "success_criteria": (cur.success_criteria or "")[:160],
         }
 
     def readaptation_directive(self) -> str:
@@ -413,7 +447,7 @@ def load_session_context_snippets(
 ) -> str:
     """Load session-scoped notes, reports, and PCAP logs (excludes legacy workspace/plan.md)."""
     from core.path_catalog import session_context_paths, rel_path
-    from core.session_paths import load_active_session_id, list_prior_artifact_snippets
+    from core.session_paths import load_active_session_id
 
     sid = session_id or load_active_session_id()
     parts: list[str] = []
@@ -430,10 +464,6 @@ def load_session_context_snippets(
         if sum(len(p) for p in parts) > max_chars:
             break
 
-    prior = list_prior_artifact_snippets(max_sessions=2, max_chars=400)
-    if prior and sum(len(p) for p in parts) < max_chars:
-        parts.append(prior)
-
     if not parts:
         return ""
     return "[SESSION CONTEXT — artifacts on disk]\n" + "\n\n".join(parts)[:max_chars]
@@ -449,6 +479,9 @@ def _tracker_to_dict(tracker: TaskPlanTracker) -> dict[str, Any]:
                 "tool_hint": s.tool_hint,
                 "status": s.status.value,
                 "note": s.note,
+                "assigned_agent": s.assigned_agent,
+                "success_criteria": s.success_criteria,
+                "delegate_brief": s.delegate_brief,
             }
             for s in tracker.steps
         ],
@@ -475,6 +508,9 @@ def _tracker_from_dict(data: dict[str, Any]) -> TaskPlanTracker:
             tool_hint=str(raw.get("tool_hint", "")),
             status=status,
             note=str(raw.get("note", "")),
+            assigned_agent=str(raw.get("assigned_agent", "lead") or "lead"),
+            success_criteria=str(raw.get("success_criteria", "")),
+            delegate_brief=str(raw.get("delegate_brief", "")),
         ))
     tracker.strategy_notes = list(data.get("strategy_notes", []))
     tracker.last_failure = str(data.get("last_failure", ""))

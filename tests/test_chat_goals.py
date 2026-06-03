@@ -45,6 +45,8 @@ def test_goal_guard_blocks_encode_decode():
         required_tools=["analyze_pcapng"],
         pcap_path_hint="last_capture.pcapng",
         label="test",
+        blocked_tools=["encode_decode"],
+        blocked_reason="Do NOT use encode_decode on PCAP data.",
     )
     _, _, err = ChatGoalGuard.apply(
         "encode_decode",
@@ -53,7 +55,7 @@ def test_goal_guard_blocks_encode_decode():
         [],
     )
     assert err is not None
-    assert "analyze_pcapng" in err
+    assert "encode_decode" in err.lower() or "pcap" in err.lower()
 
 
 def test_goal_guard_blocks_completion_notes():

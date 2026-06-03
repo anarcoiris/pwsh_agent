@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from core.runtime_paths import app_root
+from core.session_paths import session_start_iso
 
 _DB_PATH = app_root() / "state" / "findings.db"
 
@@ -116,7 +117,7 @@ def hash_identify(hash_value: str) -> dict:
     h = hash_value.strip()
     matches = []
     for pattern, name in _HASH_PATTERNS:
-        if re.match(pattern, h, re.IGNORECASE):
+        if re.match(pattern, h, re.I):
             matches.append(name)
 
     if matches:
@@ -134,6 +135,13 @@ def hash_identify(hash_value: str) -> dict:
 # Findings Database (SQLite)
 # ──────────────────────────────────────────────
 
+def _ensure_schema(conn: sqlite3.Connection) -> None:
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(findings)").fetchall()}
+    if "session_id" not in cols:
+        conn.execute("ALTER TABLE findings ADD COLUMN session_id TEXT DEFAULT ''")
+        conn.commit()
+
+
 def _get_db():
     _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(_DB_PATH))
@@ -147,11 +155,23 @@ def _get_db():
             evidence TEXT,
             recommendation TEXT,
             created_at TEXT NOT NULL,
-            specialist TEXT DEFAULT 'lead'
+            specialist TEXT DEFAULT 'lead',
+            session_id TEXT DEFAULT ''
         )
     """)
     conn.commit()
+    _ensure_schema(conn)
     return conn
+
+
+def _session_filter_clause(session_id: str) -> tuple[str, tuple]:
+    sid = (session_id or "").strip()
+    if sid:
+        return "session_id = ?", (sid,)
+    start = session_start_iso(sid)
+    if start:
+        return "created_at >= ?", (start,)
+    return "1=0", ()
 
 
 def finding_create(
@@ -161,7 +181,8 @@ def finding_create(
     target: str = "",
     evidence: str = "",
     recommendation: str = "",
-    specialist: str = "lead"
+    specialist: str = "lead",
+    session_id: str = "",
 ) -> dict:
     """
     Create and persist a new security finding to the local SQLite database.
@@ -174,6 +195,7 @@ def finding_create(
         evidence: Raw evidence snippet (output, log, etc.) (optional).
         recommendation: Suggested remediation steps (optional).
         specialist: Active specialist mode at time of finding (default: lead).
+        session_id: Session that recorded this finding (optional).
 
     Returns:
         Dict with the new finding ID and confirmation.
@@ -190,6 +212,7 @@ def finding_create(
         trace("tools.intel.finding_create", "finding created", {
             "title": title, "severity": sev, "target": target,
             "description": (description or "")[:400], "evidence": (evidence or "")[:300],
+            "session_id": (session_id or "").strip(),
         })
     except Exception:
         pass
@@ -197,40 +220,61 @@ def finding_create(
     try:
         conn = _get_db()
         cur = conn.execute(
-            "INSERT INTO findings (title, severity, target, description, evidence, recommendation, created_at, specialist) VALUES (?,?,?,?,?,?,?,?)",
-            (title, sev, target, description, evidence, recommendation, created_at, specialist)
+            "INSERT INTO findings (title, severity, target, description, evidence, recommendation, created_at, specialist, session_id) VALUES (?,?,?,?,?,?,?,?,?)",
+            (title, sev, target, description, evidence, recommendation, created_at, specialist, (session_id or "").strip())
         )
         conn.commit()
         finding_id = cur.lastrowid
         conn.close()
-        return {"success": True, "finding_id": finding_id, "title": title, "severity": sev, "created_at": created_at}
+        return {"success": True, "finding_id": finding_id, "title": title, "severity": sev, "created_at": created_at, "session_id": (session_id or "").strip()}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
-def finding_list(severity_filter: str = "", limit: int = 50) -> dict:
+def finding_list(
+    severity_filter: str = "",
+    limit: int = 50,
+    session_id: str = "",
+    scope: str = "session",
+) -> dict:
     """
     List persisted findings from the local database, optionally filtered by severity.
 
     Args:
         severity_filter: Optional severity to filter by — CRITICAL | HIGH | MEDIUM | LOW | INFO.
         limit: Maximum number of findings to return (default: 50).
+        session_id: Active session id when scope='session'.
+        scope: 'session' (this session only) or 'all' (full historical DB).
 
     Returns:
         Dict with list of findings.
     """
+    scope_norm = (scope or "session").lower()
     try:
         conn = _get_db()
-        if severity_filter:
-            rows = conn.execute(
-                "SELECT id, title, severity, target, description, created_at, specialist FROM findings WHERE severity=? ORDER BY id DESC LIMIT ?",
-                (severity_filter.upper(), limit)
-            ).fetchall()
+        if scope_norm == "session":
+            where, params = _session_filter_clause(session_id)
+            if severity_filter:
+                rows = conn.execute(
+                    f"SELECT id, title, severity, target, description, created_at, specialist FROM findings WHERE {where} AND severity=? ORDER BY id DESC LIMIT ?",
+                    (*params, severity_filter.upper(), limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    f"SELECT id, title, severity, target, description, created_at, specialist FROM findings WHERE {where} ORDER BY id DESC LIMIT ?",
+                    (*params, limit),
+                ).fetchall()
         else:
-            rows = conn.execute(
-                "SELECT id, title, severity, target, description, created_at, specialist FROM findings ORDER BY id DESC LIMIT ?",
-                (limit,)
-            ).fetchall()
+            if severity_filter:
+                rows = conn.execute(
+                    "SELECT id, title, severity, target, description, created_at, specialist FROM findings WHERE severity=? ORDER BY id DESC LIMIT ?",
+                    (severity_filter.upper(), limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT id, title, severity, target, description, created_at, specialist FROM findings ORDER BY id DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
         conn.close()
 
         findings = [
@@ -238,27 +282,43 @@ def finding_list(severity_filter: str = "", limit: int = 50) -> dict:
              "description": r[4][:200], "created_at": r[5], "specialist": r[6]}
             for r in rows
         ]
-        return {"success": True, "count": len(findings), "findings": findings}
+        return {"success": True, "count": len(findings), "findings": findings, "scope": scope_norm}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
-def report_generate(output_format: str = "markdown", title: str = "Pulse Agent Engagement Report") -> dict:
+def report_generate(
+    output_format: str = "markdown",
+    title: str = "Pulse Agent Engagement Report",
+    scope: str = "session",
+    session_id: str = "",
+) -> dict:
     """
-    Generate a structured engagement report from all findings in the local database.
+    Generate a structured engagement report from findings in the local database.
 
     Args:
         output_format: Output format — markdown | text (default: markdown).
         title: Report title (default: 'Pulse Agent Engagement Report').
+        scope: 'session' (THIS session only — default) or 'all' (full historical DB).
+        session_id: Active session id when scope='session'.
 
     Returns:
         Dict with the report file path and summary.
     """
+    scope_norm = (scope or "session").lower()
     try:
         conn = _get_db()
-        rows = conn.execute(
-            "SELECT id, title, severity, target, description, evidence, recommendation, created_at, specialist FROM findings ORDER BY CASE severity WHEN 'CRITICAL' THEN 1 WHEN 'HIGH' THEN 2 WHEN 'MEDIUM' THEN 3 WHEN 'LOW' THEN 4 ELSE 5 END, id"
-        ).fetchall()
+        order = "ORDER BY CASE severity WHEN 'CRITICAL' THEN 1 WHEN 'HIGH' THEN 2 WHEN 'MEDIUM' THEN 3 WHEN 'LOW' THEN 4 ELSE 5 END, id"
+        if scope_norm == "session":
+            where, params = _session_filter_clause(session_id)
+            rows = conn.execute(
+                f"SELECT id, title, severity, target, description, evidence, recommendation, created_at, specialist FROM findings WHERE {where} {order}",
+                params,
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                f"SELECT id, title, severity, target, description, evidence, recommendation, created_at, specialist FROM findings {order}"
+            ).fetchall()
         conn.close()
 
         # region agent log
@@ -266,6 +326,8 @@ def report_generate(output_format: str = "markdown", title: str = "Pulse Agent E
             from core.debug_log import trace
             trace("tools.intel.report_generate", "findings pulled from DB", {
                 "requested_title": title,
+                "scope": scope_norm,
+                "session_id": (session_id or "").strip(),
                 "rows": len(rows),
                 "findings": [
                     {"title": r[1], "severity": r[2], "target": r[3], "created_at": r[7], "specialist": r[8]}
@@ -277,6 +339,15 @@ def report_generate(output_format: str = "markdown", title: str = "Pulse Agent E
         # endregion
 
         if not rows:
+            if scope_norm == "session":
+                return {
+                    "success": False,
+                    "error": (
+                        "No findings recorded this session. Use finding_create first, "
+                        "or summarize the task in chat — do not dump historical engagement findings."
+                    ),
+                    "scope": scope_norm,
+                }
             return {"success": False, "error": "No findings in database. Create findings first with finding_create."}
 
         now = datetime.now(timezone.utc)
@@ -291,12 +362,14 @@ def report_generate(output_format: str = "markdown", title: str = "Pulse Agent E
         lines = [
             f"# {title}",
             f"\n**Generated:** {date_str}  ",
+            f"**Scope:** {scope_norm}  ",
             f"**Total Findings:** {len(rows)}\n",
             "---\n",
             "## Executive Summary\n",
         ]
 
-        for _id, t, sev, target, desc, evid, rec, ts, spec in rows:
+        for row in rows:
+            sev = row[2]
             severity_counts[sev] = severity_counts.get(sev, 0) + 1
 
         for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]:
@@ -306,7 +379,8 @@ def report_generate(output_format: str = "markdown", title: str = "Pulse Agent E
 
         lines.append("\n---\n\n## Findings\n")
 
-        for _id, t, sev, target, desc, evid, rec, ts, spec in rows:
+        for row in rows:
+            _id, t, sev, target, desc, evid, rec, ts, spec = row
             sev_emoji = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🔵", "INFO": "⚪"}.get(sev, "⚪")
             lines.append(f"### [{sev_emoji} {sev}] {t}")
             if target:
@@ -328,7 +402,8 @@ def report_generate(output_format: str = "markdown", title: str = "Pulse Agent E
             "report_path": str(report_path),
             "findings_count": len(rows),
             "severity_summary": severity_counts,
-            "title": title
+            "title": title,
+            "scope": scope_norm,
         }
     except Exception as e:
         return {"success": False, "error": str(e)}

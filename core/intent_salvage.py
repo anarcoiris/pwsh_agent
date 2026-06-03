@@ -138,6 +138,13 @@ def salvage_intent_tool_call(
         if session_id:
             paths.append(f"state/sessions/{session_id}/facts.json")
         paths.extend(["state/sessions/*/facts.json", "workspace/sessions/*/login_forms.txt"])
+        try:
+            from core.session_visibility import _CTX
+
+            if _CTX.get("fence_enabled"):
+                paths = [p for p in paths if "*" not in p]
+        except Exception:
+            pass
         for path in paths:
             if "*" not in path:
                 return {"function": {"name": "read_file", "arguments": {"path": path}}}

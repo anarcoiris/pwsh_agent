@@ -315,11 +315,14 @@ def _assess_safety(domain: str, message: str, targets: list[str]) -> SafetyAsses
 
 
 def _extract_inputs(message: str) -> dict[str, str]:
+    from core.credential_inputs import extract_web_auth_credentials
+
     inputs: dict[str, str] = {}
-    # user: X  /  user is X  /  username X
-    m = re.search(r"\buser(?:name)?\s*[:=]?\s*[\"']?([\w.@\\-]+)[\"']?", message, re.I)
-    if m and m.group(1).lower() not in ("name", "and"):
-        inputs["user"] = m.group(1)
+    creds = extract_web_auth_credentials(message)
+    if creds.get("user"):
+        inputs["user"] = creds["user"]
+    if creds.get("password"):
+        inputs["password"] = creds["password"]
     # password source: a quoted file path or the word password followed by a path
     pm = re.search(r"password\s*[:=]?\s*[\"']([^\"']+\.(?:txt|md|json|cfg|conf))[\"']", message, re.I)
     if pm:
@@ -481,18 +484,32 @@ class IntentFormalizer:
     async def formalize(self, message: str) -> IntentSpec:
         """Return a merged IntentSpec; never raises (falls back on any error)."""
         fallback = build_fallback_spec(message)
+        import time
         try:
+            start_t = time.time()
+            messages = [
+                {"role": "system", "content": _SCHEMA_PROMPT},
+                {"role": "user", "content": (message or "").strip()[:2000]},
+            ]
             resp = await self.client.chat(
                 model=self.model,
-                messages=[
-                    {"role": "system", "content": _SCHEMA_PROMPT},
-                    {"role": "user", "content": (message or "").strip()[:2000]},
-                ],
+                messages=messages,
                 options={"temperature": self.temperature, "num_predict": 768},
                 format="json",
                 stream=False,
             )
             content = (resp.message.content or "").strip()
+            latency_ms = int((time.time() - start_t) * 1000)
+            try:
+                from core.debug_log import log_llm_interaction
+                log_llm_interaction(
+                    model=self.model,
+                    latency_ms=latency_ms,
+                    messages=messages,
+                    response_text=content
+                )
+            except Exception:
+                pass
         except Exception:
             return fallback
 

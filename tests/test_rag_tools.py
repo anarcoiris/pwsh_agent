@@ -62,12 +62,19 @@ def test_static_routing_default_cap():
     assert len(content) <= DEFAULT_STATIC_MAX_CHARS
 
 
-def test_build_injections_includes_static_routing_once():
+def test_build_injections_excludes_static_routing():
+    messages = [{"role": "user", "content": "port scan 192.168.1.1"}]
+    injections = ContextRouter.build_injections(messages)
+    combined = "\n".join(i.get("content", "") for i in injections)
+    assert "TOOL ROUTING (static" not in combined
+
+
+def test_build_injections_includes_schemas_for_matched_tools():
     messages = [{"role": "user", "content": "scan the network"}]
     injections = ContextRouter.build_injections(messages)
-    static = [i for i in injections if _STATIC_HEADER in i.get("content", "")]
-    assert len(static) == 1
-    assert "write_file" in static[0]["content"] or "Quick Routing" in static[0]["content"]
+    schemas = [i for i in injections if "### RELATED TOOL SCHEMAS ###" in i.get("content", "")]
+    assert len(schemas) == 1
+    assert "ping_sweep" in schemas[0]["content"] or "port_scan" in schemas[0]["content"]
 
 
 def test_derive_tool_set_reporting_keywords():
@@ -153,7 +160,7 @@ if __name__ == "__main__":
     test_recursive_tools_directory()
     test_static_routing_loads_and_respects_cap()
     test_static_routing_default_cap()
-    test_build_injections_includes_static_routing_once()
+    test_build_injections_includes_schemas_for_matched_tools()
     test_derive_tool_set_reporting_keywords()
     test_derive_tool_set_web_keywords()
     test_derive_tool_set_cve_keywords()

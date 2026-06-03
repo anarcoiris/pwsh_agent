@@ -99,6 +99,27 @@ def test_working_memory_clear_strategy():
     assert wm.last_observation == "o"  # observation survives strategy change
 
 
+def test_readaptation_section_after_last_failure():
+    block = build_current_state(
+        mission="crack hash mission",
+        plan={"last_failure": "placeholder pwd.txt"},
+        readaptation="[SYSTEM — PLAN READAPTATION REQUIRED]\nReadapt now:",
+    )
+    assert "[READAPTATION]" in block
+    assert "READAPTATION REQUIRED" in block
+    fail_pos = block.index("[LAST FAILURE]")
+    readapt_pos = block.index("[READAPTATION]")
+    assert fail_pos < readapt_pos
+
+
+def test_readaptation_respects_budget():
+    block = build_current_state(
+        mission="m",
+        readaptation="x" * 10000,
+    )
+    assert len(block) <= MAX_CURRENT_STATE_CHARS
+
+
 def test_long_session_state_stays_bounded():
     """Scenario C: 30 synthetic updates must not grow CURRENT STATE."""
     wm = WorkingMemory()

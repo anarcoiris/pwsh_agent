@@ -167,6 +167,37 @@ def test_turn_trim_preserves_assistant_tool_pair():
         pass
 
 
+def test_turn_aware_old_artifact_cap():
+    mgr = AgentContextManager(
+        session_id="test_artifact_cap",
+        max_total_context=80,
+        max_context_chars=50000,
+        max_tool_result_chars=22000,
+        state_path=str(Path(__file__).parent / "_tmp_agent_test_artifact.json"),
+    )
+    mgr.clear_history()
+    old_content = "H" * 5000
+    recent_content = "R" * 5000
+    mgr.messages = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "mission"},
+        {"role": "assistant", "content": "step1"},
+        {"role": "tool", "name": "read_file", "content": old_content},
+        {"role": "assistant", "content": "step2"},
+        {"role": "tool", "name": "read_file", "content": recent_content},
+    ]
+    mgr.trim_context()
+    tool_msgs = [m for m in mgr.messages if m.get("role") == "tool"]
+    assert len(tool_msgs) == 2
+    assert "aggressively truncated older artifact" in tool_msgs[0]["content"]
+    assert len(tool_msgs[0]["content"]) < 1500
+    assert "aggressively truncated" not in tool_msgs[1]["content"]
+    try:
+        mgr.state_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def test_pcap_compaction_keeps_priority_keys():
     ResultCompactor.configure_max_chars(22_000)
     analysis = {

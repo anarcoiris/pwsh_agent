@@ -140,6 +140,13 @@ def deliverable_hint_block(session_id: str, deliverables: list[str]) -> str:
         f"Session status: {status_file(session_id).as_posix()}",
     ]
     reps = latest_reports(1)
+    try:
+        from core.session_visibility import _CTX
+
+        if _CTX.get("fence_enabled"):
+            reps = []
+    except Exception:
+        pass
     if reps:
         lines.append(f"Latest report: {rel_path(reps[0])}")
     vlog = latest_pcap_verbose_log()

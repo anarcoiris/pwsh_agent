@@ -203,6 +203,25 @@ class _GoalEntry:
         self.priority = priority
 
 
+# Domains where PCAP/hash hard gates must not override live HTTP/script work.
+_FORENSIC_VETO_DOMAINS = frozenset({"web_auth", "dev"})
+_FORENSIC_BUILDER_NAMES = frozenset({"_build_pcap_goal", "_build_hashcrack_goal"})
+
+
+def _intent_domain(message: str) -> str:
+    try:
+        from core.intent_spec import build_fallback_spec
+
+        return build_fallback_spec(message or "").domain
+    except Exception:
+        return ""
+
+
+def _forensic_goals_vetoed(message: str, intent_domain: str | None = None) -> bool:
+    domain = (intent_domain or "").strip() or _intent_domain(message)
+    return domain in _FORENSIC_VETO_DOMAINS
+
+
 class ChatGoalRegistry:
     """Match user messages to goal templates via regex patterns."""
 
@@ -215,12 +234,21 @@ class ChatGoalRegistry:
         )
 
     @classmethod
-    def match_message(cls, message: str) -> ChatGoals | None:
+    def match_message(
+        cls,
+        message: str,
+        *,
+        intent_domain: str | None = None,
+    ) -> ChatGoals | None:
         """Try each registered pattern against the user message."""
+        veto_forensic = _forensic_goals_vetoed(message, intent_domain)
         hits: list[tuple[int, _GoalEntry]] = []
         for entry in cls._templates:
-            if entry.pattern.search(message):
-                hits.append((entry.priority, entry))
+            if not entry.pattern.search(message):
+                continue
+            if veto_forensic and entry.builder.__name__ in _FORENSIC_BUILDER_NAMES:
+                continue
+            hits.append((entry.priority, entry))
         if not hits:
             return None
         # Lowest priority number wins
@@ -247,7 +275,8 @@ class ChatGoalRegistry:
 
 _PCAP_RE = re.compile(
     r"(\.pcapng|\.pcap\b|\btshark\b|\bwireshark\b|last_capture|decode.*packet|"
-    r"analyze.*packet|http packet|login.*packet|locate.*pcap)",
+    r"analyze.*packet|http packet|locate.*pcap|"
+    r"login.*(?:pcap|pcapng|capture)|packet.*(?:pcap|pcapng|capture))",
     re.I,
 )
 
@@ -258,7 +287,7 @@ _HASH_CRACK_RE = re.compile(
 )
 
 _FOLLOWUP_DECODE_RE = re.compile(
-    r"\b(decode|extract|parse|key\s*values?|look for|find|contents|login|expand|search|grep|filter)\b",
+    r"\b(decode|extract|parse|key\s*values?)\b",
     re.I,
 )
 
@@ -631,11 +660,13 @@ def _build_credential_session_goal(message: str, session: list[dict] | None) -> 
 # goals (or when the user explicitly names a tool). For conversational, coding, and
 # analysis intents, match_message() must return None so tool use remains optional.
 
-# PCAP — priority 10 (most specific, many regex patterns)
+# PCAP — priority 10 (explicit PCAP/capture signals only; no bare login+packet)
 ChatGoalRegistry.register(
     r"(\.pcapng|\.pcap\b|\btshark\b|\bwireshark\b|last_capture|decode.*packet|"
-    r"analyze.*packet|http packet|login.*packet|locate.*pcap|"
-    r"\b(?:decode|extract|parse|key\s*values?|look for|contents)\b)",
+    r"analyze.*packet|http packet|locate.*pcap|"
+    r"login.*(?:pcap|pcapng|capture)|packet.*(?:pcap|pcapng|capture)|"
+    r"\b(?:decode|extract|parse|key\s*values?)\b.*\b(?:pcap|pcapng|packet|tshark|capture)\b|"
+    r"\b(?:pcap|pcapng|last_capture|tshark)\b.*\b(?:decode|extract|parse|key\s*values?)\b)",
     _build_pcap_goal,
     priority=10,
 )

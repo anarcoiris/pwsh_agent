@@ -2,6 +2,8 @@
 __pycache__/
 *.pyc
 debug-*.log
+artifacts/
+.pytest_cache/
 
 # Identity + DB under state/ are tracked (AGENTS.md, SOUL.md, USER.md, findings.db, …).
 # Ignore volatile runtime dirs only:

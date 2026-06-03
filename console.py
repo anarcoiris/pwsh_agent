@@ -25,6 +25,23 @@ class AgentConsole:
         console_cfg = self.agent.config.get("console", {})
         self.submit_binding = console_cfg.get("submit_binding", "ctrl-enter")
 
+    @staticmethod
+    def _normalize_command(cmd: str) -> str:
+        """Map slash aliases (/help) to Prompt.ask choice names."""
+        c = (cmd or "").strip().lower()
+        aliases = {
+            "/help": "help",
+            "/exit": "exit",
+            "/quit": "exit",
+            "/mission": "mission",
+            "/chat": "chat",
+            "/status": "status",
+            "/new": "new",
+            "/audit": "audit",
+            "/cancel": "cancel",
+        }
+        return aliases.get(c, c)
+
     def display_banner(self):
         """Displays a beautiful, hacker-style retro ANSI banner."""
         banner_text = pyfiglet.figlet_format("Pulse Agent", font="slant")
@@ -32,7 +49,10 @@ class AgentConsole:
         console.print("[bold white]Streamlined PowerShell ReAct Console Command Center[/bold white]")
         console.print(f"[dim]Ollama Target: {self.agent.base_url} | Model: {self.agent.default_model}[/dim]")
         console.print("-" * 65)
-        console.print("[yellow]Type your instructions below. Use `/help` for CLI slash commands.[/yellow]\n")
+        console.print(
+            "[yellow]Type a command: [bold]help[/bold], [bold]mission[/bold], [bold]chat[/bold], "
+            "[bold]status[/bold], [bold]exit[/bold], … (aliases: /help, /exit)[/yellow]\n"
+        )
 
     def handle_agent_event(self, event_type: str, data: Any):
         """Callback to handle real-time cognitive events and render them to screen."""
@@ -169,8 +189,11 @@ class AgentConsole:
             prompt_text = f"PulseLab {mode_badge} ({spec_badge}) >"
             
             try:
-                # Prompt for exact options like the father repo Console
-                cmd = Prompt.ask(prompt_text, choices=["mission", "chat", "specialist", "toggle", "audit", "cancel", "status", "new", "help", "exit"])
+                raw_cmd = Prompt.ask(
+                    prompt_text,
+                    choices=["mission", "chat", "specialist", "toggle", "audit", "cancel", "status", "new", "session", "help", "exit"],
+                )
+                cmd = self._normalize_command(raw_cmd)
                 
                 if cmd == "exit":
                     self.is_running = False
@@ -183,8 +206,43 @@ class AgentConsole:
                     self.display_banner()
                     console.print(
                         f"[bold green]✔ New session started: {new_id}[/bold green] "
-                        "[dim](prior sessions preserved under workspace/sessions/)[/dim]\n"
+                        "[dim](prior work: 'session list' / 'session pick <id>' — handoff summaries only)[/dim]\n"
                     )
+
+                elif cmd == "session":
+                    sub = Prompt.ask(
+                        "Session command",
+                        choices=["list", "pick", "clear"],
+                        default="list",
+                    )
+                    if sub == "list":
+                        from core.session_handoff import list_sealed_handoffs
+                        from core.session_paths import load_active_session_id
+
+                        active = load_active_session_id()
+                        console.print(f"[bold]Active session:[/bold] {active}")
+                        handoffs = list_sealed_handoffs(limit=10)
+                        if not handoffs:
+                            console.print("[dim]No sealed handoffs yet.[/dim]")
+                        else:
+                            t = Table(title="Sealed handoffs", border_style="cyan")
+                            t.add_column("Session", style="cyan")
+                            t.add_column("Domain")
+                            t.add_column("Summary")
+                            for h in handoffs:
+                                t.add_row(
+                                    str(h.get("session_id", "")),
+                                    str(h.get("domain", "")),
+                                    str(h.get("summary", ""))[:60],
+                                )
+                            console.print(t)
+                    elif sub == "pick":
+                        sid = Prompt.ask("Session id to load (YYYYMMDD_HHMMSS)")
+                        self.agent.select_prior_session(sid.strip())
+                        console.print(f"[green]Prior handoff selected: {sid}[/green]\n")
+                    elif sub == "clear":
+                        self.agent.clear_prior_session_selection()
+                        console.print("[green]Prior session selection cleared.[/green]\n")
                     
                 elif cmd == "status":
                     self.show_status()
@@ -343,7 +401,8 @@ class AgentConsole:
         help_table.add_row("toggle",     "Toggle safety badge ([SANDBOX] vs [HOST]).")
         help_table.add_row("cancel",     "Signal a running mission to stop after the current step.")
         help_table.add_row("audit",      "View today's HMAC-signed audit trail and verify integrity.")
-        help_table.add_row("new",        "Start a new session (preserves prior session state and workspace files).")
+        help_table.add_row("new",        "Start a new session (seals outgoing handoff; no auto prior load).")
+        help_table.add_row("session",    "list / pick / clear prior session handoff summaries.")
         help_table.add_row("status",     "Show configuration, thought budget, and audit metrics.")
         help_table.add_row("exit",       "Terminate the session safely.")
         console.print(help_table)

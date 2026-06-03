@@ -234,7 +234,8 @@ TOOLS_SCHEMA += [
                     "target": {"type": "string", "description": "Affected host, URL, or file path (optional)."},
                     "evidence": {"type": "string", "description": "Raw evidence snippet (output, log, etc.) (optional)."},
                     "recommendation": {"type": "string", "description": "Suggested remediation steps (optional)."},
-                    "specialist": {"type": "string", "description": "Active specialist mode at time of finding (default: lead)."}
+                    "specialist": {"type": "string", "description": "Active specialist mode at time of finding (default: lead)."},
+                    "session_id": {"type": "string", "description": "Session id to tag this finding (optional; defaults to active session)."}
                 },
                 "required": ["title", "severity", "description"]
             }
@@ -244,12 +245,14 @@ TOOLS_SCHEMA += [
         "type": "function",
         "function": {
             "name": "finding_list",
-            "description": "List persisted security findings from the local database, optionally filtered by severity.",
+            "description": "List findings from finding_create. Default scope=session (THIS session only). Use scope=all only when the user explicitly wants historical engagement findings.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "severity_filter": {"type": "string", "description": "Optional severity filter: CRITICAL | HIGH | MEDIUM | LOW | INFO."},
-                    "limit": {"type": "integer", "description": "Maximum number of findings to return (default: 50)."}
+                    "limit": {"type": "integer", "description": "Maximum number of findings to return (default: 50)."},
+                    "scope": {"type": "string", "description": "session (default) or all."},
+                    "session_id": {"type": "string", "description": "Active session id when scope=session."}
                 }
             }
         }
@@ -258,15 +261,42 @@ TOOLS_SCHEMA += [
         "type": "function",
         "function": {
             "name": "report_generate",
-            "description": "Generate a structured Markdown engagement report from all findings in the local database, sorted by severity.",
+            "description": "Generate a Markdown report from findings persisted with finding_create. Default scope=session (THIS session only — never dumps old engagement findings). Do NOT use for simple fetch/login tasks unless you recorded findings this session; summarize in chat instead. Use scope=all only when the user explicitly wants a full historical engagement report.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "output_format": {"type": "string", "description": "Output format: markdown | text (default: markdown)."},
-                    "title": {"type": "string", "description": "Report title (default: 'Pulse Agent Engagement Report')."}
+                    "title": {"type": "string", "description": "Report title (default: 'Pulse Agent Engagement Report')."},
+                    "scope": {"type": "string", "description": "session (default) or all."},
+                    "session_id": {"type": "string", "description": "Active session id when scope=session."}
                 }
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delegate_to",
+            "description": "Hand off to a specialist agent (LEAD only). Required before any non-LEAD tool runs.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "agent": {
+                        "type": "string",
+                        "description": "Specialist id: workspace | web | recon | forensic | crypto",
+                    },
+                    "brief": {
+                        "type": "string",
+                        "description": "Task brief for the specialist — what to do and why.",
+                    },
+                    "success_criteria": {
+                        "type": "string",
+                        "description": "Optional — when the specialist should return control to LEAD.",
+                    },
+                },
+                "required": ["agent", "brief"],
+            },
+        },
     },
 ]
 

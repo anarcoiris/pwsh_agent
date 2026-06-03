@@ -5,32 +5,83 @@ All tools use PowerShell/native Windows cmdlets first.
 If an optional external tool (nmap, tshark) is required but not installed,
 the tool returns a structured message with the recommended winget install command.
 """
-import subprocess
+import base64
 import json
 import socket
 import ssl
 import urllib.request
 import urllib.error
-from typing import Optional
+from typing import Any, Optional
+
+from core.powershell_exec import run_powershell
 
 
 def _run_ps(command: str, timeout: int = 30) -> dict:
     """Helper: run a PowerShell command and return structured output."""
-    try:
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
-            capture_output=True, text=True, timeout=timeout, encoding="utf-8", errors="replace"
-        )
-        return {
-            "success": result.returncode == 0,
-            "stdout": result.stdout.strip(),
-            "stderr": result.stderr.strip(),
-            "exit_code": result.returncode
-        }
-    except subprocess.TimeoutExpired:
-        return {"success": False, "error": f"Command timed out after {timeout}s"}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+    out = run_powershell(command, timeout=timeout)
+    if "error" in out and "success" not in out:
+        return {"success": False, "error": out["error"]}
+    return {
+        "success": out.get("success", False),
+        "stdout": out.get("stdout", ""),
+        "stderr": out.get("stderr", ""),
+        "exit_code": out.get("exit_code", -1),
+    }
+
+
+def _ps_cfg_bootstrap(var_name: str, cfg: dict[str, Any]) -> str:
+    """Pass structured config into PowerShell without fragile string quoting."""
+    blob = base64.b64encode(json.dumps(cfg).encode("utf-8")).decode("ascii")
+    return (
+        f"${var_name} = [Text.Encoding]::UTF8.GetString("
+        f"[Convert]::FromBase64String('{blob}')) | ConvertFrom-Json"
+    )
+
+
+def _try_http_login_script(cfg: dict[str, Any]) -> str:
+    """Build the login probe script (no ConvertTo-SecureString / Security module)."""
+    return _ps_cfg_bootstrap("cfg", cfg) + """
+$failMarkers = @('invalid','incorrect','failed','wrong password','authentication failed','login failed','denied','try again')
+
+function Test-Login($desc, $invoke) {
+    $r = [ordered]@{ attempt = $desc; status = $null; final_url = $null; length = 0; set_cookie = $false; likely_success = $false; note = '' }
+    try {
+        $resp = & $invoke
+        $r.status = [int]$resp.StatusCode
+        $r.length = ($resp.Content | Measure-Object -Character).Characters
+        try { $r.final_url = $resp.BaseResponse.ResponseUri.AbsoluteUri } catch {}
+        $r.set_cookie = [bool]($resp.Headers['Set-Cookie'])
+        $body = ($resp.Content | Out-String).ToLower()
+        $hasFail = $false
+        foreach ($mk in $failMarkers) { if ($body.Contains($mk)) { $hasFail = $true; break } }
+        if ($r.status -ge 200 -and $r.status -lt 400 -and -not $hasFail) { $r.likely_success = $true }
+        if ($hasFail) { $r.note = 'failure marker in body' }
+    } catch {
+        $exresp = $_.Exception.Response
+        if ($exresp) { try { $r.status = [int]$exresp.StatusCode } catch {} }
+        if ($r.status -eq 401 -or $r.status -eq 403) { $r.note = 'rejected (auth failed)' }
+        else { $r.note = $_.Exception.Message }
+    }
+    return [PSCustomObject]$r
+}
+
+$results = @()
+if ($cfg.method -eq 'basic' -or $cfg.method -eq 'auto') {
+    $pair = ('{0}:{1}' -f $cfg.user, $cfg.password)
+    $bytes = [System.Text.Encoding]::ASCII.GetBytes($pair)
+    $auth = 'Basic ' + [System.Convert]::ToBase64String($bytes)
+    $results += Test-Login 'basic' {
+        Invoke-WebRequest -Uri $cfg.url -Headers @{ Authorization = $auth } -TimeoutSec $cfg.timeout -UseBasicParsing -MaximumRedirection 3
+    }
+}
+if ($cfg.method -eq 'form' -or $cfg.method -eq 'auto') {
+    $bodyHash = @{ ($cfg.uField) = $cfg.user; ($cfg.pField) = $cfg.password }
+    $results += Test-Login 'form' {
+        Invoke-WebRequest -Uri $cfg.url -Method POST -Body $bodyHash -TimeoutSec $cfg.timeout -UseBasicParsing -MaximumRedirection 3
+    }
+}
+$results | ConvertTo-Json -Depth 4
+"""
 
 
 def dns_lookup(hostname: str, record_type: str = "A") -> dict:
@@ -337,61 +388,16 @@ def try_http_login(
     if m not in ("auto", "basic", "form"):
         return {"success": False, "error": f"Unknown method '{method}'. Use auto|basic|form."}
 
-    # PowerShell does the request so behavior matches the rest of recon.py.
-    # Heuristics: a 2xx/3xx that is NOT obviously a re-served login page, or a
-    # Set-Cookie session, suggests success; common failure markers suggest failure.
-    ps_cmd = f"""
-$ErrorActionPreference = 'Stop'
-$url = '{url}'
-$user = '{user}'
-$pass = '{password}'
-$method = '{m}'
-$uField = '{username_field}'
-$pField = '{password_field}'
-$timeout = {int(timeout_sec)}
-
-$failMarkers = @('invalid','incorrect','failed','wrong password','authentication failed','login failed','denied','try again')
-
-function Test-Login($desc, $invoke) {{
-    $r = [ordered]@{{ attempt = $desc; status = $null; final_url = $null; length = 0; set_cookie = $false; likely_success = $false; note = '' }}
-    try {{
-        $resp = & $invoke
-        $r.status = [int]$resp.StatusCode
-        $r.length = ($resp.Content | Measure-Object -Character).Characters
-        try {{ $r.final_url = $resp.BaseResponse.ResponseUri.AbsoluteUri }} catch {{}}
-        $r.set_cookie = [bool]($resp.Headers['Set-Cookie'])
-        $body = ($resp.Content | Out-String).ToLower()
-        $hasFail = $false
-        foreach ($mk in $failMarkers) {{ if ($body.Contains($mk)) {{ $hasFail = $true; break }} }}
-        if ($r.status -ge 200 -and $r.status -lt 400 -and -not $hasFail) {{ $r.likely_success = $true }}
-        if ($hasFail) {{ $r.note = 'failure marker in body' }}
-    }} catch {{
-        $exresp = $_.Exception.Response
-        if ($exresp) {{
-            try {{ $r.status = [int]$exresp.StatusCode }} catch {{}}
-        }}
-        if ($r.status -eq 401 -or $r.status -eq 403) {{ $r.note = 'rejected (auth failed)' }}
-        else {{ $r.note = $_.Exception.Message }}
-    }}
-    return [PSCustomObject]$r
-}}
-
-$results = @()
-
-if ($method -eq 'basic' -or $method -eq 'auto') {{
-    $secpass = ConvertTo-SecureString $pass -AsPlainText -Force
-    $cred = New-Object System.Management.Automation.PSCredential($user, $secpass)
-    $results += Test-Login 'basic' {{ Invoke-WebRequest -Uri $url -Credential $cred -TimeoutSec $timeout -UseBasicParsing -MaximumRedirection 3 }}
-}}
-
-if ($method -eq 'form' -or $method -eq 'auto') {{
-    $bodyHash = @{{ $uField = $user; $pField = $pass }}
-    $results += Test-Login 'form' {{ Invoke-WebRequest -Uri $url -Method POST -Body $bodyHash -TimeoutSec $timeout -UseBasicParsing -MaximumRedirection 3 }}
-}}
-
-$results | ConvertTo-Json -Depth 4
-"""
-    result = _run_ps(ps_cmd, timeout=timeout_sec * 4 + 10)
+    cfg = {
+        "url": url,
+        "user": user,
+        "password": password,
+        "method": m,
+        "uField": username_field,
+        "pField": password_field,
+        "timeout": int(timeout_sec),
+    }
+    result = _run_ps(_try_http_login_script(cfg), timeout=timeout_sec * 4 + 10)
     if result.get("success") and result.get("stdout"):
         try:
             attempts = json.loads(result["stdout"])

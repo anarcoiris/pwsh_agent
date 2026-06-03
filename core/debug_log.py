@@ -6,6 +6,8 @@ import os
 import time
 from pathlib import Path
 
+from core.session_paths import load_active_session_id, sessions_state_root
+
 # Active debug session. All instrumentation funnels into a SINGLE file
 # (debug-{_SESSION_ID}.log) to avoid the confusion of several stale debug-*.log
 # files left over from earlier debug sessions.
@@ -106,3 +108,30 @@ def log_completion_exit(
         },
         run_id="completion",
     )
+
+
+def log_llm_interaction(
+    model: str,
+    latency_ms: int,
+    messages: list[dict],
+    response_text: str,
+    tools_schema: list | None = None
+) -> None:
+    """Audit logger for tracking full LLM interactions and responsiveness."""
+    try:
+        session_id = load_active_session_id()
+        log_path = sessions_state_root() / session_id / "llm_audit.jsonl"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        payload = {
+            "timestamp": int(time.time() * 1000),
+            "model": model,
+            "latency_ms": latency_ms,
+            "messages": messages,
+            "tools_schema": tools_schema,
+            "response": response_text,
+        }
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, default=str) + "\n")
+    except Exception:
+        pass

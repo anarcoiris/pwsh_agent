@@ -85,7 +85,24 @@ def estimate_tokens(messages: list[dict[str, Any]]) -> int:
     return max(1, chars // 4)
 
 
-def _cap_message_content(msg: dict[str, Any], max_chars: int, tool_cap: int) -> dict[str, Any]:
+_HEAVY_ARTIFACT_TOOLS = frozenset({
+    "read_file",
+    "http_get",
+    "host_exec",
+    "capture_packets",
+    "run_script",
+})
+_OLD_ARTIFACT_CAP = 1000
+_OLD_ARTIFACT_SUFFIX = "\n[... aggressively truncated older artifact ...]"
+
+
+def _cap_message_content(
+    msg: dict[str, Any],
+    max_chars: int,
+    tool_cap: int,
+    *,
+    truncate_suffix: str | None = None,
+) -> dict[str, Any]:
     """Return a copy with content truncated if needed."""
     out = dict(msg)
     content = out.get("content", "")
@@ -97,7 +114,8 @@ def _cap_message_content(msg: dict[str, Any], max_chars: int, tool_cap: int) -> 
         name = msg.get("name", "")
         limit = tool_cap if name == "analyze_pcapng" else max_chars
     if len(text) > limit:
-        out["content"] = text[:limit] + f"\n[... truncated to {limit} chars]"
+        suffix = truncate_suffix or f"\n[... truncated to {limit} chars]"
+        out["content"] = text[:limit] + suffix
     return out
 
 
@@ -280,15 +298,45 @@ def _apply_per_message_caps(
     per_message_cap: int | None = None,
 ) -> list[dict[str, Any]]:
     cap = per_message_cap or max_tool_chars
-    out: list[dict[str, Any]] = []
-    for msg in messages:
-        if msg.get("role") == "system":
-            out.append(msg)
-            continue
-        if msg.get("role") == "user" and is_system_directive(str(msg.get("content", ""))):
-            out.append(msg)
-            continue
-        out.append(_cap_message_content(msg, cap, max_tool_chars))
+    pinned, tail = _pin_headers(messages)
+    turns = _partition_turns(tail)
+    if not turns:
+        out: list[dict[str, Any]] = []
+        for msg in messages:
+            if msg.get("role") == "system":
+                out.append(msg)
+                continue
+            if msg.get("role") == "user" and is_system_directive(str(msg.get("content", ""))):
+                out.append(msg)
+                continue
+            out.append(_cap_message_content(msg, cap, max_tool_chars))
+        return out
+
+    out = list(pinned)
+    for ti, turn in enumerate(turns):
+        is_recent = ti == len(turns) - 1
+        for msg in turn:
+            if msg.get("role") == "system":
+                out.append(msg)
+                continue
+            if msg.get("role") == "user" and is_system_directive(str(msg.get("content", ""))):
+                out.append(msg)
+                continue
+            if (
+                not is_recent
+                and msg.get("role") == "tool"
+                and msg.get("name", "") in _HEAVY_ARTIFACT_TOOLS
+            ):
+                out.append(
+                    _cap_message_content(
+                        msg,
+                        _OLD_ARTIFACT_CAP,
+                        max_tool_chars,
+                        truncate_suffix=_OLD_ARTIFACT_SUFFIX,
+                    )
+                )
+            else:
+                out.append(_cap_message_content(msg, cap, max_tool_chars))
     return out
 
 
@@ -441,3 +489,19 @@ class AgentContextManager:
             len(self.messages),
             estimate_chars(self.messages),
         )
+        try:
+            from core.debug_log import debug_log
+
+            debug_log(
+                "context.trim_context",
+                "trim complete",
+                {
+                    "message_count": len(self.messages),
+                    "estimated_chars": estimate_chars(self.messages),
+                    "estimated_tokens": estimate_tokens(self.messages),
+                    "max_context_tokens": self.max_context_tokens,
+                },
+                "CTX",
+            )
+        except Exception:
+            pass
