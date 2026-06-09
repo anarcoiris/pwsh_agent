@@ -9,6 +9,7 @@ from typing import Any
 
 from core.runtime_paths import app_root
 from core.specialists import SPECIALIST_REGISTRY, TOOL_SUMMARIES
+from core.tool_schemas import DEFAULT_SCHEMA_BUDGET_CHARS, schemas_for_agent as _schemas_for_agent
 
 DEFAULT_BUDGETS = {
     "agents_tokens": 1000,
@@ -123,22 +124,10 @@ class PromptPack:
 
         return "\n\n".join(parts)
 
-    def schemas_for_agent(self, agent_id: str, max_chars: int = 2400) -> list[dict[str, Any]]:
+    def schemas_for_agent(
+        self,
+        agent_id: str,
+        max_chars: int = DEFAULT_SCHEMA_BUDGET_CHARS,
+    ) -> list[dict[str, Any]]:
         """Return TOOLS_SCHEMA entries for the active specialist only."""
-        import tools
-
-        names = SPECIALIST_REGISTRY.get(agent_id, SPECIALIST_REGISTRY["lead"])
-        out: list[dict[str, Any]] = []
-        current_len = 0
-        for schema in tools.TOOLS_SCHEMA:
-            name = schema.get("function", {}).get("name", "")
-            if name not in names:
-                continue
-            serialized = json.dumps(schema, indent=2)
-            if current_len + len(serialized) + 10 > max_chars:
-                if not out:
-                    out.append(schema)
-                break
-            out.append(schema)
-            current_len += len(serialized) + 2
-        return out
+        return _schemas_for_agent(agent_id, max_chars=max_chars)

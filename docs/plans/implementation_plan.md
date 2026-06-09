@@ -1,6 +1,8 @@
 # Implementation Plan: Batch Note Updating & Strict Context Compaction
 
-This plan outlines the architecture for the two accepted proposals from the recent audit analysis.
+> **Status:** PLANNED (not started). Specialist handoff and prompt pack work completed 2026-06-04 — see [session_closure_20260604.md](./session_closure_20260604.md) and [specialist_handoff_plan.md](./specialist_handoff_plan.md). Web auth HTML pipeline — [web_auth_html_pipeline_plan.md](./web_auth_html_pipeline_plan.md).
+
+This plan outlines the architecture for the two accepted proposals from the earlier audit analysis.
 
 ## Proposal 1: Batch Note Updating (Multi-Tool Use)
 

@@ -9,7 +9,8 @@ An advanced autonomous local Windows developer, system auditor, and automation c
 - **No SCM / Docker**: Pure native implementation. Direct, safe local command execution under close operator review.
 
 ## 📈 Recent Milestones
-1. **Python 3.10 Venv Alignment**: Reconfigured `inicio.bat` launcher to strictly target the `py -3.10` launcher, preventing cross-version conflicts.
+1. **Specialist handoff & prompt pack (2026-06-04)**: Fixed tool schema truncation (`core/tool_schemas.py`), premature handoff via `append_note`, post-delegate stall, orphan `(WEB)` badge. Handoff completes only on in-scope specialist tools; `CURRENT_STATE.md` documented as audit-only. Plans: `docs/plans/specialist_handoff_plan.md`, closure `docs/plans/session_closure_20260604.md`. Next: `web_auth_html_pipeline_plan.md` for ZTE/HTML login.
+2. **Python 3.10 Venv Alignment**: Reconfigured `inicio.bat` launcher to strictly target the `py -3.10` launcher, preventing cross-version conflicts.
 2. **Identity Implementation**: Created the core operational soul and identity blueprint documents (`SOUL.md`, `IDENTITY.md`, `USER.md`, `AGENTS.md`).
 3. **Tool Parser Fix (2026-05-30)**: Fixed critical bug where `core/parser.py` only extracted `<tool_call>` XML tags. Ollama/qwen2.5-coder emits tool calls as bare JSON or fenced blocks — now parsed via 5 fallback paths. Regression: `tests/test_parser_fix.py`.
 4. **Deliverable Pipeline (2026-05-30)**: `TaskIntentExtractor`, `WriteGuard`, and `append_note` prevent substituting `workspace/plan.md` for user-requested code files. `chat_turn` verifies deliverables exist on disk before closing. Regression: `tests/test_task_intent.py`, `tests/test_append_note.py`, `tests/test_write_guard.py`.
@@ -61,9 +62,13 @@ python tests/test_rag_tools.py
 python tests/test_run_script.py
 python tests/test_tool_template_alignment.py
 python tests/test_artifacts.py
+python tests/test_tool_schemas.py
+python tests/test_specialist_handoff.py
+python tests/test_delegate_to.py
+python tests/test_orphan_specialist.py
 ```
 
-All ten must print success lines.
+All fourteen must print success lines (baseline ten + four specialist handoff tests from 2026-06-04).
 
 ### Known limitations (not bugs — model/runtime)
 
@@ -83,7 +88,11 @@ All ten must print success lines.
 | `core/execution_policy.py` | `host_exec` → `run_script` redirect; venv pip normalize |
 | `core/runtime_paths.py` | `.venv` python/pip resolution |
 | `core/rag.py` | Jaccard RAG + tool/phase-tagged playbooks |
-| `core/context_router.py` | Phase + domain + tool playbook injection for LLM turns |
+| `core/context_router.py` | Pack-mode schema injection + legacy RAG |
+| `core/tool_schemas.py` | Per-agent Ollama schema selection (no truncation gaps) |
+| `core/specialists.py` | Specialist registry, handoff, LEAD_ONLY_TOOLS |
+| `core/prompt_pack.py` | 4-file prompt contract (AGENTS/SOUL/TOOLS/STATE) |
+| `core/working_state.py` | Live `build_current_state()` each turn |
 | `tools_legacy.py` | `write_file`, `append_note`, `run_script`, PS1 sanitizer |
 | `agent.py` | `chat_turn`, guards, `_finalize_chat_response`, failure playbook nudge |
 | `core/llm_utils.py` | `DynamicContextBuilder` dev vs recon phases |
@@ -106,5 +115,5 @@ All ten must print success lines.
 - **run_script over host_exec for .py**: `ExecutionPolicy` redirects automatically; do not regress.
 
 ## 📊 System Operations & Stats
-- **Last Run**: 2026-06-04 (Session: `20260603_225406`, Persona: `LEAD`)
+- **Last Run**: 2026-06-04 (Session: `20260603_234404`, Persona: `LEAD`)
 - **Total Auditing Days**: 7

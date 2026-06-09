@@ -276,6 +276,14 @@ TOOLS_SCHEMA += [
     {
         "type": "function",
         "function": {
+            "name": "find_tshark",
+            "description": "Locate tshark.exe on the Windows host (PATH, TSHARK_PATH, or default Wireshark install paths).",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "delegate_to",
             "description": "Hand off to a specialist agent (LEAD only). Required before any non-LEAD tool runs.",
             "parameters": {

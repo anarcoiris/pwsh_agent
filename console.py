@@ -242,7 +242,11 @@ class AgentConsole:
                         console.print(f"[green]Prior handoff selected: {sid}[/green]\n")
                     elif sub == "clear":
                         self.agent.clear_prior_session_selection()
-                        console.print("[green]Prior session selection cleared.[/green]\n")
+                        console.print(
+                            "[green]Prior handoff selection cleared; specialist reset to LEAD.[/green]\n"
+                            "[dim]Note: active session and sealed handoffs are unchanged — use "
+                            "'new' for a fresh session id.[/dim]\n"
+                        )
                     
                 elif cmd == "status":
                     self.show_status()
@@ -402,7 +406,7 @@ class AgentConsole:
         help_table.add_row("cancel",     "Signal a running mission to stop after the current step.")
         help_table.add_row("audit",      "View today's HMAC-signed audit trail and verify integrity.")
         help_table.add_row("new",        "Start a new session (seals outgoing handoff; no auto prior load).")
-        help_table.add_row("session",    "list / pick / clear prior session handoff summaries.")
+        help_table.add_row("session",    "list / pick / clear prior handoff summaries (clear resets specialist to LEAD).")
         help_table.add_row("status",     "Show configuration, thought budget, and audit metrics.")
         help_table.add_row("exit",       "Terminate the session safely.")
         console.print(help_table)

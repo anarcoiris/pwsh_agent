@@ -91,18 +91,21 @@ class ContextRouter:
                 })
 
         if prompt_pack_mode:
-            tool_names = cls._schemas_for_active_agent(active_agent)
-            if tool_names:
-                schemas_json = cls._get_tool_schemas(tool_names, max_chars=4800)
-                if schemas_json:
-                    injections.append({
-                        "role": "system",
-                        "content": (
-                            "### RELATED TOOL SCHEMAS ###\n"
-                            f"{schemas_json}\n"
-                            "#############################"
-                        ),
-                    })
+            from core.tool_schemas import DEFAULT_SCHEMA_BUDGET_CHARS, schemas_json_for_agent
+
+            schemas_json = schemas_json_for_agent(
+                active_agent,
+                max_chars=max(injection_budget_chars // 2, DEFAULT_SCHEMA_BUDGET_CHARS),
+            )
+            if schemas_json:
+                injections.append({
+                    "role": "system",
+                    "content": (
+                        "### RELATED TOOL SCHEMAS ###\n"
+                        f"{schemas_json}\n"
+                        "#############################"
+                    ),
+                })
             return injections
 
         phase_hint = DynamicContextBuilder.build_context(messages, anchor_query=query or None)

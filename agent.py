@@ -72,7 +72,11 @@ from core.working_state import (
 )
 from core.prompt_pack import PromptPack, PromptBudgets
 from core.specialists import (
+    allowlist_block_message,
     execute_delegate_to,
+    extract_target_url,
+    specialist_action_nudge,
+    specialist_hard_block,
     suggested_agent_for_domain,
     suggest_agent_for_tool,
     tool_allowed,
@@ -345,6 +349,7 @@ class ReActAgent:
         self._return_to_lead_when: str = ""
         self._handoff_complete: bool = False
         self._stop_tool_batch: bool = False
+        self._specialist_block_count: int = 0
         self._unlocked_sessions: set[str] = set()
         self._selected_prior_session: str | None = None
         self.network_mode: str      = "SANDBOX"
@@ -577,7 +582,14 @@ class ReActAgent:
 
     def _tools_schema_for_turn(self) -> list[dict[str, Any]]:
         if self.prompt_pack_mode:
-            return self.prompt_pack.schemas_for_agent(self.active_agent)
+            from core.tool_schemas import DEFAULT_SCHEMA_BUDGET_CHARS
+
+            budget = max(
+                self.reserve_injection_tokens * 4,
+                DEFAULT_SCHEMA_BUDGET_CHARS,
+            )
+            schemas = self.prompt_pack.schemas_for_agent(self.active_agent, max_chars=budget)
+            return schemas
         return tools.TOOLS_SCHEMA
 
     def _reset_handoff_state(self) -> None:
@@ -587,6 +599,28 @@ class ReActAgent:
         self._return_to_lead_when = ""
         self._handoff_complete = False
         self._stop_tool_batch = False
+        self._specialist_block_count = 0
+
+    def reset_handoff_to_lead(self, *, reason: str = "") -> bool:
+        """Return control to LEAD if a specialist handoff was left open."""
+        if self.active_agent == "lead" and not self._handoff_brief:
+            return False
+        prior = self.active_agent
+        self._reset_handoff_state()
+        self._refresh_system_prompt()
+        return prior != "lead" or bool(reason)
+
+    def _reset_orphan_specialist(self, *, when: str) -> None:
+        """Drop in-RAM specialist mode when a turn ended without handoff completion."""
+        if not self.prompt_pack_mode:
+            return
+        if self.active_agent == "lead" and not self._handoff_brief:
+            return
+        if self._handoff_complete:
+            return
+        self.reset_handoff_to_lead(
+            reason=f"orphan specialist at {when} (handoff never completed)",
+        )
 
     def _sync_visibility_context(self) -> None:
         set_visibility_context(
@@ -608,6 +642,7 @@ class ReActAgent:
 
     def clear_prior_session_selection(self) -> None:
         self._selected_prior_session = None
+        self.reset_handoff_to_lead(reason="session clear — prior handoff pick dropped")
 
     # ── Public interface ───────────────────────────────────────────────────
 
@@ -680,6 +715,29 @@ class ReActAgent:
                 return False
         self.ctx_manager.add_message({"role": "user", "content": text})
         return True
+
+    def _build_specialist_action_nudge(self) -> str:
+        plan = getattr(self, "_task_plan", None)
+        tool_hint = ""
+        if plan and plan.current_step:
+            tool_hint = plan.current_step.tool_hint or ""
+        if not tool_hint and plan and plan.current_step:
+            step_id = plan.current_step.id or ""
+            if step_id == "fetch_page":
+                tool_hint = "http_get"
+            elif step_id == "attempt_login":
+                tool_hint = "try_http_login"
+        spec = getattr(self, "_intent_spec", None)
+        targets = list(spec.targets) if spec and spec.targets else []
+        url = extract_target_url(getattr(self, "_anchor_query", "") or "", targets)
+        if not tool_hint and (spec and spec.domain == "web_auth"):
+            tool_hint = "http_get"
+        return specialist_action_nudge(
+            self.active_agent,
+            self._handoff_brief,
+            tool_hint,
+            url=url,
+        )
 
     def _artifact_refs(self) -> list[str]:
         """Compact list of on-disk artifact pointers for CURRENT STATE.
@@ -805,6 +863,29 @@ class ReActAgent:
 
         if self.prompt_pack_mode and tool_name == "delegate_to" and self.active_agent != "lead":
             block_err = "Blocked: only LEAD may call delegate_to."
+            if step_callback:
+                step_callback("AGENT_TOOL_CALL", {"tool": tool_name, "args": tool_args})
+                step_callback("AGENT_TOOL_RESULT", {
+                    "tool": tool_name,
+                    "result": {"success": False, "error": block_err},
+                })
+            self.ctx_manager.add_message({
+                "role": "tool",
+                "name": tool_name,
+                "content": json.dumps({"success": False, "error": block_err}),
+            })
+            return False, 0
+
+        if self.prompt_pack_mode and specialist_hard_block(self.active_agent, tool_name):
+            self._specialist_block_count = getattr(self, "_specialist_block_count", 0) + 1
+            if tool_name == "append_note":
+                block_err = (
+                    "Blocked: append_note is LEAD-only. "
+                    "Run your specialist action tool (see handoff brief); "
+                    "facts return via tool results, not progress notes."
+                )
+            else:
+                block_err = allowlist_block_message(tool_name, self.active_agent)
             if step_callback:
                 step_callback("AGENT_TOOL_CALL", {"tool": tool_name, "args": tool_args})
                 step_callback("AGENT_TOOL_RESULT", {
@@ -1655,16 +1736,19 @@ class ReActAgent:
                     pass
             self._refresh_system_prompt()
             self._stop_tool_batch = True
+            self._specialist_block_count = 0
         elif (
             self.prompt_pack_mode
             and self.active_agent != "lead"
             and tool_name != "delegate_to"
             and success_exec
+            and tool_allowed(self.active_agent, tool_name)
         ):
             prior_agent = self.active_agent
             self._handoff_complete = True
             self.active_agent = "lead"
             self.active_specialist = "lead"
+            self._specialist_block_count = 0
             plan = getattr(self, "_task_plan", None)
             if plan and plan.current_step:
                 try:
@@ -2273,6 +2357,7 @@ class ReActAgent:
         self._pcap_objective_met: bool = False
         self._init_turn_state(message)
         self._rehydrate_credential_pairs()
+        self._reset_orphan_specialist(when="chat_turn_start")
 
         if chat_goals and chat_goals.context_directive():
             self.ctx_manager.add_message({
@@ -2285,6 +2370,7 @@ class ReActAgent:
         evaluator_nudges = 0
         max_evaluator_nudges = 1
         crack_bootstrap_attempted = False
+        self._specialist_block_count = 0
 
         # #region agent log
         try:
@@ -2456,6 +2542,8 @@ class ReActAgent:
                         batch_only_notes = False
                     did_exec, _ = await self._execute_tool(name, args, tools_called, step_callback)
                     if self._stop_tool_batch:
+                        if self.prompt_pack_mode and self.active_agent != "lead":
+                            self._add_nudge(self._build_specialist_action_nudge())
                         break
                     if did_exec:
                         batch_executed = True
@@ -2464,6 +2552,25 @@ class ReActAgent:
                             paths_written.append(str(args["path"]).replace("\\", "/"))
 
                 self._chat_tools_executed = list(tools_executed_names)
+
+                if (
+                    self.prompt_pack_mode
+                    and self.active_agent != "lead"
+                    and not batch_executed
+                    and self._specialist_block_count >= 2
+                ):
+                    boot = await self._bootstrap_specialist_action(tools_called, step_callback)
+                    if boot:
+                        tools_executed_names.extend(boot)
+                        self._chat_tools_executed = list(tools_executed_names)
+                        self._specialist_block_count = 0
+                        self._add_nudge(
+                            "[SYSTEM] Specialist stalled on LEAD-only tools — ran deterministic fallback."
+                        )
+                        continue
+
+                if self._stop_tool_batch:
+                    continue
 
                 pending_goals = chat_goals.pending(self._chat_tool_events) if chat_goals else []
                 if (
@@ -2884,6 +2991,7 @@ class ReActAgent:
             pass
 
         steps_run = (step + 1) if "step" in locals() else 0
+        self._reset_orphan_specialist(when="chat_turn_end")
         intent_snapshot = self._active_intent
         self._active_intent = None
         self._anchor_query = ""
@@ -3143,6 +3251,60 @@ class ReActAgent:
         if self._crack_results and "write_file" in goals.required_tools:
             wboot = await self._bootstrap_write_cracked(goals, tools_called, step_callback)
             executed.extend(wboot)
+        return executed
+
+    async def _bootstrap_specialist_action(
+        self,
+        tools_called: set,
+        step_callback=None,
+    ) -> list[str]:
+        """Deterministic fallback when a specialist keeps calling LEAD-only tools."""
+        executed: list[str] = []
+        agent = self.active_agent
+        plan = getattr(self, "_task_plan", None)
+        tool_hint = ""
+        step_id = ""
+        if plan and plan.current_step:
+            tool_hint = (plan.current_step.tool_hint or "").split("|")[0].strip()
+            step_id = plan.current_step.id or ""
+        spec = getattr(self, "_intent_spec", None)
+        targets = list(spec.targets) if spec and spec.targets else []
+        url = extract_target_url(getattr(self, "_anchor_query", "") or "", targets)
+
+        if agent != "web" or not url:
+            return executed
+
+        from core.task_plan import StepStatus
+
+        fetch_pending = True
+        if plan and plan.steps:
+            for s in plan.steps:
+                if s.id == "fetch_page":
+                    fetch_pending = s.status not in (StepStatus.DONE, StepStatus.SKIPPED)
+                    break
+        if "http_get" in tools_called:
+            fetch_pending = False
+
+        want_login = tool_hint == "try_http_login" or step_id == "attempt_login"
+
+        if fetch_pending or not want_login:
+            if step_callback:
+                step_callback("AGENT_TOOL_CALL", {"tool": "http_get", "args": {"url": url}})
+            did, _ = await self._execute_tool("http_get", {"url": url}, tools_called, step_callback)
+            if did:
+                executed.append("http_get")
+            return executed
+
+        creds = getattr(self, "_web_auth_credentials", {}) or {}
+        user = creds.get("user", "")
+        password = creds.get("password", "")
+        if user and password:
+            args = {"url": url, "user": user, "password": password}
+            if step_callback:
+                step_callback("AGENT_TOOL_CALL", {"tool": "try_http_login", "args": {**args, "password": "***"}})
+            did, _ = await self._execute_tool("try_http_login", args, tools_called, step_callback)
+            if did:
+                executed.append("try_http_login")
         return executed
 
     async def _bootstrap_write_cracked(

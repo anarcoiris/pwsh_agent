@@ -36,14 +36,20 @@ Six specialists. Each tool belongs to exactly one agent. LEAD orchestrates; othe
 
 ## Handoff contract
 
-- LEAD calls `delegate_to` before specialist work (recommended). Wrong-scope tools still run with a scope advisory suggesting the correct agent.
-- Specialists cannot call `delegate_to`. Control returns to LEAD automatically after one specialist action.
+- LEAD calls `delegate_to` before specialist work (recommended). Wrong-scope tools still run with a scope advisory suggesting the correct agent (LEAD only, when `specialist_soft_scope: true`).
+- Specialists cannot call `delegate_to` or `append_note`. Control returns to LEAD automatically after one successful **in-scope** specialist action.
+- If a chat turn ends without completing the handoff, specialist mode resets to LEAD (console badge returns to `(LEAD)`).
 - Do not call `delegate_to(agent='lead')`.
 
 ## Cross-session context
 
 - Prior sessions are not browsable by default. Use sealed handoff summaries via `session pick <id>` in console.
 - LEAD reads handoff summaries, not raw prior session folders.
+- `session clear` drops the prior pick and resets specialist to LEAD; it does **not** delete sealed handoffs or change the active session id. Use `new` for a fresh session.
+
+## CURRENT STATE
+
+Each turn the agent builds a fresh CURRENT STATE block (`core/working_state.build_current_state`) from plan, working memory, facts, and handoff fields. The file `state/sessions/<id>/CURRENT_STATE.md` is an audit snapshot only — the LLM does not read it back.
 
 ## Anti-patterns
 

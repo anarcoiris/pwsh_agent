@@ -1,6 +1,8 @@
 # Codebase Mapping & Full Code Check Plan
 
-This plan organizes all files in the `pwsh_agent` codebase (excluding session directories) and defines a systematic auditing plan to verify architectural boundaries, code quality, safety guardrails, knowledge/tools context injection strategy, and compliance with the project stack (Python, PowerShell, Ollama qwen2.5-coder:7b-openclaw).
+> **Status:** REFERENCE checklist. Specialist handoff work (2026-06-04) is documented in [session_closure_20260604.md](./session_closure_20260604.md). See [README.md](./README.md) for plan index.
+
+This plan organizes all files in the `pwsh_agent` codebase (excluding session directories) and defines a systematic auditing plan to verify architectural boundaries, code quality, safety guardrails, knowledge/tools context injection strategy, and compliance with the project stack (Python, PowerShell, Ollama qwen2.5-coder:7b-instruct).
 
 ---
 

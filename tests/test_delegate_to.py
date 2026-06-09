@@ -12,7 +12,7 @@ from core.specialists import (
 )
 
 
-def test_execute_delegate_to_success():
+def test_delegate_to_success():
     result = execute_delegate_to(
         agent="web",
         brief="GET router login page",
@@ -20,6 +20,7 @@ def test_execute_delegate_to_success():
     )
     assert result["success"] is True
     assert result["active_agent"] == "web"
+    assert result["allowed_tools"][0] == "try_http_login"
     assert "http_get" in result["allowed_tools"]
 
 

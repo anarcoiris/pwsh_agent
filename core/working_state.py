@@ -128,7 +128,11 @@ def current_state_file(session_id: str) -> Path:
 
 
 def save_current_state(session_id: str, content: str) -> Path | None:
-    """Persist CURRENT STATE block to the session directory."""
+    """Persist CURRENT STATE block to the session directory (audit/replay only).
+
+    The LLM never reads this file back — each turn rebuilds state via
+    build_current_state() from working_memory.json, plan_state.json, and RAM.
+    """
     text = (content or "").strip()
     if not text:
         return None

@@ -2,9 +2,20 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 AGENT_IDS = frozenset({"lead", "workspace", "web", "recon", "forensic", "crypto"})
+
+# LEAD-only tools — hard-blocked for specialists even when specialist_soft_scope is on.
+LEAD_ONLY_TOOLS = frozenset({
+    "sequentialthinking",
+    "delegate_to",
+    "append_note",
+    "finding_create",
+    "finding_list",
+    "report_generate",
+})
 
 SPECIALIST_REGISTRY: dict[str, frozenset[str]] = {
     "lead": frozenset({
@@ -140,6 +151,11 @@ def tool_allowed(active_agent: str, tool_name: str) -> bool:
     return tool_name in allowed
 
 
+def specialist_hard_block(active_agent: str, tool_name: str) -> bool:
+    """True when a specialist must not run this tool (LEAD-only), regardless of soft scope."""
+    return active_agent != "lead" and tool_name in LEAD_ONLY_TOOLS
+
+
 def suggest_agent_for_tool(tool_name: str) -> str:
     return _suggest_delegate_for_tool(tool_name)
 
@@ -198,7 +214,9 @@ def execute_delegate_to(
         return {"success": False, "error": "Use return_to_lead flow; do not delegate_to(lead)."}
     if not brief:
         return {"success": False, "error": "brief is required — describe the specialist task."}
-    allowed = sorted(SPECIALIST_REGISTRY.get(agent, frozenset()))
+    from core.tool_schemas import tool_names_for_agent
+
+    allowed = tool_names_for_agent(agent)
     return {
         "success": True,
         "active_agent": agent,
@@ -206,3 +224,36 @@ def execute_delegate_to(
         "success_criteria": (success_criteria or "").strip(),
         "allowed_tools": allowed,
     }
+
+
+def extract_target_url(anchor: str, targets: list[str] | None = None) -> str:
+    """First http(s) URL from intent targets or anchor query."""
+    for raw in targets or []:
+        t = (raw or "").strip()
+        if t.lower().startswith(("http://", "https://")):
+            return t
+    m = re.search(r"https?://[^\s\"']+", anchor or "")
+    return m.group(0) if m else ""
+
+
+def specialist_action_nudge(
+    active_agent: str,
+    handoff_brief: str,
+    tool_hint: str = "",
+    *,
+    url: str = "",
+) -> str:
+    """Ephemeral directive after delegate_to — tells specialist which tool to run."""
+    hint = (tool_hint or "").split("|")[0].strip() or "your action tool"
+    brief = (handoff_brief or "").strip() or "complete the delegated task"
+    args = ""
+    if hint == "http_get" and url:
+        args = f' with {{"url": "{url}"}}'
+    elif hint == "try_http_login" and url:
+        args = f' with {{"url": "{url}", "user": "<from mission>", "password": "<from mission>"}}'
+    return (
+        f"[SYSTEM] Active specialist: {active_agent.upper()}. "
+        f"Brief: {brief}. "
+        f"Execute ONE in-scope tool NOW: {hint}{args}. "
+        "append_note and delegate_to are forbidden — use tool results only."
+    )

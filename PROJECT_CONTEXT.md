@@ -1,6 +1,8 @@
 # Repo context
 
-Stack: Python 3.10+, PowerShell, Ollama (qwen2.5-coder:7b-openclaw)
+Stack: Python 3.10+, PowerShell, Ollama (qwen2.5-coder:7b-instruct)  
+Specialists: LEAD + workspace / web / recon / forensic / crypto (`core/specialists.py`, `config.agent.prompt_pack_mode`)
+
 Module layout:
 - /core: The ReAct engine, LLM utils, parsers, and execution policies.
 - /tools: The extensible plugin system (network, system, intelligence) and `tools_legacy.py` monolith.
@@ -16,4 +18,13 @@ Execution:
 - Standard executions must funnel through `agent.py`.
 - Ollama context: `config.yaml` sets `num_ctx: 8192` and `num_predict: 3072` (4096 for synthesis). Agent trim budgets (`max_context_tokens`, `reserve_generation_tokens`, `reserve_injection_tokens`) are aligned to the same 8192 window so persisted history + injections fit what Ollama receives. Reload the model with context length ≥8192 if the server was started with a smaller window.
 - Tool executions are audited by `audit.py` to `state/audit_trail/`.
-- Memory logs are appended to `state/memory/`.
+- Memory logs are appended to `state/memory/` (and `memory/` daily notes).
+
+Plans index (`docs/plans/`):
+
+- [session_closure_20260604.md](docs/plans/session_closure_20260604.md) — fixes verified this session
+- [specialist_handoff_plan.md](docs/plans/specialist_handoff_plan.md) — prompt pack + handoff (done)
+- [web_auth_html_pipeline_plan.md](docs/plans/web_auth_html_pipeline_plan.md) — router/HTML login (next)
+- [implementation_plan.md](docs/plans/implementation_plan.md) — batch notes + artifact compaction (backlog)
+- [context_trim_plan.md](docs/plans/context_trim_plan.md) — context audit checklist
+- [README.md](docs/plans/README.md) — plans index
