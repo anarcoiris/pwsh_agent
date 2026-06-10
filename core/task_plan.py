@@ -522,7 +522,16 @@ def save_plan_state(session_id: str, tracker: TaskPlanTracker) -> Path | None:
     """Persist in-progress roadmap across turns."""
     if not tracker.steps:
         return None
-    from core.session_paths import plan_state_file
+    from core.session_paths import session_state_dir, plan_state_file
+    db_path = session_state_dir(session_id) / "session.db"
+    if db_path.is_file():
+        from core.session_db import SessionDB
+        db = SessionDB(session_id)
+        try:
+            db.set_state("plan_state", _tracker_to_dict(tracker))
+        finally:
+            db.close()
+        return plan_state_file(session_id)
 
     path = plan_state_file(session_id)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -543,40 +552,60 @@ def load_plan_state(
     domain. This prevents a stale credential/PCAP roadmap from hijacking an
     unrelated follow-up turn in a resumed session.
     """
-    from core.session_paths import plan_state_file
-
-    path = plan_state_file(session_id)
-    if not path.is_file():
-        return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            return None
-        tracker = _tracker_from_dict(data)
-        if tracker.all_done:
-            return None
-        if current_message:
+    from core.session_paths import session_state_dir, plan_state_file
+    db_path = session_state_dir(session_id) / "session.db"
+    
+    data = None
+    if db_path.is_file():
+        from core.session_db import SessionDB
+        db = SessionDB(session_id)
+        try:
+            data = db.get_state("plan_state")
+        finally:
+            db.close()
+    else:
+        path = plan_state_file(session_id)
+        if path.is_file():
             try:
-                from core.intent_spec import build_fallback_spec
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                pass
 
-                prev = build_fallback_spec(tracker.prompt).domain
-                new = build_fallback_spec(current_message).domain
-            except Exception:
-                prev = new = ""
-            if (
-                prev not in _GENERIC_DOMAINS
-                and new not in _GENERIC_DOMAINS
-                and prev != new
-            ):
-                clear_plan_state(session_id)
-                return None
-        return tracker
-    except (OSError, json.JSONDecodeError):
+    if not isinstance(data, dict):
         return None
+
+    tracker = _tracker_from_dict(data)
+    if tracker.all_done:
+        return None
+    if current_message:
+        try:
+            from core.intent_spec import build_fallback_spec
+
+            prev = build_fallback_spec(tracker.prompt).domain
+            new = build_fallback_spec(current_message).domain
+        except Exception:
+            prev = new = ""
+        if (
+            prev not in _GENERIC_DOMAINS
+            and new not in _GENERIC_DOMAINS
+            and prev != new
+        ):
+            clear_plan_state(session_id)
+            return None
+    return tracker
 
 
 def clear_plan_state(session_id: str) -> None:
-    from core.session_paths import plan_state_file
+    from core.session_paths import session_state_dir, plan_state_file
+    db_path = session_state_dir(session_id) / "session.db"
+    if db_path.is_file():
+        from core.session_db import SessionDB
+        db = SessionDB(session_id)
+        try:
+            db.delete_state("plan_state")
+        finally:
+            db.close()
+        return
 
     path = plan_state_file(session_id)
     try:

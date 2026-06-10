@@ -39,6 +39,7 @@ class AgentConsole:
             "/new": "new",
             "/audit": "audit",
             "/cancel": "cancel",
+            "/schedule": "schedule",
         }
         return aliases.get(c, c)
 
@@ -179,6 +180,11 @@ class AgentConsole:
         """Active menu and command-driven console loop."""
         self.display_banner()
         prompt_session, multiline_mode, submit_hint = self._build_prompt_session()
+
+        # Start background sweep loop for scheduled missions
+        import asyncio as _aio
+        from core.sweep_loop import sweep_loop
+        self._sweep_task = _aio.ensure_future(sweep_loop(self.agent, interval_s=60))
         
         while self.is_running:
             # Build colorized badges for active settings
@@ -191,7 +197,7 @@ class AgentConsole:
             try:
                 raw_cmd = Prompt.ask(
                     prompt_text,
-                    choices=["mission", "chat", "specialist", "toggle", "audit", "cancel", "status", "new", "session", "help", "exit"],
+                    choices=["mission", "chat", "specialist", "toggle", "audit", "cancel", "schedule", "status", "new", "session", "help", "exit"],
                 )
                 cmd = self._normalize_command(raw_cmd)
                 
@@ -272,6 +278,9 @@ class AgentConsole:
                 elif cmd == "cancel":
                     self.agent.request_cancel()
                     console.print("[bold yellow]⏹ Cancellation signal sent — mission will stop after the current step.[/bold yellow]\n")
+
+                elif cmd == "schedule":
+                    self._handle_schedule()
 
                 elif cmd == "specialist":
                     # Swap cognitive mode
@@ -407,13 +416,116 @@ class AgentConsole:
         help_table.add_row("audit",      "View today's HMAC-signed audit trail and verify integrity.")
         help_table.add_row("new",        "Start a new session (seals outgoing handoff; no auto prior load).")
         help_table.add_row("session",    "list / pick / clear prior handoff summaries (clear resets specialist to LEAD).")
+        help_table.add_row("schedule",   "Add / list / pause / resume / cancel autonomous scheduled missions.")
         help_table.add_row("status",     "Show configuration, thought budget, and audit metrics.")
         help_table.add_row("exit",       "Terminate the session safely.")
         console.print(help_table)
 
+    def _handle_schedule(self):
+        """Interactive schedule sub-menu."""
+        from core.scheduler import (
+            schedule_mission, list_scheduled, pause_mission,
+            resume_mission, cancel_mission, validate_cron,
+        )
+
+        sub = Prompt.ask(
+            "Schedule command",
+            choices=["add", "list", "pause", "resume", "cancel"],
+            default="list",
+        )
+
+        if sub == "list":
+            missions = list_scheduled(include_done=True)
+            if not missions:
+                console.print("[dim]No scheduled missions.[/dim]")
+                return
+            t = Table(title="Scheduled Missions", border_style="cyan")
+            t.add_column("ID", style="cyan", no_wrap=True)
+            t.add_column("Status", style="white")
+            t.add_column("Cron", style="magenta")
+            t.add_column("Next Run", style="yellow")
+            t.add_column("Runs", style="green")
+            t.add_column("Specialist", style="blue")
+            t.add_column("Mission", style="white")
+            for m in missions:
+                status_color = {
+                    "active": "green", "paused": "yellow",
+                    "done": "dim", "failed": "red",
+                }.get(m["status"], "white")
+                t.add_row(
+                    m["id"],
+                    f"[{status_color}]{m['status']}[/{status_color}]",
+                    m.get("cron_expr") or "one-shot",
+                    (m.get("next_run_at") or "")[:19],
+                    f"{m.get('run_count', 0)}/{m.get('max_runs') or '∞'}",
+                    m.get("specialist", "lead"),
+                    (m.get("mission_text") or "")[:50],
+                )
+            console.print(t)
+
+        elif sub == "add":
+            text = Prompt.ask("Mission text")
+            if not text.strip():
+                return
+            cron = Prompt.ask("Cron expression (empty for one-shot)", default="")
+            specialist = Prompt.ask(
+                "Specialist",
+                choices=["lead", "network", "re", "exploit", "web", "workspace"],
+                default="lead",
+            )
+            mode = Prompt.ask(
+                "Network mode",
+                choices=["SANDBOX", "HOST"],
+                default="SANDBOX",
+            )
+            try:
+                cron_val = cron.strip() or None
+                if cron_val and not validate_cron(cron_val):
+                    console.print(f"[bold red]Invalid cron expression: {cron_val}[/bold red]")
+                    return
+                mid = schedule_mission(
+                    text.strip(),
+                    cron_expr=cron_val,
+                    specialist=specialist,
+                    network_mode=mode,
+                )
+                label = f"recurring ({cron_val})" if cron_val else "one-shot (next sweep)"
+                console.print(f"[bold green]✔ Scheduled:[/bold green] {mid} — {label}")
+            except Exception as e:
+                console.print(f"[bold red]Failed to schedule: {e}[/bold red]")
+
+        elif sub == "pause":
+            mid = Prompt.ask("Mission ID to pause")
+            if pause_mission(mid.strip()):
+                console.print(f"[yellow]⏸ Mission {mid} paused.[/yellow]")
+            else:
+                console.print(f"[red]Mission {mid} not found or already paused.[/red]")
+
+        elif sub == "resume":
+            mid = Prompt.ask("Mission ID to resume")
+            if resume_mission(mid.strip()):
+                console.print(f"[green]▶ Mission {mid} resumed.[/green]")
+            else:
+                console.print(f"[red]Mission {mid} not found or not paused.[/red]")
+
+        elif sub == "cancel":
+            mid = Prompt.ask("Mission ID to cancel")
+            if cancel_mission(mid.strip()):
+                console.print(f"[red]✖ Mission {mid} cancelled.[/red]")
+            else:
+                console.print(f"[red]Mission {mid} not found.[/red]")
+
 if __name__ == "__main__":
-    app = AgentConsole()
+    from core.circuit_breaker import enforce_startup_backoff, reset as cb_reset
+
+    enforce_startup_backoff()
+
     # Check if Windows platform and set appropriate asyncio event policy if needed
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-    asyncio.run(app.run_repl())
+
+    try:
+        app = AgentConsole()
+        asyncio.run(app.run_repl())
+    finally:
+        cb_reset()  # Clean exit → clear breaker for instant next launch

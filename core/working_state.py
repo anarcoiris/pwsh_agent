@@ -92,18 +92,41 @@ def _working_memory_path(session_id: str) -> Path:
 
 
 def load_working_memory(session_id: str) -> WorkingMemory:
-    path = _working_memory_path(session_id)
-    if not path.is_file():
-        return WorkingMemory()
-    try:
-        return WorkingMemory.from_dict(json.loads(path.read_text(encoding="utf-8")))
-    except (OSError, json.JSONDecodeError):
-        return WorkingMemory()
+    from core.session_paths import session_state_dir
+    db_path = session_state_dir(session_id) / "session.db"
+    
+    data = None
+    if db_path.is_file():
+        from core.session_db import SessionDB
+        db = SessionDB(session_id)
+        try:
+            data = db.get_state("working_memory")
+        finally:
+            db.close()
+    else:
+        path = _working_memory_path(session_id)
+        if path.is_file():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                pass
+    return WorkingMemory.from_dict(data)
 
 
 def save_working_memory(session_id: str, wm: WorkingMemory) -> Path | None:
     if wm.is_empty():
         return None
+    from core.session_paths import session_state_dir
+    db_path = session_state_dir(session_id) / "session.db"
+    if db_path.is_file():
+        from core.session_db import SessionDB
+        db = SessionDB(session_id)
+        try:
+            db.set_state("working_memory", wm.to_dict())
+        finally:
+            db.close()
+        return _working_memory_path(session_id)
+
     path = _working_memory_path(session_id)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -136,6 +159,16 @@ def save_current_state(session_id: str, content: str) -> Path | None:
     text = (content or "").strip()
     if not text:
         return None
+    from core.session_paths import session_state_dir
+    db_path = session_state_dir(session_id) / "session.db"
+    if db_path.is_file():
+        from core.session_db import SessionDB
+        db = SessionDB(session_id)
+        try:
+            db.set_state("current_state_md", text)
+        finally:
+            db.close()
+
     path = current_state_file(session_id)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)

@@ -137,6 +137,17 @@ def seal_handoff(
         "continues_from": continues_from,
     }
 
+    from core.session_paths import session_state_dir
+    db_path = session_state_dir(sid) / "session.db"
+    if db_path.is_file():
+        from core.session_db import SessionDB
+        db = SessionDB(sid)
+        try:
+            db.set_state("handoff", payload)
+        finally:
+            db.close()
+        return handoff_file(sid)
+
     path = handoff_file(sid)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -147,14 +158,25 @@ def seal_handoff(
 
 
 def load_handoff(session_id: str) -> dict[str, Any] | None:
-    path = handoff_file(session_id)
-    if not path.is_file():
-        return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else None
-    except (OSError, json.JSONDecodeError):
-        return None
+    from core.session_paths import session_state_dir
+    db_path = session_state_dir(session_id) / "session.db"
+    
+    data = None
+    if db_path.is_file():
+        from core.session_db import SessionDB
+        db = SessionDB(session_id)
+        try:
+            data = db.get_state("handoff")
+        finally:
+            db.close()
+    else:
+        path = handoff_file(session_id)
+        if path.is_file():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                pass
+    return data if isinstance(data, dict) else None
 
 
 def format_handoff_for_state(handoff: dict[str, Any] | None, max_chars: int = 600) -> str:

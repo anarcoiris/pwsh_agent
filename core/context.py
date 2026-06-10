@@ -342,8 +342,8 @@ def _apply_per_message_caps(
 
 class AgentContextManager:
     """
-    Manages the agent's message history with disk persistence and
-    automatic context trimming.
+    Manages the agent's message history with disk persistence (SQLite or JSON)
+    and automatic context trimming.
     """
 
     def __init__(
@@ -367,6 +367,9 @@ class AgentContextManager:
         self.reserve_generation_tokens = max(0, int(reserve_generation_tokens))
         self.reserve_injection_tokens = max(0, int(reserve_injection_tokens))
 
+        self.use_sqlite = False
+        self.db = None
+
         if state_path:
             self.state_path = Path(state_path)
         else:
@@ -377,37 +380,151 @@ class AgentContextManager:
                 / session_id
                 / f"agent_{mode}.json"
             )
+            self.use_sqlite = True
+            from core.session_paths import session_state_dir, facts_file, plan_state_file, intent_spec_file
+            from core.working_state import _working_memory_path, current_state_file
+            from core.session_handoff import handoff_file
+            from core.session_db import SessionDB
+
+            db_path = session_state_dir(self.session_id) / "session.db"
+            if not db_path.is_file():
+                # Perform auto-migration if there is any legacy JSON data
+                has_json = self.state_path.is_file()
+                has_others = any(
+                    p.is_file() for p in (
+                        facts_file(self.session_id),
+                        plan_state_file(self.session_id),
+                        intent_spec_file(self.session_id),
+                        _working_memory_path(self.session_id),
+                        handoff_file(self.session_id),
+                    )
+                )
+                if has_json or has_others:
+                    logger.info("Auto-migrating session %s to SQLite...", self.session_id)
+                    self.db = SessionDB(self.session_id)
+                    
+                    # 1. Messages
+                    if self.state_path.is_file():
+                        try:
+                            with open(self.state_path, encoding="utf-8") as f:
+                                msgs = json.load(f)
+                            for msg in msgs:
+                                self.db.add_message(msg)
+                            logger.info("Migrated %d messages", len(msgs))
+                        except Exception as e:
+                            logger.warning("Failed to migrate messages: %s", e)
+
+                    # 2. Key-value state files
+                    state_mappings = {
+                        "facts": facts_file(self.session_id),
+                        "plan_state": plan_state_file(self.session_id),
+                        "intent_spec": intent_spec_file(self.session_id),
+                        "working_memory": _working_memory_path(self.session_id),
+                        "handoff": handoff_file(self.session_id),
+                    }
+                    for key, path in state_mappings.items():
+                        if path.is_file():
+                            try:
+                                val = json.loads(path.read_text(encoding="utf-8"))
+                                self.db.set_state(key, val)
+                                logger.info("Migrated key '%s'", key)
+                            except Exception as e:
+                                logger.warning("Failed to migrate %s: %s", key, e)
+
+                    # 3. CURRENT_STATE.md
+                    cs_file = current_state_file(self.session_id)
+                    if cs_file.is_file():
+                        try:
+                            val = cs_file.read_text(encoding="utf-8")
+                            self.db.set_state("current_state_md", val)
+                            logger.info("Migrated current_state_md")
+                        except Exception as e:
+                            logger.warning("Failed to migrate current_state_md: %s", e)
+
+                    # 4. Rename original files to .bak
+                    all_to_rename = list(state_mappings.values()) + [self.state_path, cs_file]
+                    for path in all_to_rename:
+                        if path.is_file():
+                            try:
+                                path.rename(path.with_suffix(path.suffix + ".bak"))
+                            except Exception as e:
+                                logger.warning("Failed to rename %s: %s", path, e)
+                    logger.info("Migration of session %s complete.", self.session_id)
+                else:
+                    self.db = SessionDB(self.session_id)
+            else:
+                self.db = SessionDB(self.session_id)
 
         self.messages: list[dict[str, Any]] = []
         self.load_state()
 
     def save_state(self) -> None:
-        try:
-            self.state_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.state_path, "w", encoding="utf-8") as f:
-                json.dump(self.messages, f, indent=2, cls=DateTimeEncoder)
-        except Exception as e:
-            logger.warning("Could not save agent state: %s", e)
+        if self.use_sqlite:
+            try:
+                self.db._conn.execute("DELETE FROM messages")
+                self.db._conn.execute("DELETE FROM sqlite_sequence WHERE name='messages'")
+                for msg in self.messages:
+                    self.db.add_message(msg)
+                # Reload to populate seq attribute in memory
+                self.messages = self.db.get_messages()
+            except Exception as e:
+                logger.warning("Could not save agent state to SQLite: %s", e)
+        else:
+            try:
+                self.state_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(self.state_path, "w", encoding="utf-8") as f:
+                    json.dump(self.messages, f, indent=2, cls=DateTimeEncoder)
+            except Exception as e:
+                logger.warning("Could not save agent state: %s", e)
 
     def load_state(self) -> None:
-        try:
-            if self.state_path.exists():
-                with open(self.state_path, encoding="utf-8") as f:
-                    self.messages = json.load(f)
+        if self.use_sqlite:
+            try:
+                self.messages = self.db.get_messages()
                 logger.info(
-                    "Loaded %d messages from %s", len(self.messages), self.state_path
+                    "Loaded %d messages from SQLite session.db", len(self.messages)
                 )
-        except Exception as e:
-            logger.warning("Could not load agent state: %s", e)
+            except Exception as e:
+                logger.warning("Could not load agent state from SQLite: %s", e)
+        else:
+            try:
+                if self.state_path.exists():
+                    with open(self.state_path, encoding="utf-8") as f:
+                        self.messages = json.load(f)
+                    logger.info(
+                        "Loaded %d messages from %s", len(self.messages), self.state_path
+                    )
+            except Exception as e:
+                logger.warning("Could not load agent state: %s", e)
 
     def clear_history(self) -> None:
         self.messages = []
-        try:
-            if self.state_path.exists():
-                os.remove(self.state_path)
-                logger.info("Cleared history and deleted %s", self.state_path)
-        except Exception as e:
-            logger.warning("Could not delete state file: %s", e)
+        if self.use_sqlite:
+            try:
+                from core.session_paths import session_state_dir
+                self.db.close()
+                db_path = session_state_dir(self.session_id) / "session.db"
+                for suffix in ("", "-wal", "-shm"):
+                    p = db_path.with_name(db_path.name + suffix)
+                    if p.is_file():
+                        p.unlink()
+                # Also unlink any .bak files if they exist
+                for p in session_state_dir(self.session_id).iterdir():
+                    if p.suffix == ".bak" or p.name.endswith(".json.bak") or p.name.endswith(".md.bak"):
+                        p.unlink()
+                logger.info("Cleared SQLite history and deleted session.db files")
+                # Re-initialize SessionDB
+                from core.session_db import SessionDB
+                self.db = SessionDB(self.session_id)
+            except Exception as e:
+                logger.warning("Could not clear SQLite history: %s", e)
+        else:
+            try:
+                if self.state_path.exists():
+                    os.remove(self.state_path)
+                    logger.info("Cleared history and deleted %s", self.state_path)
+            except Exception as e:
+                logger.warning("Could not delete state file: %s", e)
 
     def get_messages(self) -> list[dict[str, Any]]:
         return self.messages

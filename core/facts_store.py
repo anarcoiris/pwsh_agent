@@ -76,6 +76,21 @@ def contains_narrative(facts: dict[str, Any]) -> bool:
 
 
 def load_facts(session_id: str) -> dict[str, Any]:
+    from core.session_paths import session_state_dir
+    db_path = session_state_dir(session_id) / "session.db"
+    if db_path.is_file():
+        from core.session_db import SessionDB
+        db = SessionDB(session_id)
+        try:
+            data = db.get_state("facts")
+            if isinstance(data, dict):
+                base = _default()
+                base.update(data)
+                return base
+        finally:
+            db.close()
+        return _default()
+
     path = facts_file(session_id)
     if not path.is_file():
         return _default()
@@ -91,10 +106,21 @@ def load_facts(session_id: str) -> dict[str, Any]:
 
 
 def save_facts(session_id: str, facts: dict[str, Any]) -> Path:
-    path = facts_file(session_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    from core.session_paths import session_state_dir
+    db_path = session_state_dir(session_id) / "session.db"
     facts = dict(facts)
     facts["updated_at"] = datetime.now(timezone.utc).isoformat()
+    if db_path.is_file():
+        from core.session_db import SessionDB
+        db = SessionDB(session_id)
+        try:
+            db.set_state("facts", facts)
+        finally:
+            db.close()
+        return facts_file(session_id)
+
+    path = facts_file(session_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(facts, indent=2, default=str), encoding="utf-8")
     return path
 

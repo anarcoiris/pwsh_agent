@@ -68,17 +68,16 @@ See [specialist_handoff_plan.md](plans/specialist_handoff_plan.md).
 
 ## On-disk stores (per session)
 
+All state for active sessions is consolidated into a single SQLite database file. Legacy JSON files are auto-migrated on first access and renamed to `*.json.bak`.
+
 | File | Purpose |
 |------|---------|
-| `state/sessions/<id>/agent_autonomous.json` | Full ReAct message history |
-| `plan_state.json` | Heuristic roadmap (`TaskPlanTracker`) |
-| `working_memory.json` | Volatile scratch fields |
-| `facts.json` | Structured session facts |
-| `CURRENT_STATE.md` | **Audit/replay snapshot only** — LLM uses live `build_current_state()` |
-| `handoff.json` | Sealed summary when session ends or `new` |
-| `context_dump.md` | Full text of digested old tool results |
-| `llm_audit.jsonl` | Optional full prompt/response audit |
-| `artifacts/*` | Spilled tool outputs (e.g. large `http_get`) |
+| `state/sessions/<id>/session.db` | Consolidated SQLite database containing the messages history and all session key-value states (facts, plan_state, working_memory, intent_spec, handoff, and audit current_state_md). |
+| `CURRENT_STATE.md` | **Audit/replay snapshot only** — written to disk for human operator inspection, but also persisted inside `session.db`. |
+| `context_dump.md` | Full text of digested old tool results. |
+| `llm_audit.jsonl` | Optional full prompt/response audit. |
+| `artifacts/*` | Spilled tool outputs (e.g. large `http_get`). |
+| `*.bak` | Backup files of migrated legacy JSON session states. |
 
 ## Console session commands
 

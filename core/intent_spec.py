@@ -534,12 +534,27 @@ class IntentFormalizer:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def save_intent_spec(session_id: str, spec: IntentSpec) -> Any:
-    """Append the spec to the session's intent_spec.json history (newest last)."""
-    from core.session_paths import intent_spec_file
+    """Append the spec to the session's intent_spec history (newest last)."""
+    from core.session_paths import session_state_dir, intent_spec_file
+    db_path = session_state_dir(session_id) / "session.db"
+    
+    history: list[dict[str, Any]] = []
+    if db_path.is_file():
+        from core.session_db import SessionDB
+        db = SessionDB(session_id)
+        try:
+            loaded = db.get_state("intent_spec")
+            if isinstance(loaded, list):
+                history = loaded
+            history.append(spec.to_dict())
+            history = history[-50:]
+            db.set_state("intent_spec", history)
+        finally:
+            db.close()
+        return intent_spec_file(session_id)
 
     path = intent_spec_file(session_id)
     path.parent.mkdir(parents=True, exist_ok=True)
-    history: list[dict[str, Any]] = []
     if path.is_file():
         try:
             loaded = json.loads(path.read_text(encoding="utf-8"))
@@ -558,14 +573,26 @@ def save_intent_spec(session_id: str, spec: IntentSpec) -> Any:
 
 
 def load_latest_intent_spec(session_id: str) -> IntentSpec | None:
-    from core.session_paths import intent_spec_file
+    from core.session_paths import session_state_dir, intent_spec_file
+    db_path = session_state_dir(session_id) / "session.db"
+    
+    loaded = None
+    if db_path.is_file():
+        from core.session_db import SessionDB
+        db = SessionDB(session_id)
+        try:
+            loaded = db.get_state("intent_spec")
+        finally:
+            db.close()
+    else:
+        path = intent_spec_file(session_id)
+        if path.is_file():
+            try:
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                pass
 
-    path = intent_spec_file(session_id)
-    if not path.is_file():
-        return None
-    try:
-        loaded = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    if loaded is None:
         return None
     if isinstance(loaded, list) and loaded:
         return IntentSpec.from_dict(loaded[-1])
