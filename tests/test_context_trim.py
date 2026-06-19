@@ -56,8 +56,8 @@ def test_build_injections_pcap_phase_after_nudge():
 def test_detect_mission_kind():
     assert detect_mission_kind("crack sha256 hash with crack_hash") == "hash"
     assert detect_mission_kind("analyze foo.pcapng") == "pcap"
-    assert detect_mission_kind("write watcher.py script") == "dev"
-    assert detect_mission_kind("Propose a top 10 must-have .ps1 tools and start building them") == "dev"
+    assert detect_mission_kind("write watcher.py script") == "code_build"
+    assert detect_mission_kind("Propose a top 10 must-have .ps1 tools and start building them") == "hygiene_remediation"
 
 
 def test_digest_includes_artifact_pointers():

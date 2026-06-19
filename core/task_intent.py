@@ -12,7 +12,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-MissionKind = Literal["hash", "pcap", "dev", "file_find", "recon", "general"]
+MissionKind = Literal[
+    "hash", "pcap", "dev", "code_build", "hygiene_remediation",
+    "file_find", "recon", "general",
+]
+
+_HYGIENE_MISSION_RE = re.compile(
+    r"\b(hygiene|dead\s*code|auto[_\s-]?fixable|repo[\s-]?maintenance|repo-hygiene)\b"
+    r"|(?:REF|DOC|DEP|ARCH)-\d+"
+    r"|(?:must.?have|top\s+\d+).*(?:\.ps1|powershell\s+util)"
+    r"|workspace/scripts/tool\d+\.ps1",
+    re.I,
+)
 
 # User wants files by name/glob under workspace — not PCAP log content search.
 _FILE_FIND_RE = re.compile(
@@ -142,7 +153,9 @@ def detect_mission_kind(text: str) -> MissionKind:
         lower,
     ))
     if (skip_network or dev_task) and not explicit_recon:
-        return "dev"
+        if _HYGIENE_MISSION_RE.search(text or ""):
+            return "hygiene_remediation"
+        return "code_build"
     if explicit_recon:
         return "recon"
     return "general"

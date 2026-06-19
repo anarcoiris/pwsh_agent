@@ -116,20 +116,25 @@ class ContextRouter:
             # Selective skill injection (small budget) — hygiene remediation
             skill_query = query or ""
             if skill_query and _HYGIENE_SKILL_RE.search(skill_query):
-                skill_playbook = get_rag_context_for_tools(
-                    ["hygiene_lookup", "delegate_to", "read_file", "write_file"],
-                    skill_query,
-                    max_chars=800,
+                skip_hygiene_skill = (
+                    task_intent is not None
+                    and task_intent.mission_kind in ("code_build",)
                 )
-                if skill_playbook:
-                    injections.append({
-                        "role": "system",
-                        "content": (
-                            "### SKILL: Hygiene Remediation ###\n"
-                            f"{skill_playbook}\n"
-                            "##################################"
-                        ),
-                    })
+                if not skip_hygiene_skill:
+                    skill_playbook = get_rag_context_for_tools(
+                        ["hygiene_lookup", "delegate_to", "read_file", "write_file"],
+                        skill_query,
+                        max_chars=800,
+                    )
+                    if skill_playbook:
+                        injections.append({
+                            "role": "system",
+                            "content": (
+                                "### SKILL: Hygiene Remediation ###\n"
+                                f"{skill_playbook}\n"
+                                "##################################"
+                            ),
+                        })
             return injections
 
         phase_hint = DynamicContextBuilder.build_context(messages, anchor_query=query or None)
@@ -234,7 +239,7 @@ class ContextRouter:
                 return "NETWORK"
             if intent.mission_kind == "hash":
                 return "GENERAL"
-            if intent.is_dev_task or intent.mission_kind == "dev":
+            if intent.is_dev_task or intent.mission_kind in ("dev", "code_build"):
                 return "DEVELOPMENT"
         if "DEVELOPMENT" in phase_hint:
             return "DEVELOPMENT"

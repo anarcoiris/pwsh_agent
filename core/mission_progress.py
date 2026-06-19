@@ -138,11 +138,17 @@ class MissionProgressTracker:
             "[SYSTEM DIRECTIVE] Mission objective not satisfied yet. "
             "Do NOT call append_note or repeat find_file now. "
         )
-        if kind == "dev":
+        if kind == "hygiene_remediation":
             return (
                 base
                 + "LEAD: call delegate_to(agent='workspace', brief=<script task>) NOW. "
                   "Workspace: use write_file to create script(s), then run_script or host_exec to verify."
+            )
+        if kind in ("dev", "code_build"):
+            return (
+                base
+                + "LEAD: call delegate_to(agent='workspace', brief=<deliverable paths>) NOW. "
+                  "Workspace: mkdir if needed, write_file for each deliverable, then run_script to verify."
             )
         if kind == "file_find":
             globs = []

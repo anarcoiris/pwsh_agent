@@ -7,19 +7,29 @@
 
 ## 1. Contexto del Hardware
 
-### 3× GTX 1080 (Pascal)
+### 1× GTX 1080 + 2× GTX 1070 (Pascal, 8 GB each)
 
 | Parámetro | Valor |
 |---|---|
-| VRAM por GPU | 8 GB GDDR5X |
+| VRAM por GPU | 8 GB (1080: GDDR5X; 1070: GDDR5) |
 | VRAM total | 24 GB |
-| Arquitectura | Pascal (GP102) |
-| Tensor Cores | No (exclusivo de Volta+) |
-| NVLink | No (Pascal consumer no lo incluye) |
+| Arquitectura | Pascal |
+| Tensor Cores | No |
+| NVLink | No |
 | Interconexión GPU–GPU | PCIe 3.0 x16 (~12–14 GB/s por dirección) |
-| FP16 nativo | Parcial (emulado, sin aceleración hardware real) |
+| Rendimiento relativo | GTX 1080 ~20–35% más rápida que GTX 1070 en inferencia |
 
-**Implicación crítica del hardware:** La ausencia de NVLink hace que el *model parallelism* (dividir un único modelo grande entre varias GPUs con comunicación de tensores por capa) sea impracticable para modelos medianos-grandes, porque la transferencia de activaciones a través de PCIe introduce latencia de 10–30 ms por token en cada frontera de capa. El patrón correcto para estas GPUs es **paralelismo de especialización**: un modelo completo por GPU, sin comunicación de tensores entre GPUs durante inferencia.
+**Implicación crítica del hardware:** La ausencia de NVLink hace que el *model parallelism* sea impracticable. El patrón correcto es **paralelismo de especialización**: un modelo completo por GPU, sin tensor-split.
+
+**Asignación multi-GPU (Escenario 1 actualizado):**
+
+| GPU | Modelo | Rol | Endpoint |
+|---|---|---|---|
+| GTX 1070 #1 | chat-analyzer | INTAKE | `:11436` |
+| GTX 1080 | vibethinker:3b | PLAN + EVALUATE | `:11434` |
+| GTX 1070 #2 | qwen2.5-coder:7b | VALIDATE + EXECUTE | `:11435` |
+
+RAG, FAISS, embeddings y FSM del orquestador viven en **CPU** (Fase 1).
 
 ---
 
@@ -53,23 +63,20 @@ A 32,768 tokens → ~0.45 GB  (≡ FP16 a 8k tokens)
 **Estimación VRAM total a 4k contexto (configuración base):**
 
 ```
-GPU 1 (Intake, Qwen 7B):
+GPU 1 (Intake, chat-analyzer @ :11436):
   Pesos:     ~4.5 GB
-  KV cache:  ~0.22 GB
-  Activaciones + overhead: ~0.5 GB
-  Total:     ~5.2 GB  ← cabe en 8 GB ✓
+  KV cache:  ~0.22 GB @ 4k
+  Total:     ~5.2 GB  ← cabe en 8 GB
 
-GPU 2 (Planner, VibeThinker 3B):
+GPU 2 (Planner, VibeThinker 3B @ :11434, GTX 1080):
   Pesos:     ~2.0 GB
   KV cache:  ~0.1 GB
-  Activaciones + overhead: ~0.3 GB
-  Total:     ~2.4 GB  ← cabe en 8 GB ✓
+  Total:     ~2.4 GB  ← cabe holgado
 
-GPU 3 (Coder, Qwen Coder 7B):
+GPU 3 (Coder, Qwen Coder 7B @ :11435):
   Pesos:     ~4.5 GB
-  KV cache:  ~0.22 GB
-  Activaciones + overhead: ~0.5 GB
-  Total:     ~5.2 GB  ← cabe en 8 GB ✓
+  KV cache:  ~0.22 GB @ 4k
+  Total:     ~5.2 GB  ← cabe en 8 GB
 ```
 
 > **Aviso:** La ejecución simultánea a num_ctx=8,192 es borderline. La afirmación inicial de "encajar ambos modelos en 8 GB" era optimista al no contabilizar activaciones, workspace de operadores CUDA (~100–300 MB) y overhead del driver (~100–200 MB). El margen real es ajustado. Preferir num_ctx=4,096 para mayor estabilidad.

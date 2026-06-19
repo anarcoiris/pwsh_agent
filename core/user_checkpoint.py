@@ -108,40 +108,40 @@ def whitelist_trigger(
 
 _TRIGGER_MESSAGES: dict[CheckpointTrigger, str] = {
     CheckpointTrigger.NEEDS_READAPTATION: (
-        "⚠️  **Checkpoint** — Un paso del plan falló.\n"
+        "[Checkpoint] A plan step failed.\n"
         "{detail}\n\n"
-        "¿Cómo continuamos?\n"
-        "  [C] Continuar — intentar otra estrategia\n"
-        "  [I] Añadir información — dame más contexto\n"
-        "  [X] Terminar — marcar como completado\n"
-        "  [S] Siempre continuar en casos de fallo (no preguntar de nuevo)"
+        "How should we continue?\n"
+        "  [C] Continue — try another strategy\n"
+        "  [I] Add information — give me more context\n"
+        "  [X] Stop — mark as complete\n"
+        "  [S] Always continue on failure (do not ask again)"
     ),
     CheckpointTrigger.STALL_RECOVERY: (
-        "🔄  **Checkpoint** — Parece que el agente está dando vueltas.\n"
+        "[Checkpoint] The agent appears to be stalling.\n"
         "{detail}\n\n"
-        "¿Cómo continuamos?\n"
-        "  [C] Continuar — seguir adelante\n"
-        "  [I] Añadir información — dame más contexto\n"
-        "  [X] Terminar — cerrar la misión\n"
-        "  [S] Siempre continuar en casos de stall (no preguntar de nuevo)"
+        "How should we continue?\n"
+        "  [C] Continue — keep going\n"
+        "  [I] Add information — give me more context\n"
+        "  [X] Stop — close the mission\n"
+        "  [S] Always continue on stall (do not ask again)"
     ),
     CheckpointTrigger.ATTEMPT_CAP_REACHED: (
-        "🚫  **Checkpoint** — Se agotaron los intentos para este paso.\n"
+        "[Checkpoint] Attempt cap reached for this step.\n"
         "{detail}\n\n"
-        "¿Cómo continuamos?\n"
-        "  [C] Continuar — cambiar de enfoque\n"
-        "  [I] Añadir información — dame más contexto\n"
-        "  [X] Terminar — dejar este paso como irresoluble\n"
-        "  [S] Siempre continuar al agotar intentos (no preguntar de nuevo)"
+        "How should we continue?\n"
+        "  [C] Continue — change approach\n"
+        "  [I] Add information — give me more context\n"
+        "  [X] Stop — leave this step unresolved\n"
+        "  [S] Always continue when attempts are exhausted (do not ask again)"
     ),
     CheckpointTrigger.EXEC_RESULT_REVIEW: (
-        "📋  **Checkpoint** — Resultado de ejecución disponible.\n"
+        "[Checkpoint] Execution result available.\n"
         "{detail}\n\n"
-        "¿Cómo continuamos?\n"
-        "  [C] Continuar — proceder con el siguiente paso\n"
-        "  [I] Añadir información — dame más contexto\n"
-        "  [X] Terminar — misión completada\n"
-        "  [S] Siempre continuar tras ejecuciones (no preguntar de nuevo)"
+        "How should we continue?\n"
+        "  [C] Continue — proceed to the next step\n"
+        "  [I] Add information — give me more context\n"
+        "  [X] Stop — mission complete\n"
+        "  [S] Always continue after executions (do not ask again)"
     ),
 }
 
@@ -151,7 +151,7 @@ def format_checkpoint_message(
     detail: str = "",
 ) -> str:
     """Format the checkpoint prompt shown to the user."""
-    template = _TRIGGER_MESSAGES.get(trigger, "⚠️ Checkpoint: {detail}")
+    template = _TRIGGER_MESSAGES.get(trigger, "[Checkpoint] {detail}")
     return template.format(detail=(detail or "").strip()[:400])
 
 
@@ -216,9 +216,17 @@ class CheckpointGate:
         self.cfg = cfg
         checkpoint_cfg = cfg.get("checkpoint", {})
         self.enabled: bool = bool(checkpoint_cfg.get("enabled", True))
-        self.active_triggers: frozenset[str] = frozenset(
-            checkpoint_cfg.get("triggers", [t.value for t in CheckpointTrigger])
-        )
+        self.profile: str = str(checkpoint_cfg.get("profile", "interactive")).strip().lower()
+        triggers = list(checkpoint_cfg.get("triggers", [t.value for t in CheckpointTrigger]))
+        if self.profile == "headless":
+            triggers = [
+                t for t in triggers
+                if t not in (
+                    CheckpointTrigger.STALL_RECOVERY.value,
+                    CheckpointTrigger.EXEC_RESULT_REVIEW.value,
+                )
+            ]
+        self.active_triggers: frozenset[str] = frozenset(triggers)
 
     def should_fire(self, trigger: CheckpointTrigger) -> bool:
         """Return True when this trigger should pause execution."""

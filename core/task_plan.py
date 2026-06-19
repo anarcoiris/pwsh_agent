@@ -53,8 +53,9 @@ class TaskStep:
     assigned_agent: str = "lead"
     success_criteria: str = ""
     delegate_brief: str = ""
-    # VibeThinker explains why this step is needed (for audit/debug)
     rationale: str = ""
+    depends_on: list[str] = field(default_factory=list)
+    parallel_group: str = ""
 
 
 _PLACEHOLDER_PWD = re.compile(
@@ -160,7 +161,11 @@ class TaskPlanTracker:
                 tool_hint = str(tool_hint_raw).strip()
             # assigned_agent: validate against known agents
             agent_raw = str(raw.get("assigned_agent") or raw.get("agent") or "lead").strip().lower()
-            assigned_agent = agent_raw if agent_raw in ("lead", "workspace", "web") else "lead"
+            _agents = ("lead", "workspace", "web", "recon", "forensic", "crypto")
+            assigned_agent = agent_raw if agent_raw in _agents else "lead"
+            deps_raw = raw.get("depends_on") or []
+            depends_on = [str(d).strip() for d in deps_raw if str(d).strip()] if isinstance(deps_raw, list) else []
+            parallel_group = str(raw.get("parallel_group") or "").strip()
             steps.append(TaskStep(
                 id=step_id,
                 label=label[:200],
@@ -169,6 +174,8 @@ class TaskPlanTracker:
                 success_criteria=str(raw.get("success_criteria") or "")[:200],
                 delegate_brief=str(raw.get("delegate_brief") or label)[:200],
                 rationale=str(raw.get("rationale") or "")[:300],
+                depends_on=depends_on,
+                parallel_group=parallel_group,
             ))
 
         # VT produced nothing usable — fall back to regex parser

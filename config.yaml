@@ -1,16 +1,24 @@
 # config.yaml - Pulse pwsh_agent Configuration
 
 ollama:
-  # Base URL for the local Ollama instance (same port 11435)
+  # Legacy fallback — used when endpoints are not set; also canonical coder URL.
   base_url: "http://localhost:11435"
 
-  # ── 3-phase model pipeline ────────────────────────────────────────────────
-  # INTAKE  (chat-analyzer): user msg → structured IntentSpec (JSON output)
-  # PLAN    (vibethinker):   IntentSpec → 1st-person monologue → roadmap
-  # EXECUTE (qwen-coder):    tool_calls, code, strict syntax
-  # EVALUATE (vibethinker):  execution result → next step / done?
-  # Models are loaded/unloaded sequentially — never simultaneously.
-  # Future: pin to dedicated Pascal GPUs when available (no unload needed).
+  # Multi-GPU endpoints (docker-compose.multi-gpu.yml)
+  endpoints:
+    intake:  "http://localhost:11436"
+    planner: "http://localhost:11434"
+    coder:   "http://localhost:11435"
+
+  # Pin models resident per GPU — no unload between phase switches.
+  unload_after_call: false
+
+  # ── 5-phase model pipeline ────────────────────────────────────────────────
+  # INTAKE   (chat-analyzer @ :11436): user msg → structured IntentSpec
+  # PLAN     (vibethinker @ :11434):   IntentSpec → monologue → roadmap
+  # VALIDATE (qwen-coder @ :11435):    Coder checks roadmap JSON
+  # EXECUTE  (qwen-coder @ :11435):    tool_calls, code, strict syntax
+  # EVALUATE (vibethinker @ :11434):   exec result → next step / done?
   # ─────────────────────────────────────────────────────────────────────────
 
   # EXECUTE phase: tool-calling, code, strict syntax
@@ -68,8 +76,8 @@ agent:
   llm_audit: meta
 
 intent:
-  # INTAKE phase: chat-analyzer formalises the user message into a structured
-  # IntentSpec (JSON). shadow_mode=false → the spec now GATES routing/planning.
+  # INTAKE phase: chat-analyzer formalises the user message into IntentSpec (JSON).
+  # shadow_mode=false → spec drives planning bootstrap, hygiene RAG gating, and VT roadmap.
   shadow_mode: false
   use_llm: true
   # Intake model: defaults to ollama.conversational_model (chat-analyzer)
@@ -79,15 +87,24 @@ intent:
 
 planner:
   # PLAN + EVALUATE phase — VibeThinker leads the process.
-  # monologue: VT emits a first-person reasoning monologue before producing
-  #   the structured roadmap. This helps smaller models "think out loud".
   monologue_enabled: true
   monologue_max_tokens: 512
-  # Re-evaluate after: mission start, any failure/warning, any code/cmd result
   reevaluate_on: ["start", "failure", "warning", "exec_result"]
   temperature: 0.4
+  validate_temperature: 0.1
+  validate_enabled: true
+  validate_max_retries: 1
+  parallel_branches: true
+  max_parallel_branches: 2
+
+handoff:
+  # Workspace specialist may run this many in-scope tools before auto-return to LEAD.
+  max_tools_per_delegate: 4
 
 checkpoint:
+  # profile: interactive — all triggers may pause for user input
+  # profile: headless — skips stall_recovery and exec_result_review (autonomous harness)
+  profile: headless
   # User checkpoint: blocks execution and asks the user for direction.
   # The user can answer once or whitelist "always continue in this case".
   enabled: true

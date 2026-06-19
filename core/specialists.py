@@ -22,7 +22,6 @@ SPECIALIST_REGISTRY: dict[str, frozenset[str]] = {
         "sequentialthinking",
         "delegate_to",
         "append_note",
-        "hygiene_lookup",
         "finding_create",
         "finding_list",
         "report_generate",

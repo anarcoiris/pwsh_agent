@@ -99,8 +99,18 @@ from core.runtime_paths import app_root, workspace_root
 from core.mission_progress import MissionProgressTracker
 from core.mission_evaluator import MissionEvaluator
 from core.user_checkpoint import CheckpointGate, CheckpointTrigger, CheckpointDecision
-from core.model_dispatch import should_reevaluate
-from core.intent_spec import IntentFormalizer, build_fallback_spec, save_intent_spec
+from core.model_dispatch import (
+    chat_options_for_phase,
+    endpoint_for_phase,
+    endpoints_config,
+    model_for_phase,
+    num_predict_for_phase,
+    should_reevaluate,
+    temperature_for_phase,
+    TurnPhase,
+    unload_after_call,
+)
+from core.intent_spec import IntentFormalizer, IntentPlanner, build_fallback_spec, save_intent_spec
 
 logger = logging.getLogger("pwsh_agent.agent")
 
@@ -147,7 +157,14 @@ class OllamaAdapter:
         self.num_predict = num_predict
         self.injection_budget_chars = injection_budget_chars
         self.llm_audit_mode = llm_audit_mode
-        self.client = AsyncClient(host=host, timeout=httpx.Timeout(300.0))
+        self._clients: dict[str, AsyncClient] = {}
+        self.client = self._client_for(host)
+
+    def _client_for(self, host: str) -> AsyncClient:
+        host = (host or "").rstrip("/")
+        if host not in self._clients:
+            self._clients[host] = AsyncClient(host=host, timeout=httpx.Timeout(300.0))
+        return self._clients[host]
 
     async def chat(
         self,
@@ -164,6 +181,8 @@ class OllamaAdapter:
         active_agent: str = "lead",
         priority_tools: list[str] | None = None,
         model: str | None = None,
+        turn_phase: TurnPhase = TurnPhase.EXECUTE,
+        agent_config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         try:
             for injection in ContextRouter.build_injections(
@@ -187,19 +206,30 @@ class OllamaAdapter:
             "num_ctx": self.num_ctx,
             "num_predict": self.num_predict,
         }
+        active_host = self.host
+        if agent_config:
+            exec_model, exec_ctx = model_for_phase(turn_phase, agent_config)
+            active_model = model or exec_model
+            active_host = endpoint_for_phase(turn_phase, agent_config)
+            _options = chat_options_for_phase(turn_phase, agent_config)
+        else:
+            active_model = model or self.model
         if options:
             _options.update(options)
+
+        client = self._client_for(active_host)
 
         anchor = (anchor_query or "").strip() or resolve_anchor_query(messages)
         self.parser.set_user_context(anchor)
         latest_user = anchor
-        active_model = model or self.model
 
         # region agent log
         try:
             from core.debug_log import trace
             trace("agent.OllamaAdapter.chat:request", "llm prompt", {
                 "model": active_model,
+                "host": active_host,
+                "turn_phase": turn_phase.value,
                 "num_messages": len(messages),
                 "anchor": (anchor or "")[:300],
                 "messages": [
@@ -216,7 +246,7 @@ class OllamaAdapter:
         for attempt in range(1, max_retries + 1):
             try:
                 start_t = time.time()
-                response = await self.client.chat(
+                response = await client.chat(
                     model=active_model,
                     messages=messages,
                     tools=tools_schema,
@@ -333,6 +363,7 @@ class ReActAgent:
 
         ollama_cfg = self.config.get("ollama", {})
         self.base_url      = ollama_cfg.get("base_url", "http://localhost:11435")
+        self.ollama_endpoints = endpoints_config(self.config)
         self.default_model = ollama_cfg.get("default_model", "qwen2.5-coder:7b-instruct")
         self.synthesis_model = ollama_cfg.get("synthesis_model") or self.default_model
         self.conversational_model = ollama_cfg.get("conversational_model")
@@ -377,6 +408,9 @@ class ReActAgent:
         self._handoff_brief: str = ""
         self._return_to_lead_when: str = ""
         self._handoff_complete: bool = False
+        self._handoff_tools_used: int = 0
+        handoff_cfg = self.config.get("handoff", {})
+        self.handoff_max_tools = max(1, int(handoff_cfg.get("max_tools_per_delegate", 4)))
         self._mission_running: bool = False
         self._pending_dev_continue: bool = False
         self._last_delegate_brief: str = ""
@@ -412,16 +446,35 @@ class ReActAgent:
         )
         self.mission_evaluator: MissionEvaluator | None = None
         eval_model = ollama_cfg.get("planner_model") or self.conversational_model or self.default_model
+        eval_host = endpoint_for_phase(TurnPhase.EVALUATE, self.config)
         if eval_model:
             self.mission_evaluator = MissionEvaluator(
-                host=self.base_url,
+                host=eval_host,
                 model=eval_model,
                 temperature=self.evaluator_temperature,
             )
 
-        # ── Intent formalization (Phase 1 — shadow mode) ───────────────────
-        # Computes a structured IntentSpec per turn for logging/validation; it
-        # does NOT yet gate routing/planning/completion.
+        planner_cfg = self.config.get("planner", {})
+        planner_model, num_ctx_planner = model_for_phase(TurnPhase.PLAN, self.config)
+        planner_host = endpoint_for_phase(TurnPhase.PLAN, self.config)
+        self.intent_planner: IntentPlanner | None = None
+        if planner_model:
+            try:
+                self.intent_planner = IntentPlanner(
+                    host=planner_host,
+                    model=planner_model,
+                    num_ctx=num_ctx_planner,
+                    temperature=float(planner_cfg.get("temperature", 0.4)),
+                    monologue_max_tokens=int(planner_cfg.get("monologue_max_tokens", 512)),
+                    agent_config=self.config,
+                )
+            except Exception:
+                self.intent_planner = None
+        self._vt_monologue: str = ""
+        self._vt_reformulate_used: bool = False
+
+        # ── Intent formalization ───────────────────────────────────────────
+        # shadow_mode=false: IntentSpec informs planning, bootstrap, and RAG gating.
         intent_cfg = self.config.get("intent", {})
         self.intent_shadow_mode = bool(intent_cfg.get("shadow_mode", True))
         self.intent_use_llm = bool(intent_cfg.get("use_llm", True))
@@ -429,14 +482,16 @@ class ReActAgent:
         self._intent_spec = None
         self._intent_refine_task = None
         intent_model = intent_cfg.get("model") or self.conversational_model
+        intake_host = endpoint_for_phase(TurnPhase.INTAKE, self.config)
         self.intent_formalizer: IntentFormalizer | None = None
         if self.intent_use_llm and intent_model:
             try:
                 self.intent_formalizer = IntentFormalizer(
-                    host=self.base_url,
+                    host=intake_host,
                     model=intent_model,
                     temperature=float(intent_cfg.get("temperature", self.evaluator_temperature)),
                     timeout=float(intent_cfg.get("timeout_sec", 30.0)),
+                    agent_config=self.config,
                 )
             except Exception:
                 self.intent_formalizer = None
@@ -651,6 +706,7 @@ class ReActAgent:
         self._handoff_brief = ""
         self._return_to_lead_when = ""
         self._handoff_complete = False
+        self._handoff_tools_used = 0
         self._stop_tool_batch = False
         self._specialist_block_count = 0
 
@@ -787,7 +843,9 @@ class ReActAgent:
         if not tool_hint and (spec and spec.domain == "web_auth"):
             tool_hint = "http_get"
         from core.task_intent import detect_mission_kind
-        if not tool_hint and detect_mission_kind(getattr(self, "_anchor_query", "") or "") == "dev":
+        if not tool_hint and detect_mission_kind(getattr(self, "_anchor_query", "") or "") in (
+            "dev", "code_build", "hygiene_remediation",
+        ):
             tool_hint = "write_file"
         return specialist_action_nudge(
             self.active_agent,
@@ -899,6 +957,214 @@ class ReActAgent:
                 return "return_pause"
         return None
 
+    def _emit_tool_block(
+        self,
+        tool_name: str,
+        tool_args: dict,
+        block_err: str,
+        step_callback=None,
+        *,
+        register_mission: bool = False,
+    ) -> tuple[bool, int]:
+        """Record a blocked tool call and return (did_execute=False, delta=0)."""
+        if step_callback:
+            step_callback("AGENT_TOOL_CALL", {"tool": tool_name, "args": tool_args})
+            step_callback("AGENT_TOOL_RESULT", {
+                "tool": tool_name,
+                "result": {"success": False, "error": block_err},
+            })
+        self.ctx_manager.add_message({
+            "role": "tool",
+            "name": tool_name,
+            "content": json.dumps({"success": False, "error": block_err}),
+        })
+        if register_mission and self._mission_tracker:
+            self._mission_tracker.register(
+                tool_name, {"success": False, "error": block_err}, False, True
+            )
+        return False, 0
+
+    def _code_build_delegate_brief(self, mission_brief: str) -> str:
+        """Build a workspace brief from IntentSpec deliverables, not PS1 stubs."""
+        spec = getattr(self, "_intent_spec", None)
+        parts: list[str] = []
+        if spec:
+            if spec.deliverables:
+                parts.append("Deliverables: " + ", ".join(spec.deliverables[:6]))
+            elif spec.targets:
+                parts.append("Targets: " + ", ".join(spec.targets[:6]))
+            if spec.objectives:
+                parts.append("Objectives: " + "; ".join(spec.objectives[:3]))
+        detail = ". ".join(parts) if parts else mission_brief.strip()[:300]
+        return (
+            "Implement the user-requested code/files in the declared paths. "
+            f"{detail}"
+        )
+
+    async def _run_vt_planning(self, message: str) -> None:
+        """PLAN phase: VibeThinker monologue + roadmap → validate → TaskPlanTracker."""
+        if not self.intent_planner or not self._intent_spec:
+            return
+        from core.roadmap_validator import validate_roadmap
+
+        planner_cfg = self.config.get("planner", {})
+        max_retries = int(planner_cfg.get("validate_max_retries", 1))
+        rejection = ""
+        steps: list[dict] = []
+
+        for attempt in range(max_retries + 1):
+            if not bool(planner_cfg.get("monologue_enabled", True)):
+                steps = await self.intent_planner.decompose(
+                    self._intent_spec, "", rejection_reason=rejection
+                )
+            else:
+                if attempt == 0 or not self._vt_monologue:
+                    self._vt_monologue = await self.intent_planner.monologue(self._intent_spec)
+                steps = await self.intent_planner.decompose(
+                    self._intent_spec, self._vt_monologue, rejection_reason=rejection
+                )
+            if not steps:
+                break
+            final_steps, rejection = await validate_roadmap(
+                self._intent_spec, steps, self.config
+            )
+            if final_steps:
+                steps = final_steps
+                rejection = ""
+                break
+            if attempt >= max_retries:
+                steps = []
+                break
+
+        if steps:
+            self._task_plan = TaskPlanTracker.from_vt_roadmap(message, steps)
+            try:
+                from core.task_graph import TaskGraph
+                from core.task_scheduler import (
+                    max_parallel_branches,
+                    parallel_branches_enabled,
+                )
+                if parallel_branches_enabled(self.config):
+                    ready = TaskGraph.from_tracker(self._task_plan).ready_steps()
+                    if len(ready) > 1:
+                        cap = max_parallel_branches(self.config)
+                        ids = [s.id for s in ready[:cap]]
+                        self._working_memory.update(
+                            next_action=f"Parallel-ready steps (up to {cap}): {', '.join(ids)}"
+                        )
+            except Exception:
+                pass
+            try:
+                save_plan_state(self.session_id, self._task_plan)
+            except Exception:
+                pass
+
+    async def _mission_evaluate(
+        self,
+        prompt: str,
+        recent_tools: list[str],
+        recent_results: list[str],
+        objective_satisfied: bool,
+    ) -> dict[str, Any]:
+        """Unified evaluation: IntentPlanner when available, else MissionEvaluator."""
+        plan = getattr(self, "_task_plan", None)
+        if self.intent_planner and self._intent_spec:
+            roadmap_status = json.dumps(plan.compact(), ensure_ascii=False)[:1200] if plan else ""
+            exec_result = "\n".join(recent_results[-3:])[:800]
+            try:
+                data = await self.intent_planner.evaluate(
+                    self._intent_spec,
+                    self._vt_monologue,
+                    exec_result,
+                    roadmap_status,
+                )
+                status = str(data.get("status", "continue"))
+                mapped = "complete" if status == "done" else ("stalled" if status == "blocked" else "continue")
+                return {
+                    "status": mapped,
+                    "next_tool": "",
+                    "hint": str(data.get("hint", "")),
+                    "missing": [],
+                }
+            except Exception:
+                pass
+        if self.mission_evaluator:
+            return await self.mission_evaluator.evaluate(
+                prompt, recent_tools, recent_results, objective_satisfied
+            )
+        return {"status": "continue", "next_tool": "", "hint": "", "missing": []}
+
+    def _apply_evaluator_hint(self, plan: TaskPlanTracker | None, eval_data: dict[str, Any]) -> None:
+        """Shared helper: record planner/evaluator hint on the active plan step."""
+        if not plan:
+            return
+        hint = str(eval_data.get("hint", "")).strip()
+        if not hint:
+            return
+        plan.record_strategy(hint)
+        cur = plan.current_step
+        if cur:
+            plan.append_scratchpad(self.session_id, cur.id, hint)
+
+    async def _maybe_evaluate_after_batch(
+        self,
+        prompt: str,
+        tools_executed: list[str],
+        recent_heads: list[str],
+        plan: TaskPlanTracker | None,
+    ) -> None:
+        """Shared post-batch evaluation hook (run_mission + chat_turn)."""
+        if not should_reevaluate("exec_result", self.config):
+            return
+        try:
+            eval_data = await self._mission_evaluate(
+                prompt,
+                tools_executed,
+                recent_heads,
+                plan.all_done if plan else False,
+            )
+            self._apply_evaluator_hint(plan, eval_data)
+        except Exception as e:
+            logger.warning("Evaluator error on exec_result: %s", e)
+
+    async def _vt_reformulate_and_inject(self, failed_content: str) -> bool:
+        """One-shot VT reformulation when the parser finds no tool calls."""
+        if self._vt_reformulate_used or not self.intent_planner:
+            return False
+        from core.intent_salvage import build_vt_reformulation_prompt
+
+        excerpt = json.dumps(tools.TOOLS_SCHEMA[:8], ensure_ascii=False)[:2400]
+        messages = build_vt_reformulation_prompt(
+            failed_content,
+            excerpt,
+            getattr(self, "_anchor_query", "") or "",
+        )
+        try:
+            resp = await self.intent_planner.client.chat(
+                model=self.intent_planner.model,
+                messages=messages,
+                options={
+                    "temperature": self.intent_planner.temperature,
+                    "num_predict": 512,
+                    "num_ctx": self.intent_planner.num_ctx,
+                },
+                stream=False,
+            )
+            reformulated = (resp.message.content or "").strip()
+        except Exception:
+            return False
+        if not reformulated:
+            return False
+        self.ctx_manager.add_message({
+            "role": "user",
+            "content": (
+                "[SYSTEM — VibeThinker reformulation for executor]\n"
+                f"{reformulated[:2000]}"
+            ),
+        })
+        self._vt_reformulate_used = True
+        return True
+
     # ── Tool execution ─────────────────────────────────────────────────────
 
     async def _execute_tool(
@@ -939,25 +1205,28 @@ class ReActAgent:
             if self.active_agent != "lead":
                 block_err = "Blocked: only LEAD may call delegate_to."
             elif self._handoff_complete:
-                block_err = (
-                    "Blocked: specialist just returned. Call append_note to update status, "
-                    "then delegate_to the NEXT sub-task (not the same brief again)."
-                )
+                brief = str((tool_args or {}).get("brief", "")).strip()
+                plan = getattr(self, "_task_plan", None)
+                has_pending = False
+                if plan and plan.steps:
+                    from core.task_plan import StepStatus
+                    has_pending = any(
+                        s.status in (StepStatus.PENDING, StepStatus.IN_PROGRESS)
+                        for s in plan.steps
+                    )
+                brief_changed = bool(brief) and brief != self._last_delegate_brief.strip()
+                if brief_changed or has_pending:
+                    self._handoff_complete = False
+                    block_err = ""
+                else:
+                    block_err = (
+                        "Blocked: specialist just returned. Call append_note to update status, "
+                        "then delegate_to the NEXT sub-task (not the same brief again)."
+                    )
             else:
                 block_err = ""
             if block_err:
-                if step_callback:
-                    step_callback("AGENT_TOOL_CALL", {"tool": tool_name, "args": tool_args})
-                    step_callback("AGENT_TOOL_RESULT", {
-                        "tool": tool_name,
-                        "result": {"success": False, "error": block_err},
-                    })
-                self.ctx_manager.add_message({
-                    "role": "tool",
-                    "name": tool_name,
-                    "content": json.dumps({"success": False, "error": block_err}),
-                })
-                return False, 0
+                return self._emit_tool_block(tool_name, tool_args, block_err, step_callback)
 
         if getattr(self, "_mission_running", False) and self.active_agent == "lead":
             from core.intent_salvage import mission_lead_dev_guard
@@ -970,22 +1239,9 @@ class ReActAgent:
                 last_delegate_brief=getattr(self, "_last_delegate_brief", ""),
             )
             if dev_block:
-                if step_callback:
-                    step_callback("AGENT_TOOL_CALL", {"tool": tool_name, "args": tool_args})
-                    step_callback("AGENT_TOOL_RESULT", {
-                        "tool": tool_name,
-                        "result": {"success": False, "error": dev_block},
-                    })
-                self.ctx_manager.add_message({
-                    "role": "tool",
-                    "name": tool_name,
-                    "content": json.dumps({"success": False, "error": dev_block}),
-                })
-                if self._mission_tracker:
-                    self._mission_tracker.register(
-                        tool_name, {"success": False, "error": dev_block}, False, True
-                    )
-                return False, 0
+                return self._emit_tool_block(
+                    tool_name, tool_args, dev_block, step_callback, register_mission=True
+                )
 
         if self.prompt_pack_mode and specialist_hard_block(self.active_agent, tool_name):
             self._specialist_block_count = getattr(self, "_specialist_block_count", 0) + 1
@@ -1883,6 +2139,7 @@ class ReActAgent:
             self._handoff_brief = str(result.get("handoff_brief", ""))
             self._return_to_lead_when = str(result.get("success_criteria", ""))
             self._handoff_complete = False
+            self._handoff_tools_used = 0
             self._last_delegate_brief = str(tool_args.get("brief", "")) if isinstance(tool_args, dict) else ""
             plan = getattr(self, "_task_plan", None)
             if plan and plan.current_step:
@@ -1907,48 +2164,54 @@ class ReActAgent:
             and tool_allowed(self.active_agent, tool_name)
         ):
             prior_agent = self.active_agent
-            self._handoff_complete = True
-            self.active_agent = "lead"
-            self.active_specialist = "lead"
-            self._specialist_block_count = 0
-            # #region agent log
-            try:
-                from core.debug_log import trace
-                trace(
-                    "agent.py:_execute_tool:handoff_complete",
-                    "specialist auto-return to LEAD",
-                    {
-                        "prior_agent": prior_agent,
-                        "tool_name": tool_name,
-                        "handoff_brief_head": (self._handoff_brief or "")[:200],
-                        "mission_head": (getattr(self, "_anchor_query", "") or "")[:120],
-                    },
-                    run_id="handoff",
-                )
-            except Exception:
-                pass
-            # #endregion
-            plan = getattr(self, "_task_plan", None)
-            if plan and plan.current_step:
+            self._handoff_tools_used += 1
+            if self._handoff_tools_used >= self.handoff_max_tools:
+                self._handoff_complete = True
+                self.active_agent = "lead"
+                self.active_specialist = "lead"
+                self._specialist_block_count = 0
+                # #region agent log
                 try:
-                    from core.task_plan import StepStatus, save_plan_state
-
-                    if plan.current_step.assigned_agent == prior_agent:
-                        plan.current_step.status = StepStatus.DONE
-                    save_plan_state(self.session_id, plan)
+                    from core.debug_log import trace
+                    trace(
+                        "agent.py:_execute_tool:handoff_complete",
+                        "specialist auto-return to LEAD",
+                        {
+                            "prior_agent": prior_agent,
+                            "tool_name": tool_name,
+                            "handoff_tools_used": self._handoff_tools_used,
+                            "handoff_brief_head": (self._handoff_brief or "")[:200],
+                            "mission_head": (getattr(self, "_anchor_query", "") or "")[:120],
+                        },
+                        run_id="handoff",
+                    )
                 except Exception:
                     pass
-            self._refresh_system_prompt()
+                # #endregion
+                plan = getattr(self, "_task_plan", None)
+                if plan and plan.current_step:
+                    try:
+                        from core.task_plan import StepStatus, save_plan_state
 
-            from core.task_intent import detect_mission_kind
-            if (
-                tool_name == "write_file"
-                and detect_mission_kind(getattr(self, "_anchor_query", "") or "") == "dev"
-            ):
-                written = getattr(self, "_mission_tools_executed", []).count("write_file") + 1
-                target = self._dev_script_target(getattr(self, "_anchor_query", "") or "")
-                if written < target:
-                    self._pending_dev_continue = True
+                        if plan.current_step.assigned_agent == prior_agent:
+                            plan.current_step.status = StepStatus.DONE
+                        save_plan_state(self.session_id, plan)
+                    except Exception:
+                        pass
+                self._refresh_system_prompt()
+
+                from core.task_intent import detect_mission_kind
+                if (
+                    tool_name == "write_file"
+                    and detect_mission_kind(getattr(self, "_anchor_query", "") or "")
+                    == "hygiene_remediation"
+                ):
+                    written = getattr(self, "_mission_tools_executed", []).count("write_file") + 1
+                    target = self._dev_script_target(getattr(self, "_anchor_query", "") or "")
+                    if written < target:
+                        self._pending_dev_continue = True
+            else:
+                self._refresh_system_prompt()
 
         elif (
             self.prompt_pack_mode
@@ -2050,6 +2313,9 @@ class ReActAgent:
             })
 
         self._init_turn_state(user_prompt)
+        self._vt_reformulate_used = False
+        await self._compute_intent_spec(user_prompt)
+        await self._run_vt_planning(user_prompt)
         evaluator_nudges = 0
         max_evaluator_nudges = 1
 
@@ -2103,6 +2369,8 @@ class ReActAgent:
                     prompt_pack_mode=self.prompt_pack_mode,
                     active_agent=self.active_agent,
                     priority_tools=self._plan_priority_tools(),
+                    turn_phase=TurnPhase.EXECUTE,
+                    agent_config=self.config,
                 )
             except Exception as e:
                 err = f"Ollama error: {e}"
@@ -2270,7 +2538,7 @@ class ReActAgent:
 
                 if (
                     getattr(self, "_pending_dev_continue", False)
-                    and mission_kind == "dev"
+                    and mission_kind == "hygiene_remediation"
                     and self.active_agent == "lead"
                 ):
                     self._pending_dev_continue = False
@@ -2299,7 +2567,7 @@ class ReActAgent:
 
                 if (
                     not dev_bootstrap_attempted
-                    and mission_kind == "dev"
+                    and mission_kind in ("dev", "code_build", "hygiene_remediation")
                     and self.active_agent == "lead"
                     and "delegate_to" not in self._mission_tools_executed
                     and "write_file" not in self._mission_tools_executed
@@ -2355,24 +2623,15 @@ class ReActAgent:
 
                 plan = getattr(self, "_task_plan", None)
 
-                if batch_executed and self.mission_evaluator and should_reevaluate("exec_result", self.config):
-                    try:
-                        eval_data = await self.mission_evaluator.evaluate(
-                            user_prompt,
-                            self._mission_tools_executed,
-                            recent_result_heads or [
-                                self.ctx_manager.get_messages()[-1].get("content", "")[:240]
-                            ],
-                            plan.all_done if plan else False,
-                        )
-                        hint = str(eval_data.get("hint", "")).strip()
-                        if hint and plan:
-                            plan.record_strategy(hint)
-                            cur = plan.current_step
-                            if cur:
-                                plan.append_scratchpad(self.session_id, cur.id, hint)
-                    except Exception as e:
-                        logger.warning("Evaluator error on exec_result: %s", e)
+                if batch_executed:
+                    await self._maybe_evaluate_after_batch(
+                        user_prompt,
+                        self._mission_tools_executed,
+                        recent_result_heads or [
+                            self.ctx_manager.get_messages()[-1].get("content", "")[:240]
+                        ],
+                        plan,
+                    )
 
                 if plan and plan.steps and plan.needs_readaptation():
                     ask_fn = getattr(self, "ask_user_fn", None) or default_ask_user
@@ -2390,10 +2649,10 @@ class ReActAgent:
                         self._mission_running = False
                         return "[Checkpoint: Paused for user context input.]"
 
-                    if self.mission_evaluator and evaluator_nudges < max_evaluator_nudges:
+                    if (self.intent_planner or self.mission_evaluator) and evaluator_nudges < max_evaluator_nudges:
                         evaluator_nudges += 1
                         try:
-                            eval_data = await self.mission_evaluator.evaluate(
+                            eval_data = await self._mission_evaluate(
                                 user_prompt,
                                 self._mission_tools_executed,
                                 recent_result_heads or [
@@ -2401,12 +2660,7 @@ class ReActAgent:
                                 ],
                                 plan.all_done,
                             )
-                            hint = str(eval_data.get("hint", "")).strip()
-                            if hint:
-                                plan.record_strategy(hint)
-                                cur = plan.current_step
-                                if cur:
-                                    plan.append_scratchpad(self.session_id, cur.id, hint)
+                            self._apply_evaluator_hint(plan, eval_data)
                         except Exception:
                             pass
                     continue
@@ -2428,9 +2682,9 @@ class ReActAgent:
                         return "[Checkpoint: Paused for user context input.]"
 
                     self._add_nudge(self._mission_tracker.stall_directive())
-                    if self.mission_evaluator and MissionEvaluator.should_run(user_prompt):
+                    if (self.intent_planner or self.mission_evaluator) and MissionEvaluator.should_run(user_prompt):
                         try:
-                            eval_data = await self.mission_evaluator.evaluate(
+                            eval_data = await self._mission_evaluate(
                                 user_prompt,
                                 self._mission_tools_executed,
                                 recent_result_heads,
@@ -2489,6 +2743,11 @@ class ReActAgent:
                     except Exception:
                         pass
                     # #endregion
+
+                if not reflection:
+                    if await self._vt_reformulate_and_inject(content):
+                        consecutive_empty = 0
+                        continue
 
                 if reflection:
                     consecutive_empty = 0
@@ -2624,21 +2883,6 @@ class ReActAgent:
         self._log_intent_spec(message, self._intent_spec)
         try:
             save_intent_spec(self.session_id, self._intent_spec)
-        except Exception:
-            pass
-
-    async def _refine_intent_spec_bg(self, message: str) -> None:
-        """Background LLM refinement of the intent spec (best-effort)."""
-        try:
-            refined = await self.intent_formalizer.formalize(message)
-        except Exception:
-            return
-        if refined is None or refined.source == "fallback":
-            return
-        self._intent_spec = refined
-        self._log_intent_spec(message, refined)
-        try:
-            save_intent_spec(self.session_id, refined)
         except Exception:
             pass
 
@@ -2814,6 +3058,8 @@ class ReActAgent:
         self._last_pcap_summary: str | None = None
         self._pcap_objective_met: bool = False
         self._init_turn_state(message)
+        self._vt_reformulate_used = False
+        await self._run_vt_planning(message)
         self._rehydrate_credential_pairs()
         self._reset_orphan_specialist(when="chat_turn_start")
 
@@ -2892,6 +3138,8 @@ class ReActAgent:
                 prompt_pack_mode=self.prompt_pack_mode,
                 active_agent=self.active_agent,
                 priority_tools=self._plan_priority_tools(),
+                turn_phase=TurnPhase.EXECUTE,
+                agent_config=self.config,
             )
 
             msg     = response.get("message", {})
@@ -3117,22 +3365,13 @@ class ReActAgent:
                         self._chat_tools_executed = list(tools_executed_names)
                         continue
 
-                if batch_executed and self.mission_evaluator and should_reevaluate("exec_result", self.config):
-                    try:
-                        eval_data = await self.mission_evaluator.evaluate(
-                            message,
-                            tools_executed_names,
-                            [self.ctx_manager.get_messages()[-1].get("content", "")[:240]],
-                            self._task_plan.all_done if self._task_plan else False,
-                        )
-                        hint = str(eval_data.get("hint", "")).strip()
-                        if hint and self._task_plan:
-                            self._task_plan.record_strategy(hint)
-                            cur = self._task_plan.current_step
-                            if cur:
-                                self._task_plan.append_scratchpad(self.session_id, cur.id, hint)
-                    except Exception as e:
-                        logger.warning("Evaluator error on exec_result: %s", e)
+                if batch_executed:
+                    await self._maybe_evaluate_after_batch(
+                        message,
+                        tools_executed_names,
+                        [self.ctx_manager.get_messages()[-1].get("content", "")[:240]],
+                        self._task_plan,
+                    )
 
                 if self._task_plan.steps and self._task_plan.needs_readaptation():
                     ask_fn = getattr(self, "ask_user_fn", None) or default_ask_user
@@ -3146,21 +3385,16 @@ class ReActAgent:
                     elif decision == CheckpointDecision.CHANGE_CONTEXT:
                         return "[Checkpoint: Paused for user context input.]"
 
-                    if self.mission_evaluator and evaluator_nudges < max_evaluator_nudges:
+                    if (self.intent_planner or self.mission_evaluator) and evaluator_nudges < max_evaluator_nudges:
                         evaluator_nudges += 1
                         try:
-                            eval_data = await self.mission_evaluator.evaluate(
+                            eval_data = await self._mission_evaluate(
                                 message,
                                 tools_executed_names,
                                 [self.ctx_manager.get_messages()[-1].get("content", "")[:240]],
                                 self._task_plan.all_done,
                             )
-                            hint = str(eval_data.get("hint", "")).strip()
-                            if hint:
-                                self._task_plan.record_strategy(hint)
-                                cur = self._task_plan.current_step
-                                if cur:
-                                    self._task_plan.append_scratchpad(self.session_id, cur.id, hint)
+                            self._apply_evaluator_hint(self._task_plan, eval_data)
                         except Exception:
                             pass
                     continue
@@ -3178,20 +3412,15 @@ class ReActAgent:
                         return "[Checkpoint: Paused for user context input.]"
 
                     self._add_nudge(self._mission_tracker.stall_directive())
-                    if self.mission_evaluator and MissionEvaluator.should_run(message):
+                    if (self.intent_planner or self.mission_evaluator) and MissionEvaluator.should_run(message):
                         try:
-                            eval_data = await self.mission_evaluator.evaluate(
+                            eval_data = await self._mission_evaluate(
                                 message,
                                 tools_executed_names,
                                 [self.ctx_manager.get_messages()[-1].get("content", "")[:240]],
                                 self._task_plan.all_done if self._task_plan else False,
                             )
-                            hint = str(eval_data.get("hint", "")).strip()
-                            if hint and self._task_plan:
-                                self._task_plan.record_strategy(hint)
-                                cur = self._task_plan.current_step
-                                if cur:
-                                    self._task_plan.append_scratchpad(self.session_id, cur.id, hint)
+                            self._apply_evaluator_hint(self._task_plan, eval_data)
                         except Exception:
                             pass
                     continue
@@ -3420,6 +3649,10 @@ class ReActAgent:
                 if reflection and chat_goals and chat_goals.is_pcap_goal():
                     if rname == "sequentialthinking" and consecutive_no_tool >= 3:
                         reflection = None
+                if not reflection:
+                    if await self._vt_reformulate_and_inject(content):
+                        consecutive_no_tool = 0
+                        continue
                 if reflection:
                     # Ensure the LLM sees its own faked tool call
                     last_msg = self.ctx_manager.get_messages()[-1]
@@ -3923,8 +4156,38 @@ class ReActAgent:
         tools_called: set,
         step_callback=None,
     ) -> list[str]:
-        """Auto-delegate dev/script missions when LEAD stalls on planning tools."""
-        return await self._bootstrap_dev_next_script(1, brief, tools_called, step_callback)
+        """Auto-delegate when LEAD stalls — code_build uses IntentSpec paths."""
+        from core.task_intent import detect_mission_kind
+
+        kind = detect_mission_kind(brief)
+        if kind == "hygiene_remediation":
+            return await self._bootstrap_dev_next_script(1, brief, tools_called, step_callback)
+        return await self._bootstrap_code_build_mission(brief, tools_called, step_callback)
+
+    async def _bootstrap_code_build_mission(
+        self,
+        mission_brief: str,
+        tools_called: set,
+        step_callback=None,
+    ) -> list[str]:
+        """Delegate workspace to create user-requested deliverables (not toolN.ps1)."""
+        executed: list[str] = []
+        brief = self._code_build_delegate_brief(mission_brief)
+        spec = getattr(self, "_intent_spec", None)
+        criteria = "All declared deliverables exist on disk."
+        if spec and spec.deliverables:
+            criteria = f"Files exist: {', '.join(spec.deliverables[:4])}"
+        args = {
+            "agent": "workspace",
+            "brief": brief,
+            "success_criteria": criteria,
+        }
+        if step_callback:
+            step_callback("AGENT_TOOL_CALL", {"tool": "delegate_to", "args": args})
+        did, _ = await self._execute_tool("delegate_to", args, tools_called, step_callback)
+        if did:
+            executed.append("delegate_to")
+        return executed
 
     async def _bootstrap_dev_next_script(
         self,
@@ -3973,7 +4236,8 @@ class ReActAgent:
             if agent == "workspace":
                 from core.task_intent import detect_mission_kind
                 anchor = getattr(self, "_anchor_query", "") or ""
-                if detect_mission_kind(anchor) == "dev":
+                kind = detect_mission_kind(anchor)
+                if kind == "hygiene_remediation":
                     script_num = getattr(self, "_mission_tools_executed", []).count("write_file") + 1
                     path = f"workspace/scripts/tool{script_num}.ps1"
                     content = (
@@ -3984,6 +4248,25 @@ class ReActAgent:
                         step_callback("AGENT_TOOL_CALL", {"tool": "write_file", "args": {"path": path}})
                     did, _ = await self._execute_tool(
                         "write_file", {"path": path, "content": content}, tools_called, step_callback
+                    )
+                    if did:
+                        executed.append("write_file")
+                    return executed
+                if kind in ("dev", "code_build"):
+                    rel_path = ""
+                    if spec and spec.deliverables:
+                        py_paths = [d for d in spec.deliverables if d.lower().endswith(".py")]
+                        rel_path = py_paths[0] if py_paths else spec.deliverables[0]
+                    elif spec and spec.targets:
+                        rel_path = spec.targets[0]
+                    if not rel_path:
+                        m = re.search(r"([\w./\\-]+\.(?:py|md|txt|ps1))", anchor, re.I)
+                        rel_path = m.group(1).replace("\\", "/") if m else "workspace/deliverable.py"
+                    content = f"# {rel_path} — {anchor[:120]}\n# TODO: implement user request\n"
+                    if step_callback:
+                        step_callback("AGENT_TOOL_CALL", {"tool": "write_file", "args": {"path": rel_path}})
+                    did, _ = await self._execute_tool(
+                        "write_file", {"path": rel_path, "content": content}, tools_called, step_callback
                     )
                     if did:
                         executed.append("write_file")

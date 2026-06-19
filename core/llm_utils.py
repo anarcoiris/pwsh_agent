@@ -490,7 +490,7 @@ class DynamicContextBuilder:
             )
 
         # Development / file tasks — override default recon bias
-        if kind == "dev":
+        if kind in ("dev", "code_build", "hygiene_remediation"):
             return (
                 "\n[CURRENT PHASE: DEVELOPMENT / FILE TASK]\n"
                 "The user wants coding, reading, or writing files — NOT network recon.\n"

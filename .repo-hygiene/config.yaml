@@ -14,6 +14,10 @@ meta:
   max_tokens_per_task: 8192
   dry_run: false                        # true → solo informes, sin commits/PRs
 
+# Ventana de contexto Ollama compartida (orchestrator). Tags: Ollama/docker/models/registry.yaml
+ollama:
+  num_ctx: 8192
+
 # ── CONTROL DE COSTES ────────────────────────────────────────
 budget:
   monthly_usd_limit: 50
@@ -60,8 +64,8 @@ tasks:
       Detecta archivos, funciones, clases e imports que no están
       referenciados por ningún otro módulo del proyecto.
     scope:
-      include: ["*.py", "core/**/*.py", "tools/**/*.py"]
-      exclude: ["**/test_*.py", "**/test/**/*.py", "**/fixtures/**"]
+      include: ["src/**", "lib/**", "app/**"]
+      exclude: ["**/*.test.*", "**/*.spec.*", "**/fixtures/**", "dist/**", "build/**"]
     output:
       report: dead_code_report.md
       data: dead_code.json
@@ -97,8 +101,8 @@ tasks:
       Revisa TODOs, FIXMEs, código comentado y analiza su antigüedad
       estimada. Prioriza según impacto y esfuerzo.
     scope:
-      include: ["*.py", "core/**/*.py", "tools/**/*.py", "scripts/**/*.py", "scripts/**/*.ps1"]
-      exclude: ["dist/**", "build/**", "node_modules/**", ".venv/**", ".repo-hygiene/**"]
+      include: ["src/**", "lib/**", "app/**", "scripts/**"]
+      exclude: ["dist/**", "build/**", "node_modules/**", ".venv/**"]
     output:
       report: issue_triage.md
       data: issue_triage.json
@@ -114,7 +118,8 @@ tasks:
       Verifica coherencia entre código y docs: ejemplos rotos,
       APIs documentadas que ya no existen, secciones huérfanas.
     scope:
-      include: ["*.md", "docs/**/*.md", "*.py", "core/**/*.py", "tools/**/*.py"]
+      include: ["README.md", "docs/**", "*.md", "src/**/*.ts",
+                "src/**/*.py", "src/**/*.js"]
     output:
       report: documentation_health.md
       data: documentation_health.json
@@ -130,7 +135,7 @@ tasks:
       Identifica módulos críticos sin tests, tests que no cubren
       paths de error, y fixtures obsoletos.
     scope:
-      include: ["*.py", "core/**/*.py", "tools/**/*.py", "tests/**/*.py", "**/test_*.py"]
+      include: ["src/**", "tests/**", "**/*.test.*", "**/*.spec.*"]
     output:
       report: test_gaps.md
       data: test_gaps.json
@@ -147,7 +152,7 @@ tasks:
       Detecta módulos duplicados, acoplamiento excesivo,
       inconsistencias en APIs internas y deuda técnica estructural.
     scope:
-      include: ["*.py", "core/**/*.py", "tools/**/*.py", "docs/**/*.md"]
+      include: ["src/**", "lib/**", "docs/architecture/**"]
     output:
       report: architecture_review.md
       data: architecture_review.json
@@ -163,9 +168,9 @@ tasks:
       Análisis profundo: secrets hardcodeados, configuraciones
       inseguras, dependencias con CVEs, permisos excesivos.
     scope:
-      include: ["**/*.env*", "**/*.config.*", "*.py", "core/**/*.py", "tools/**/*.py",
+      include: ["**/*.env*", "**/*.config.*", "src/**",
                 "scripts/**", "Dockerfile*", ".github/**"]
-      exclude: ["**/*.env.example", "node_modules/**", ".repo-hygiene/**"]
+      exclude: ["**/*.env.example", "node_modules/**"]
     output:
       report: security_posture.md
       data: security_posture.json
@@ -188,3 +193,90 @@ tasks:
       data: docs_full_audit.json
     actions:
       open_issue_if: P2_or_above
+
+# ── CONFIGURACIÓN DEL HUB SCANNER (CENTRALIZADO) ──────────────
+hub:
+  scan_root: ".."                      # Directorio superior por defecto
+  exclude_dirs:
+    - "Archive_Legacy"
+    - "Libraries"
+    - "Santi"
+    - ".reports"
+  sensitive_path_patterns:
+    - 'C:\\Users\\soyko'
+    - 'c:\\Users\\soyko'
+  heavyweight_packages:
+    - "torch"
+    - "tensorflow"
+    - "TTS"
+    - "onnxruntime"
+    - "sentence-transformers"
+  caddy_hub_path: "../caddy-hub"
+
+# ── CONFIGURACIÓN DEL REVISOR DE IA Y DAEMON ──────────────────
+ai_review:
+  ollama_url: "http://localhost:11435"   # default / coder endpoint
+  pipeline: dual
+  unload_after_call: false               # false while models pinned (multi-GPU or concurrency)
+
+  # Multi-GPU endpoints (docker-compose.multi-gpu.yml); omit to use ollama_url for both
+  planner_ollama_url: "http://localhost:11434"
+  coder_ollama_url: "http://localhost:11435"
+
+  # Parallel Phase-1 clusters — must match ollama-code OLLAMA_NUM_PARALLEL (registry.yaml)
+  concurrency:
+    enabled: true
+    max_workers: 3
+    ollama_num_parallel: 3
+
+  # Planificador: routing + síntesis (contexto amplio, modelo pequeño)
+  planner:
+    model: "vibethinker:3b"              # canonical tag; see Ollama/docker/models/registry.yaml
+    ollama_url: "http://localhost:11434" # ollama-planner container (multi-GPU)
+    num_ctx: 16384
+    reserve_output_tokens: 3072
+    max_context_chars: 28000
+    temperature: 0.3
+
+  # Coder: análisis profundo por cluster (especializado en código)
+  coder:
+    model: "qwen2.5-coder:7b-instruct"
+    ollama_url: "http://localhost:11435" # ollama-coder container (multi-GPU)
+    num_ctx: 8192
+    reserve_output_tokens: 2048
+    max_context_chars: 12000
+    temperature: 0.1
+
+  # Fallback legacy (pipeline: coder_only)
+  model: "qwen2.5-coder:7b-instruct"
+  num_ctx: 8192
+  reserve_output_tokens: 2048
+  max_context_chars: 12000
+  max_file_size_kb: 100
+  exclude_patterns:
+    - "*.json"
+    - "*.log"
+    - ".git/*"
+    - "node_modules/*"
+    - ".venv/*"
+    - "venv/*"
+    - "__pycache__/*"
+    - "lightning_logs/*"
+    - "*logs/*"
+    - "*cache/*"
+    - "*checkpoints/*"
+    - "*trained_models/*"
+    - "artifacts/*"
+    - "data/*"
+
+daemon:
+  idle_threshold_seconds: 900           # 15 minutos de inactividad
+  poll_interval_seconds: 15
+  night_start_hour: 4                   # 4:00 AM
+  night_end_hour: 9                     # 9:00 AM
+
+# ── FEED NEUTRO (pwsh_agent hygiene_eyes) ─────────────────────
+feed:
+  dir: "C:/Users/soyko/Documents/Libraries/hygiene-feed"
+  export_on_complete: true
+

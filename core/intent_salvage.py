@@ -217,7 +217,7 @@ def mission_lead_dev_guard(
         return None
     from core.task_intent import detect_mission_kind
 
-    if detect_mission_kind(anchor_query) != "dev":
+    if detect_mission_kind(anchor_query) != "hygiene_remediation":
         return None
 
     done = list(tools_executed or [])

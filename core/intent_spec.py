@@ -8,10 +8,8 @@ Two-stage LLM pipeline:
     JSON-structured output. chat-analyzer (7B) handles this well.
 
   Stage 2 — PLAN (IntentPlanner, vibethinker):
-    Given the IntentSpec, VibeThinker emits a first-person reasoning monologue
-    (internalising the problem), then produces a structured JSON roadmap of
-    TaskStep-compatible dicts. The monologue is persisted for downstream
-    evaluation calls.
+    Wired in ReActAgent._run_vt_planning() after INTAKE. Produces monologue +
+    JSON roadmap consumed by TaskPlanTracker.from_vt_roadmap().
 
 Design invariants:
 - The deterministic regex fallback (build_fallback_spec) always produces a
@@ -246,7 +244,7 @@ def _detect_domain(message: str) -> str:
 
     if mission == "file_find":
         return "file_ops"
-    if mission == "dev":
+    if mission in ("dev", "code_build"):
         return "code_build"
     if mission == "recon":
         return "recon"
@@ -477,7 +475,14 @@ _SCHEMA_PROMPT = (
 class IntentFormalizer:
     """Optional LLM-backed formalizer. Mirrors MissionEvaluator's lightweight call."""
 
-    def __init__(self, host: str, model: str, temperature: float = 0.1, timeout: float = 60.0):
+    def __init__(
+        self,
+        host: str,
+        model: str,
+        temperature: float = 0.1,
+        timeout: float = 60.0,
+        agent_config: dict[str, Any] | None = None,
+    ):
         # Imported lazily so the module is importable without ollama installed
         # (the fallback path needs no LLM and is used by tests).
         import httpx
@@ -486,10 +491,13 @@ class IntentFormalizer:
         self.host = host
         self.model = model
         self.temperature = temperature
+        self.agent_config = agent_config or {}
         self.client = AsyncClient(host=host, timeout=httpx.Timeout(timeout))
 
     async def formalize(self, message: str) -> IntentSpec:
         """Return a merged IntentSpec; never raises (falls back on any error)."""
+        from core.model_dispatch import TurnPhase, chat_options_for_phase
+
         fallback = build_fallback_spec(message)
         import time
         try:
@@ -498,10 +506,12 @@ class IntentFormalizer:
                 {"role": "system", "content": _SCHEMA_PROMPT},
                 {"role": "user", "content": (message or "").strip()[:2000]},
             ]
+            opts = chat_options_for_phase(TurnPhase.INTAKE, self.agent_config)
+            opts["num_predict"] = 768
             resp = await self.client.chat(
                 model=self.model,
                 messages=messages,
-                options={"temperature": self.temperature, "num_predict": 768},
+                options=opts,
                 format="json",
                 stream=False,
             )
@@ -621,7 +631,7 @@ class IntentPlanner:
 
     def __init__(self, host: str, model: str, num_ctx: int = 16384,
                  temperature: float = 0.4, monologue_max_tokens: int = 512,
-                 timeout: float = 90.0):
+                 timeout: float = 90.0, agent_config: dict[str, Any] | None = None):
         import httpx
         from ollama import AsyncClient
 
@@ -630,28 +640,22 @@ class IntentPlanner:
         self.num_ctx = num_ctx
         self.temperature = temperature
         self.monologue_max_tokens = monologue_max_tokens
+        self.agent_config = agent_config or {}
         self.client = AsyncClient(host=host, timeout=httpx.Timeout(timeout))
 
     async def monologue(self, spec: IntentSpec, *, prior: str = "",
                         exec_result: str = "") -> str:
-        """Emit a first-person reasoning monologue about the mission.
-
-        VibeThinker thinks out loud: what is the real goal, what are the risks,
-        what could go wrong, what is the best sequence of actions.
-        Returns the raw monologue text. Never raises — returns empty on error.
-        """
-        from core.model_dispatch import build_monologue_messages
+        """Emit a first-person reasoning monologue about the mission."""
+        from core.model_dispatch import TurnPhase, build_monologue_messages, chat_options_for_phase
         messages = build_monologue_messages(spec, prior_monologue=prior,
                                            exec_result=exec_result)
         try:
+            opts = chat_options_for_phase(TurnPhase.PLAN, self.agent_config)
+            opts["num_predict"] = self.monologue_max_tokens
             resp = await self.client.chat(
                 model=self.model,
                 messages=messages,
-                options={
-                    "temperature": self.temperature,
-                    "num_predict": self.monologue_max_tokens,
-                    "num_ctx": self.num_ctx,
-                },
+                options=opts,
                 stream=False,
             )
             return (resp.message.content or "").strip()
@@ -659,24 +663,21 @@ class IntentPlanner:
             return ""
 
     async def decompose(self, spec: IntentSpec,
-                        monologue: str = "") -> list[dict]:
-        """Decompose an IntentSpec into a structured roadmap.
-
-        Returns a list of step-dicts compatible with TaskPlanTracker:
-          [{id, label, tool_hint, assigned_agent, success_criteria, rationale}, ...]
-        Falls back to [] on any error (caller uses regex fallback).
-        """
-        from core.model_dispatch import build_roadmap_messages
-        messages = build_roadmap_messages(spec, monologue)
+                        monologue: str = "",
+                        *,
+                        rejection_reason: str = "") -> list[dict]:
+        """Decompose an IntentSpec into a structured roadmap."""
+        from core.model_dispatch import TurnPhase, build_roadmap_messages, chat_options_for_phase
+        messages = build_roadmap_messages(
+            spec, monologue, rejection_reason=rejection_reason
+        )
         try:
+            opts = chat_options_for_phase(TurnPhase.PLAN, self.agent_config)
+            opts["num_predict"] = 1024
             resp = await self.client.chat(
                 model=self.model,
                 messages=messages,
-                options={
-                    "temperature": self.temperature,
-                    "num_predict": 1024,
-                    "num_ctx": self.num_ctx,
-                },
+                options=opts,
                 format="json",
                 stream=False,
             )
@@ -713,7 +714,7 @@ class IntentPlanner:
           {status: continue|done|blocked|needs_user,
            next_step_id: str|None, hint: str, monologue: str}
         """
-        from core.model_dispatch import build_evaluation_messages
+        from core.model_dispatch import TurnPhase, build_evaluation_messages, chat_options_for_phase
         messages = build_evaluation_messages(spec, monologue, exec_result,
                                             roadmap_status)
         _fallback = {
@@ -723,14 +724,12 @@ class IntentPlanner:
             "monologue": "",
         }
         try:
+            opts = chat_options_for_phase(TurnPhase.EVALUATE, self.agent_config)
+            opts["num_predict"] = 512
             resp = await self.client.chat(
                 model=self.model,
                 messages=messages,
-                options={
-                    "temperature": self.temperature,
-                    "num_predict": 512,
-                    "num_ctx": self.num_ctx,
-                },
+                options=opts,
                 format="json",
                 stream=False,
             )

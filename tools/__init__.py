@@ -51,6 +51,7 @@ from tools.intel import (
     report_generate,
 )
 from tools.hygiene import hygiene_lookup
+from tools.editorial import editorial_lookup
 
 # ── Extend TOOLS_SCHEMA with new tool definitions ───────────────────────────
 TOOLS_SCHEMA += [
@@ -303,6 +304,22 @@ TOOLS_SCHEMA += [
     {
         "type": "function",
         "function": {
+            "name": "editorial_lookup",
+            "description": "Search the editorial feed for triage/proposal findings (G1, M2, etc.). Returns compact excerpts.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Free-text search across titles and actions."},
+                    "finding_id": {"type": "string", "description": "Exact issue id (e.g. G1)."},
+                    "project_slug": {"type": "string", "description": "Filter by project slug."},
+                    "max_results": {"type": "integer", "description": "Max results (default 5)."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "delegate_to",
             "description": "Hand off to a specialist agent (LEAD only). Required before any non-LEAD tool runs.",
             "parameters": {
@@ -337,5 +354,6 @@ __all__ = [
     "encode_decode", "hash_identify",
     "finding_create", "finding_list", "report_generate",
     "hygiene_lookup",
+    "editorial_lookup",
     "TOOLS_SCHEMA",
 ]

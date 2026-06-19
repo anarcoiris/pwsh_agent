@@ -291,7 +291,11 @@ def invoke_agent(system_prompt: str, user_message: str,
 
     elif provider == "ollama":
         import requests
-        ollama_host = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+        ollama_host = os.environ.get("OLLAMA_HOST", "http://localhost:11435")
+        num_ctx = int(
+            os.environ.get("OLLAMA_NUM_CTX")
+            or config.get("ollama", {}).get("num_ctx", 8192)
+        )
         url = f"{ollama_host.rstrip('/')}/v1/chat/completions"
         headers = {"Content-Type": "application/json"}
         payload = {
@@ -301,7 +305,8 @@ def invoke_agent(system_prompt: str, user_message: str,
                 {"role": "user", "content": user_message}
             ],
             "max_tokens": max_tokens,
-            "temperature": 0.2
+            "temperature": 0.2,
+            "options": {"num_ctx": num_ctx},
         }
         res = requests.post(url, headers=headers, json=payload)
         res.raise_for_status()
@@ -668,6 +673,10 @@ def main() -> None:
         "--dry-run", action="store_true",
         help="No crear issues ni PRs, solo generar informes"
     )
+    parser.add_argument(
+        "--export-feed", action="store_true",
+        help="Exportar hallazgos al feed neutro para pwsh_agent tras completar"
+    )
     args = parser.parse_args()
 
     config = load_config()
@@ -732,6 +741,14 @@ def main() -> None:
         for tid, msg in errors:
             print(f"  ✗ {tid}: {msg}", file=sys.stderr)
         sys.exit(1)
+
+    if args.export_feed or config.get("feed", {}).get("export_on_complete", False):
+        try:
+            sys.path.insert(0, str(HYGIENE_DIR / "scripts"))
+            from export_feed import maybe_export_after_run
+            maybe_export_after_run(REPO_ROOT)
+        except Exception as exc:
+            print(f"[WARN] Feed export failed: {exc}", file=sys.stderr)
 
 
 if __name__ == "__main__":

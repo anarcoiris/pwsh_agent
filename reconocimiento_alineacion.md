@@ -1,16 +1,19 @@
 # Reconocimiento de Alineación del Ecosistema — Análisis Crítico
 
+> **Actualizado 2026-06-19:** Pipeline 5 fases activo en pwsh_agent (`intent.shadow_mode: false`). Multi-GPU vía `docker-compose.multi-gpu.yml` (intake `:11436`, planner `:11434`, coder `:11435`). VT planifica; Coder valida JSON (`core/roadmap_validator.py`). Protocolo canónico: `exploration-kernel/protocols/COOPERATION_AGENT.md`.
+
 ## 1. Infraestructura de Modelos Compartida
 
-Todos los sistemas apuntan a `http://localhost:11435` (contenedor `ollama-code`), con un solo Docker Compose y un [registry.yaml](file:///c:/Users/soyko/Documents/Ollama/docker/models/registry.yaml) como fuente canónica de tags y contextos.
+**Modo multi-GPU (objetivo):** tres contenedores Ollama, volumen compartido, sin unload. **Modo legacy:** un solo `ollama-code` @ `:11435`.
 
-| Modelo | num_ctx | Rol actual | Consumidores |
-|--------|---------|------------|--------------|
-| `qwen2.5-coder:7b-instruct` | 8192 | Codificación, herramientas, análisis profundo | pwsh_agent, repo-hygiene coder |
-| `vibethinker:3b` | 16384 | Planificación, routing, síntesis | repo-hygiene planner **solo** |
-| `chat-analyzer` | 8192 | Formalización de intención, conversación corta | pwsh_agent conversacional |
-| `qwen2.5:7b-16k` | 16384 | Prosa larga, narrativa | Editorial, Hestia |
-| `qwen2.5:3b` | 8192 | Auxiliar ligero | Benchmarks pwsh_agent |
+[registry.yaml](file:///c:/Users/soyko/Documents/Ollama/docker/models/registry.yaml) define tags, endpoints y consumidores.
+
+| Modelo | num_ctx | Rol | Endpoint | Consumidores |
+|--------|---------|-----|----------|--------------|
+| `chat-analyzer` | 8192 | INTAKE / IntentSpec | `:11436` | pwsh_agent |
+| `vibethinker:3b` | 16384 | PLAN + EVALUATE | `:11434` | pwsh_agent, repo-hygiene planner |
+| `qwen2.5-coder:7b-instruct` | 8192 | VALIDATE + EXECUTE + hygiene coder | `:11435` | pwsh_agent, repo-hygiene |
+| `qwen2.5:7b-16k` | 16384 | Prosa larga | `:11435` | Editorial, Hestia |
 
 ---
 
@@ -23,7 +26,7 @@ Todos los sistemas apuntan a `http://localhost:11435` (contenedor `ollama-code`)
 
 | Capa | Archivo | ¿Usa LLM? | Qué hace |
 |------|---------|------------|----------|
-| **IntentSpec** | [intent_spec.py](file:///c:/Users/soyko/Documents/Libraries/pwsh_agent/core/intent_spec.py) | Opcional (`chat-analyzer`) | Formaliza dominio, objetivos, targets, safety, capabilities. Shadow mode: se computa pero no gatilla routing todavía. |
+| **IntentSpec** | [intent_spec.py](file:///c:/Users/soyko/Documents/Libraries/pwsh_agent/core/intent_spec.py) | Sí (`chat-analyzer` @ intake) | Formaliza dominio, objetivos, targets. **shadow_mode=false** — gobierna routing y planificación. |
 | **TaskPlanTracker** | [task_plan.py](file:///c:/Users/soyko/Documents/Libraries/pwsh_agent/core/task_plan.py) | No | Roadmap de pasos atómicos con estados (PENDING→DONE→FAILED→BLOCKED), readaptación, trial-and-error cap (8 intentos). |
 | **ChatGoals** | [chat_goals.py](file:///c:/Users/soyko/Documents/Libraries/pwsh_agent/core/chat_goals.py) | No | Goals registrados por regex: bloquean herramientas incorrectas, fuerzan secuencias, nudge text. |
 | **MissionProgressTracker** | [mission_progress.py](file:///c:/Users/soyko/Documents/Libraries/pwsh_agent/core/mission_progress.py) | No | Anti-stall: detecta streaks no-sustantivos, objective_satisfied(), stall_directive(). |
