@@ -21,13 +21,15 @@
 
 **Implicación crítica del hardware:** La ausencia de NVLink hace que el *model parallelism* sea impracticable. El patrón correcto es **paralelismo de especialización**: un modelo completo por GPU, sin tensor-split.
 
-**Asignación multi-GPU (Escenario 1 actualizado):**
+**Asignación multi-GPU (R1c v2 — coder en 1080):**
 
 | GPU | Modelo | Rol | Endpoint |
 |---|---|---|---|
-| GTX 1070 #1 | chat-analyzer | INTAKE | `:11436` |
-| GTX 1080 | vibethinker:3b | PLAN + EVALUATE | `:11434` |
-| GTX 1070 #2 | qwen2.5-coder:7b | VALIDATE + EXECUTE | `:11435` |
+| GTX 1070 #2 | chat-analyzer | INTAKE | `:11435` |
+| GTX 1070 #1 | vibethinker:3b | PLAN + EVALUATE | `:11434` |
+| GTX 1080 | qwen2.5-coder:7b | VALIDATE + EXECUTE | `:11436` |
+
+> Plan: [plans/gpu_allocation_plan.md](plans/gpu_allocation_plan.md). Infra: `C:\Users\soyko\Documents\Ollama\docker\`.
 
 RAG, FAISS, embeddings y FSM del orquestador viven en **CPU** (Fase 1).
 
@@ -389,6 +391,8 @@ Efecto: reduce el KV cache a ~25% del tamaño FP16. Para Qwen2.5-7B con GQA:
 | 65,536 tokens | ~3,584 MB | ~896 MB |
 
 Un contexto de 32k tokens en Q4_0 cuesta lo mismo en VRAM que FP16 a 8k. Pérdida de precisión marginal en contextos muy largos.
+
+> **2026-06-19:** `OLLAMA_KV_CACHE_TYPE=q4_0` confirmado en los 3 contenedores multi-GPU (`probe-kv-env.ps1`). Caps empíricos en `Ollama/docker/logs/vram-probe-20260619.json`: planner 32k aplicado; coder 8k (re-probe 16k pendiente sin carga concurrente).
 
 ### Opción B: Layer split desequilibrado (llama.cpp)
 

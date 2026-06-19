@@ -523,6 +523,8 @@ class ReActAgent:
         self._mission_goals: ChatGoals | None = None
         self._mission_tools_executed: list[str] = []
         self._mission_tracker: MissionProgressTracker | None = None
+        self._active_queue_job_id: str | None = None
+        self._mvf_payload_override: dict | None = None
         self._pending_script_failure: dict[str, Any] | None = None
         self._last_script_path: str | None = None
         self._chat_tool_events: list[dict[str, Any]] = []
@@ -789,6 +791,32 @@ class ReActAgent:
         self._checkpoint_gate = CheckpointGate(self.session_id, self.config)
         self._init_system_prompt()
         return self.session_id
+
+    def begin_queue_job_session(self, job_id: str) -> str:
+        """Bind to an isolated per-job session for queue/daemon missions."""
+        self.ctx_manager.save_state()
+        session_id = f"q_{job_id}"
+        self.session_id = session_id
+        self.session_note_paths = ensure_session_layout(session_id)
+        self.ctx_manager = AgentContextManager(
+            mode="autonomous",
+            session_id=session_id,
+            max_total_context=self.max_total_messages,
+            max_context_chars=self.max_context_chars,
+            max_tool_result_chars=self.max_tool_result_chars,
+            max_context_tokens=self.max_context_tokens,
+            reserve_generation_tokens=self.reserve_generation_tokens,
+            reserve_injection_tokens=self.reserve_injection_tokens,
+        )
+        self._anchor_query = ""
+        self.thinking_engine.reset()
+        self.retry_orchestrator.reset()
+        self._selected_prior_session = None
+        self._unlocked_sessions = set()
+        self._reset_handoff_state()
+        self._checkpoint_gate = CheckpointGate(self.session_id, self.config)
+        self._init_system_prompt()
+        return session_id
 
     def request_cancel(self):
         """Signal the running mission to stop after the current step."""
@@ -1186,6 +1214,24 @@ class ReActAgent:
         # Normalise args
         tool_args = ArgumentNormalizer.normalize(tool_name, tool_args)
         tool_args = self._correct_web_target_arg(tool_name, tool_args)
+
+        if tool_name == "host_exec" and getattr(self, "_mission_running", False):
+            from core.task_intent import detect_mission_kind
+            if detect_mission_kind(anchor := getattr(self, "_anchor_query", "") or "") == "code_build":
+                cmd = str(tool_args.get("command", ""))
+                if re.search(
+                    r"for\s*\(\s*;|for\s*\(\s*\$|powershell\s+-Command.*\bfor\s*\(",
+                    cmd,
+                    re.I,
+                ):
+                    return self._emit_tool_block(
+                        tool_name,
+                        tool_args,
+                        "Blocked: bulk host_exec loops are not allowed for code_build. "
+                        "Use write_file per artifact or run_script with a .py generator.",
+                        step_callback,
+                        register_mission=True,
+                    )
 
         anchor = getattr(self, "_anchor_query", "") or ""
         try:
@@ -1686,6 +1732,17 @@ class ReActAgent:
         web_target_hint = self._build_web_target_hint(tool_name, result, tool_args)
         if web_target_hint:
             self.ctx_manager.add_message({"role": "user", "content": web_target_hint})
+
+        if tool_name == "append_note" and success_exec:
+            from core.delivery_probe import probe_append_note_line
+
+            line = str((tool_args or {}).get("line", ""))
+            warn = probe_append_note_line(line)
+            if warn:
+                self.ctx_manager.add_message({
+                    "role": "user",
+                    "content": f"[SYSTEM] {warn}",
+                })
 
         script_hint = self._build_script_failure_hint(tool_name, result, tool_args)
         if script_hint:
@@ -2306,6 +2363,12 @@ class ReActAgent:
         self.parser.set_user_context(user_prompt)
         from core.task_intent import detect_mission_kind
         mission_kind = detect_mission_kind(user_prompt)
+        if mission_kind == "code_build":
+            self._add_nudge(
+                "[SYSTEM] code_build playbook: use write_file per deliverable or "
+                "run_script with a .py generator; bulk host_exec PowerShell loops are blocked. "
+                "Verify files on disk before append_note progress claims."
+            )
         if self._mission_goals and self._mission_goals.context_directive():
             self.ctx_manager.add_message({
                 "role": "user",
@@ -2315,6 +2378,7 @@ class ReActAgent:
         self._init_turn_state(user_prompt)
         self._vt_reformulate_used = False
         await self._compute_intent_spec(user_prompt)
+        self._maybe_init_mvf(user_prompt)
         await self._run_vt_planning(user_prompt)
         evaluator_nudges = 0
         max_evaluator_nudges = 1
@@ -2423,6 +2487,23 @@ class ReActAgent:
 
             # MISSION_COMPLETE guard
             if "MISSION_COMPLETE" in content:
+                from core.mvf_validator import load_mvf, mvf_enabled, validate_session
+
+                mvf_data = load_mvf(self.session_id) if mvf_enabled(self.config) else None
+                if mvf_data and mvf_data.get("checks"):
+                    mvf_result = validate_session(self.session_id)
+                    if not mvf_result.validated:
+                        failed = [c.detail for c in mvf_result.checks if not c.ok]
+                        self._add_nudge(
+                            "[SYSTEM] MISSION_COMPLETE rejected — MVF not validated. "
+                            f"Failed: {failed[:5]}"
+                        )
+                        continue
+                    final_answer = await self._complete_mission_success(step_callback)
+                    if final_answer is not None:
+                        break
+                    continue
+
                 objective_ok = self._mission_tracker.objective_satisfied() if self._mission_tracker else True
                 substantive_ok = (
                     not self._mission_tracker
@@ -2453,10 +2534,10 @@ class ReActAgent:
                     except Exception:
                         pass
                     # #endregion
-                    final_answer = await self._final_synthesis()
-                    if step_callback:
-                        step_callback("MISSION_COMPLETED", final_answer)
-                    break
+                    final_answer = await self._complete_mission_success(step_callback)
+                    if final_answer is not None:
+                        break
+                    continue
                 else:
                     # Not enough tools run — reject and keep going
                     self._add_nudge(
@@ -2616,10 +2697,10 @@ class ReActAgent:
 
                 if getattr(self, "_checkpoint_decision", None) == "STOPPED":
                     self._checkpoint_decision = None
-                    final_answer = await self._final_synthesis()
-                    if step_callback:
-                        step_callback("MISSION_COMPLETED", final_answer)
-                    break
+                    final_answer = await self._complete_mission_success(step_callback)
+                    if final_answer is not None:
+                        break
+                    continue
 
                 plan = getattr(self, "_task_plan", None)
 
@@ -2641,10 +2722,10 @@ class ReActAgent:
                         ask_user_fn=ask_fn,
                     )
                     if decision == CheckpointDecision.STOP:
-                        final_answer = await self._final_synthesis()
-                        if step_callback:
-                            step_callback("MISSION_COMPLETED", final_answer)
-                        break
+                        final_answer = await self._complete_mission_success(step_callback)
+                        if final_answer is not None:
+                            break
+                        continue
                     elif decision == CheckpointDecision.CHANGE_CONTEXT:
                         self._mission_running = False
                         return "[Checkpoint: Paused for user context input.]"
@@ -2673,10 +2754,10 @@ class ReActAgent:
                         ask_user_fn=ask_fn,
                     )
                     if decision == CheckpointDecision.STOP:
-                        final_answer = await self._final_synthesis()
-                        if step_callback:
-                            step_callback("MISSION_COMPLETED", final_answer)
-                        break
+                        final_answer = await self._complete_mission_success(step_callback)
+                        if final_answer is not None:
+                            break
+                        continue
                     elif decision == CheckpointDecision.CHANGE_CONTEXT:
                         self._mission_running = False
                         return "[Checkpoint: Paused for user context input.]"
@@ -2770,10 +2851,10 @@ class ReActAgent:
                     )
                     chk = self._check_checkpoint_decision()
                     if chk == "break":
-                        final_answer = await self._final_synthesis()
-                        if step_callback:
-                            step_callback("MISSION_COMPLETED", final_answer)
-                        break
+                        final_answer = await self._complete_mission_success(step_callback)
+                        if final_answer is not None:
+                            break
+                        continue
                     elif chk == "return_pause":
                         self._mission_running = False
                         return "[Checkpoint: Paused for user context input.]"
@@ -2812,7 +2893,9 @@ class ReActAgent:
                         )
                     except Exception:
                         pass
-                    final_answer = content
+                    final_answer = self._mission_exit_failure_text(
+                        "Mission ended at step 0 without tool execution"
+                    )
                     break
 
         # Hit step limit — synthesise
@@ -2828,9 +2911,13 @@ class ReActAgent:
                 )
             except Exception:
                 pass
-            final_answer = await self._final_synthesis()
-            if step_callback:
-                step_callback("MISSION_COMPLETED", final_answer)
+            final_answer = await self._complete_mission_success(step_callback)
+            if final_answer is None:
+                final_answer = self._mission_exit_failure_text(
+                    "Mission ended at step limit"
+                )
+                if step_callback:
+                    step_callback("ERROR", final_answer)
 
         # Memory logging
         try:
@@ -2885,6 +2972,58 @@ class ReActAgent:
             save_intent_spec(self.session_id, self._intent_spec)
         except Exception:
             pass
+
+    def _maybe_init_mvf(self, mission_text: str) -> None:
+        """Create mvf.json once per session when auto_derive is enabled."""
+        from core.mvf_validator import (
+            derive_mvf_from_intent,
+            load_mvf,
+            mvf_enabled,
+            save_mvf,
+        )
+        if not mvf_enabled(self.config):
+            return
+        if not (self.config.get("mvf") or {}).get("auto_derive", True):
+            return
+        if load_mvf(self.session_id):
+            return
+        spec = getattr(self, "_intent_spec", None)
+        override = getattr(self, "_mvf_payload_override", None)
+        mvf = derive_mvf_from_intent(spec, mission_text, override=override)
+        if mvf.get("checks"):
+            save_mvf(self.session_id, mvf)
+
+    def _hygiene_context_allowed(self) -> bool:
+        """Skip hygiene/REF playbooks when the mission is pure code_build."""
+        anchor = getattr(self, "_anchor_query", "") or ""
+        if re.search(r"\b(REF-\d+|hygiene_lookup|hygiene[\s_-]?feed|repo-hygiene)\b", anchor, re.I):
+            return True
+        from core.task_intent import detect_mission_kind
+        return detect_mission_kind(anchor) not in ("code_build", "dev", "file_find")
+
+    async def _complete_mission_success(self, step_callback) -> str | None:
+        """MVF gate + synthesis. None = blocked, caller should continue loop."""
+        from core.mvf_validator import mvf_exit_blocked
+
+        blocked, failed = mvf_exit_blocked(self.session_id, self.config)
+        if blocked:
+            self._add_nudge(
+                "[SYSTEM] Mission exit blocked — MVF not validated. "
+                f"Failed: {failed[:5]}. Continue until checks pass."
+            )
+            return None
+        final = await self._final_synthesis()
+        if step_callback:
+            step_callback("MISSION_COMPLETED", final)
+        return final
+
+    def _mission_exit_failure_text(self, reason: str) -> str:
+        from core.mvf_validator import mvf_exit_blocked
+
+        blocked, failed = mvf_exit_blocked(self.session_id, self.config)
+        if blocked:
+            return f"[{reason} — MVF not validated. Failed: {failed[:5]}]"
+        return f"[{reason}]"
 
     def _log_intent_spec(self, message: str, spec) -> None:
         # #region agent log
@@ -4574,9 +4713,10 @@ class ReActAgent:
             "Or: analyze_pcapng with filter_expression='xml' (not only 'http')."
         )
 
-    @staticmethod
-    def _build_failure_playbook_hint(tool_name: str, result: Any) -> str | None:
+    def _build_failure_playbook_hint(self, tool_name: str, result: Any) -> str | None:
         """Inject a corrective playbook excerpt after host_exec/run_script failures."""
+        if not self._hygiene_context_allowed():
+            return None
         if tool_name not in ("host_exec", "run_script") or not isinstance(result, dict):
             return None
         failed = (
@@ -4604,8 +4744,7 @@ class ReActAgent:
             return None
         return f"[SYSTEM] Tool failure — follow this playbook excerpt:\n{excerpt}"
 
-    @staticmethod
-    def _build_tool_reflection_hint(tool_name: str, result: Any) -> str | None:
+    def _build_tool_reflection_hint(self, tool_name: str, result: Any) -> str | None:
         """Inject the tool's schema + playbook excerpt to help self-correct after failure."""
         if not isinstance(result, dict) or result.get("success") is not False:
             return None
@@ -4631,11 +4770,12 @@ class ReActAgent:
 
         # Find playbook from RAG
         playbook = ""
-        try:
-            from core.rag import get_rag_context_for_tools
-            playbook = get_rag_context_for_tools([tool_name], max_chars=1200)
-        except Exception:
-            pass
+        if self._hygiene_context_allowed():
+            try:
+                from core.rag import get_rag_context_for_tools
+                playbook = get_rag_context_for_tools([tool_name], max_chars=1200)
+            except Exception:
+                pass
 
         hint_parts = [
             f"[SYSTEM] Tool '{tool_name}' failed.",

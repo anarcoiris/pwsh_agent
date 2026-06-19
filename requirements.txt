@@ -6,3 +6,7 @@ pyfiglet>=1.0.2
 prompt_toolkit>=3.0.0
 watchdog>=4.0.0
 croniter>=2.0.0
+# Semantic RAG (CPU-only — GPUs stay free for Ollama models)
+faiss-cpu>=1.7.4
+sentence-transformers>=2.2.0
+numpy>=1.24.0

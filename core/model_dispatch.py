@@ -14,6 +14,9 @@ Legacy: single base_url when endpoints are not configured.
 
 from __future__ import annotations
 
+import re as _re
+from pathlib import Path as _Path
+
 import os
 from enum import Enum
 from functools import lru_cache
@@ -39,9 +42,9 @@ class TurnPhase(str, Enum):
 
 
 _DEFAULT_ENDPOINTS = {
-    "intake":  "http://localhost:11436",
+    "intake":  "http://localhost:11435",
     "planner": "http://localhost:11434",
-    "coder":   "http://localhost:11435",
+    "coder":   "http://localhost:11436",
 }
 
 _PHASE_ENDPOINT_KEY = {
@@ -206,6 +209,10 @@ def chat_options_for_phase(
 # Monologue prompt helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Hardcoded fallback strings — used when the .md skill file is not on disk.
+# The canonical versions live in knowledge/skills/planner_*.md and are loaded
+# at call time by _load_skill_system().
+
 _MONOLOGUE_SYSTEM = (
     "You are VibeThinker, a strategic reasoning model leading an AI agent. "
     "You think out loud in the FIRST PERSON. Write as if you are thinking privately "
@@ -243,6 +250,24 @@ _ROADMAP_USER_TPL = (
     "Domain: {domain} | Objectives: {objectives}"
 )
 
+_SKILLS_DIR = _Path(__file__).parent.parent / "knowledge" / "skills"
+_FRONTMATTER_STRIP_RE = _re.compile(r"^---\s*\n.*?\n---\s*\n", _re.DOTALL)
+
+
+def _load_skill_system(skill_name: str, fallback: str) -> str:
+    """Load system prompt body from knowledge/skills/<skill_name>.md.
+
+    Strips YAML frontmatter. Returns ``fallback`` if the file is missing or
+    unreadable — no exceptions propagate to the caller.
+    """
+    path = _SKILLS_DIR / f"{skill_name}.md"
+    try:
+        raw = path.read_text(encoding="utf-8")
+        body = _FRONTMATTER_STRIP_RE.sub("", raw, count=1).strip()
+        return body if body else fallback
+    except Exception:
+        return fallback
+
 
 def build_monologue_messages(
     intent_spec: "Any",
@@ -251,6 +276,7 @@ def build_monologue_messages(
     exec_result: str = "",
 ) -> list[dict[str, str]]:
     """Build the messages list for a VibeThinker monologue call."""
+    system = _load_skill_system("planner_monologue", _MONOLOGUE_SYSTEM)
     user_content = _MONOLOGUE_USER_TPL.format(
         intent_summary=getattr(intent_spec, "summary", str(intent_spec))[:600],
         domain=getattr(intent_spec, "domain", "general"),
@@ -265,7 +291,7 @@ def build_monologue_messages(
         user_content += f"\n\nYour previous reasoning:\n{prior_monologue[:400]}"
 
     return [
-        {"role": "system", "content": _MONOLOGUE_SYSTEM},
+        {"role": "system", "content": system},
         {"role": "user",   "content": user_content},
     ]
 
@@ -277,6 +303,7 @@ def build_roadmap_messages(
     rejection_reason: str = "",
 ) -> list[dict[str, str]]:
     """Build messages for the VibeThinker roadmap decomposition call."""
+    system = _load_skill_system("planner_roadmap", _ROADMAP_SYSTEM)
     user_content = _ROADMAP_USER_TPL.format(
         monologue=monologue[:800],
         intent_summary=getattr(intent_spec, "summary", str(intent_spec))[:400],
@@ -290,9 +317,18 @@ def build_roadmap_messages(
             "Produce a corrected roadmap JSON array."
         )
     return [
-        {"role": "system", "content": _ROADMAP_SYSTEM},
+        {"role": "system", "content": system},
         {"role": "user",   "content": user_content},
     ]
+
+
+_EVALUATION_SYSTEM_FALLBACK = (
+    "You are VibeThinker, evaluating the progress of an ongoing mission. "
+    "Think in FIRST PERSON. Assess what happened, decide the next step. "
+    'Output JSON: {"status": "continue"|"done"|"blocked"|"needs_user", '
+    '"next_step_id": "<step_id or null>", "hint": "<one line hint>", '
+    '"monologue": "<your private first-person reasoning>"}'
+)
 
 
 def build_evaluation_messages(
@@ -302,13 +338,7 @@ def build_evaluation_messages(
     roadmap_status: str,
 ) -> list[dict[str, str]]:
     """Build messages for a VibeThinker evaluation call after execution."""
-    system = (
-        "You are VibeThinker, evaluating the progress of an ongoing mission. "
-        "Think in FIRST PERSON. Assess what happened, decide the next step. "
-        'Output JSON: {"status": "continue"|"done"|"blocked"|"needs_user", '
-        '"next_step_id": "<step_id or null>", "hint": "<one line hint>", '
-        '"monologue": "<your private first-person reasoning>"}'
-    )
+    system = _load_skill_system("planner_evaluation", _EVALUATION_SYSTEM_FALLBACK)
     user = (
         f"Mission goal: {getattr(intent_spec, 'summary', '')[:300]}\n\n"
         f"Current roadmap:\n{roadmap_status}\n\n"

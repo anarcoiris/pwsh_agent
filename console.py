@@ -64,6 +64,7 @@ class AgentConsole:
             "/audit": "audit",
             "/cancel": "cancel",
             "/schedule": "schedule",
+            "/queue": "queue",
         }
         return aliases.get(c, c)
 
@@ -208,7 +209,9 @@ class AgentConsole:
         # Start background sweep loop for scheduled missions
         import asyncio as _aio
         from core.sweep_loop import sweep_loop
-        self._sweep_task = _aio.ensure_future(sweep_loop(self.agent, interval_s=60))
+        self._sweep_task = _aio.ensure_future(
+            sweep_loop(interactive_agent=self.agent, interval_s=60)
+        )
         
         while self.is_running:
             # Build colorized badges for active settings
@@ -221,7 +224,7 @@ class AgentConsole:
             try:
                 raw_cmd = Prompt.ask(
                     prompt_text,
-                    choices=["mission", "chat", "specialist", "toggle", "audit", "cancel", "schedule", "status", "new", "session", "help", "exit"],
+                    choices=["mission", "chat", "specialist", "toggle", "audit", "cancel", "schedule", "queue", "status", "new", "session", "help", "exit"],
                 )
                 cmd = self._normalize_command(raw_cmd)
                 
@@ -315,16 +318,31 @@ class AgentConsole:
                 elif cmd == "schedule":
                     self._handle_schedule()
 
+                elif cmd == "queue":
+                    self._handle_queue()
+
                 elif cmd == "specialist":
-                    # Swap cognitive mode
+                    from core.specialists import AGENT_IDS
+
+                    _legacy_map = {
+                        "network": "recon",
+                        "re": "crypto",
+                        "exploit": "workspace",
+                    }
                     active_spec = Prompt.ask(
-                        "Select Specialist Mode", 
-                        choices=["lead", "network", "re", "exploit"], 
-                        default="lead"
+                        "Select Specialist Mode",
+                        choices=sorted(AGENT_IDS),
+                        default="lead",
                     )
+                    active_spec = _legacy_map.get(active_spec, active_spec)
+                    if active_spec not in AGENT_IDS:
+                        active_spec = "lead"
+                    self.agent.active_agent = active_spec
                     self.agent.active_specialist = active_spec
-                    self.agent._init_system_prompt()  # Dynamically reload prompt
-                    console.print(f"[bold green]✔ Persona shifted successfully to: {active_spec.upper()}[/bold green]\n")
+                    self.agent._init_system_prompt()
+                    console.print(
+                        f"[bold green]✔ Persona shifted successfully to: {active_spec.upper()}[/bold green]\n"
+                    )
                     
                 elif cmd == "mission":
                     console.print(f"[bold green]Enter mission objective[/bold green] [dim]({submit_hint})[/dim]")
@@ -472,6 +490,7 @@ class AgentConsole:
         help_table.add_row("new",        "Start a new session (seals outgoing handoff; no auto prior load).")
         help_table.add_row("session",    "list / pick / clear prior handoff summaries (clear resets specialist to LEAD).")
         help_table.add_row("schedule",   "Add / list / pause / resume / cancel autonomous scheduled missions.")
+        help_table.add_row("queue",      "Unified work queue: missions, hygiene, templates, run-once, status.")
         help_table.add_row("status",     "Show configuration, thought budget, and audit metrics.")
         help_table.add_row("exit",       "Terminate the session safely.")
         console.print(help_table)
@@ -569,6 +588,90 @@ class AgentConsole:
                 console.print(f"[red]✖ Mission {mid} cancelled.[/red]")
             else:
                 console.print(f"[red]Mission {mid} not found.[/red]")
+
+    def _handle_queue(self):
+        """Unified Pulse Queue sub-menu."""
+        from core.work_queue import list_jobs, pause_job, resume_job, cancel_job, enqueue_job
+        from core.queue_templates import list_templates, enqueue_from_template
+        from core.idle_detect import get_idle_time_seconds
+
+        sub = Prompt.ask(
+            "Queue command",
+            choices=["list", "add", "template", "pause", "resume", "cancel", "status"],
+            default="list",
+        )
+
+        if sub == "list":
+            jobs = list_jobs(include_done=False)
+            if not jobs:
+                console.print("[dim]Queue empty. Try template → hello_game[/dim]")
+                return
+            t = Table(title="Pulse Queue", border_style="cyan")
+            t.add_column("ID", style="cyan")
+            t.add_column("Pri")
+            t.add_column("Type", style="magenta")
+            t.add_column("Status")
+            t.add_column("Next")
+            t.add_column("Title")
+            for j in jobs:
+                t.add_row(
+                    j["id"],
+                    str(j.get("priority", 50)),
+                    j.get("job_type", ""),
+                    j.get("status", ""),
+                    (j.get("next_run_at") or "")[:19],
+                    (j.get("title") or "")[:50],
+                )
+            console.print(t)
+
+        elif sub == "add":
+            text = Prompt.ask("Mission text")
+            pri = int(Prompt.ask("Priority", default="50"))
+            when = Prompt.ask("When", choices=["now", "idle", "night"], default="idle")
+            idle = 900 if when == "idle" else None
+            ns = ne = None
+            if when == "night":
+                ns, ne = 22, 7
+            jid = enqueue_job(
+                "pwsh_mission",
+                {"mission_text": text, "specialist": "workspace", "network_mode": "SANDBOX"},
+                priority=pri,
+                requires_idle_seconds=idle,
+                night_start_hour=ns,
+                night_end_hour=ne,
+            )
+            console.print(f"[green]Queued:[/green] {jid}")
+
+        elif sub == "template":
+            names = list_templates()
+            if not names:
+                console.print("[red]No templates in knowledge/queue_templates/[/red]")
+                return
+            name = Prompt.ask("Template", choices=names)
+            jid = enqueue_from_template(name)
+            console.print(f"[green]Queued from template:[/green] {jid} ({name})")
+
+        elif sub == "pause":
+            if pause_job(Prompt.ask("Job ID").strip()):
+                console.print("[yellow]Paused[/yellow]")
+            else:
+                console.print("[red]Not found[/red]")
+
+        elif sub == "resume":
+            if resume_job(Prompt.ask("Job ID").strip()):
+                console.print("[green]Resumed[/green]")
+            else:
+                console.print("[red]Not found[/red]")
+
+        elif sub == "cancel":
+            if cancel_job(Prompt.ask("Job ID").strip()):
+                console.print("[red]Cancelled[/red]")
+            else:
+                console.print("[red]Not found[/red]")
+
+        elif sub == "status":
+            idle = get_idle_time_seconds()
+            console.print(f"[cyan]Idle:[/cyan] {idle/60:.1f} min — orchestrator via sweep every 60s")
 
 if __name__ == "__main__":
     from core.circuit_breaker import enforce_startup_backoff, reset as cb_reset

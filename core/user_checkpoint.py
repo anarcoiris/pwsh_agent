@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,7 @@ class CheckpointTrigger(str, Enum):
     STALL_RECOVERY      = "stall_recovery"        # 3+ non-substantive tools
     ATTEMPT_CAP_REACHED = "attempt_cap_reached"   # step BLOCKED after 8 attempts
     EXEC_RESULT_REVIEW  = "exec_result_review"    # after any code/script execution
+    PROMOTE_GATE        = "promote_gate"          # post-MVF human promote (R4)
 
 
 class CheckpointDecision(str, Enum):
@@ -174,6 +176,11 @@ _RESPONSE_MAP: dict[str, CheckpointDecision] = {
     "terminar": CheckpointDecision.STOP,
     "done": CheckpointDecision.STOP,
     "cerrar": CheckpointDecision.STOP,
+    "no": CheckpointDecision.STOP,
+    "cancel": CheckpointDecision.STOP,
+    "abort": CheckpointDecision.STOP,
+    "no hagas": CheckpointDecision.STOP,
+    "no hacer": CheckpointDecision.STOP,
     "s": CheckpointDecision.ALWAYS_CONTINUE,
     "always": CheckpointDecision.ALWAYS_CONTINUE,
     "siempre": CheckpointDecision.ALWAYS_CONTINUE,
@@ -188,6 +195,60 @@ def parse_user_decision(raw_input: str) -> CheckpointDecision:
     """
     key = (raw_input or "").strip().lower()
     return _RESPONSE_MAP.get(key, CheckpointDecision.CONTINUE)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Operator inbox (mvf_autonomous notify-only)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def operator_inbox_path(session_id: str) -> Path:
+    return Path("state") / "sessions" / session_id / "operator_inbox.jsonl"
+
+
+def append_operator_inbox(
+    session_id: str,
+    trigger: CheckpointTrigger,
+    detail: str,
+    *,
+    source: str = "agent",
+) -> None:
+    """Append a notify-only checkpoint event for daemon / night missions."""
+    path = operator_inbox_path(session_id)
+    entry = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "trigger": trigger.value,
+        "detail": (detail or "")[:2000],
+        "source": source,
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError as e:
+        logger.warning("Could not append operator inbox: %s", e)
+
+
+def read_operator_inbox_decision(session_id: str) -> CheckpointDecision | None:
+    """Return STOP/CONTINUE if the operator appended a reply line."""
+    path = operator_inbox_path(session_id)
+    if not path.is_file():
+        return None
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for raw in reversed(lines):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            row = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if row.get("role") != "operator_reply":
+            continue
+        return parse_user_decision(str(row.get("text") or ""))
+    return None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -217,8 +278,12 @@ class CheckpointGate:
         checkpoint_cfg = cfg.get("checkpoint", {})
         self.enabled: bool = bool(checkpoint_cfg.get("enabled", True))
         self.profile: str = str(checkpoint_cfg.get("profile", "interactive")).strip().lower()
-        triggers = list(checkpoint_cfg.get("triggers", [t.value for t in CheckpointTrigger]))
-        if self.profile == "headless":
+        triggers = list(checkpoint_cfg.get("triggers", [t.value for t in CheckpointTrigger if t != CheckpointTrigger.PROMOTE_GATE]))
+        self.notify_only: bool = False
+        if self.profile == "mvf_autonomous":
+            self.active_triggers: frozenset[str] = frozenset(triggers)
+            self.notify_only = True
+        elif self.profile == "headless":
             triggers = [
                 t for t in triggers
                 if t not in (
@@ -226,10 +291,23 @@ class CheckpointGate:
                     CheckpointTrigger.EXEC_RESULT_REVIEW.value,
                 )
             ]
-        self.active_triggers: frozenset[str] = frozenset(triggers)
+            self.active_triggers = frozenset(triggers)
+        else:
+            self.active_triggers = frozenset(triggers)
 
     def should_fire(self, trigger: CheckpointTrigger) -> bool:
         """Return True when this trigger should pause execution."""
+        if not self.enabled:
+            return False
+        if self.notify_only:
+            return False
+        if trigger.value not in self.active_triggers:
+            return False
+        if is_whitelisted(trigger, self.session_id, self.cfg):
+            return False
+        return True
+
+    def _trigger_active(self, trigger: CheckpointTrigger) -> bool:
         if not self.enabled:
             return False
         if trigger.value not in self.active_triggers:
@@ -255,6 +333,14 @@ class CheckpointGate:
         Returns:
             CheckpointDecision — always returns something safe.
         """
+        if self.notify_only:
+            if self._trigger_active(trigger):
+                append_operator_inbox(self.session_id, trigger, detail)
+            op_decision = read_operator_inbox_decision(self.session_id)
+            if op_decision == CheckpointDecision.STOP:
+                return CheckpointDecision.STOP
+            return CheckpointDecision.CONTINUE
+
         if not self.should_fire(trigger):
             return CheckpointDecision.CONTINUE
 

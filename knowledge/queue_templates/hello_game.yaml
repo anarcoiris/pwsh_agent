@@ -1,0 +1,29 @@
+# HelloGame E2E — plantilla Pulse Queue
+job_type: pwsh_mission
+title: "HelloGame MVF"
+priority: 70
+requires_idle_seconds: 600
+night_start_hour: 22
+night_end_hour: 7
+checkpoint_profile: mvf_autonomous
+payload:
+  mission_text: |
+    In HelloGame/ create PLAN.md and game.py — a minimal Python ASCII game.
+    Add tests/test_game.py with a smoke import test. Run pytest until green.
+  specialist: workspace
+  network_mode: SANDBOX
+  mvf:
+    deliverables:
+      - HelloGame/PLAN.md
+      - HelloGame/game.py
+      - HelloGame/tests/test_game.py
+    checks:
+      - type: file_exists
+        path: HelloGame/PLAN.md
+      - type: file_exists
+        path: HelloGame/game.py
+      - type: file_exists
+        path: HelloGame/tests/test_game.py
+      - type: command
+        cmd: "py -3.10 -m pytest HelloGame/tests -q"
+        exit_code: 0

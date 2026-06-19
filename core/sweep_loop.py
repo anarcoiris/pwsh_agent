@@ -1,9 +1,4 @@
-"""Background sweep loop that checks for due scheduled missions.
-
-Inspired by NanoClaw v2's ``host-sweep.ts`` — runs inside the same
-asyncio event loop as the REPL and checks the scheduler DB every
-*interval_s* seconds.
-"""
+"""Background sweep — isolated agent for scheduled/orchestrator work."""
 
 from __future__ import annotations
 
@@ -15,29 +10,40 @@ from core.scheduler import get_due_missions, mark_completed, mark_failed
 
 logger = logging.getLogger("pwsh_agent.core.sweep_loop")
 
+_background_agent: Any | None = None
+
+
+def get_background_agent() -> Any:
+    """Dedicated ReActAgent for sweep/orchestrator — never the interactive console agent."""
+    global _background_agent
+    if _background_agent is None:
+        import agent as agent_mod
+        _background_agent = agent_mod.ReActAgent()
+        logger.info("Background sweep agent created (session=%s)", _background_agent.session_id)
+    return _background_agent
+
 
 async def sweep_loop(
-    agent: Any,
+    interactive_agent: Any | None = None,
     interval_s: int = 60,
     event_callback: Callable | None = None,
+    *,
+    agent: Any | None = None,
 ) -> None:
-    """Background coroutine — checks scheduler DB for due missions.
+    """Background coroutine — checks scheduler DB and Pulse Queue.
 
-    Parameters
-    ----------
-    agent : ReActAgent
-        The live agent instance whose ``run_mission`` will be called.
-    interval_s : int
-        Poll interval in seconds (default 60).
-    event_callback : callable, optional
-        Forwarded to ``agent.run_mission()`` for UI events.
+    ``interactive_agent`` (legacy alias ``agent``) is only used for the
+    ``_mission_running`` busy flag. Work always runs on ``get_background_agent()``.
     """
+    if interactive_agent is None and agent is not None:
+        interactive_agent = agent
+
+    bg = get_background_agent()
     logger.info("Sweep loop started (interval=%ds)", interval_s)
 
     while True:
         await asyncio.sleep(interval_s)
         try:
-            # Poll hygiene-feed mission stubs (repo-hygiene eyes)
             try:
                 from core.hygiene_missions import poll_hygiene_missions
                 polled = poll_hygiene_missions()
@@ -46,12 +52,34 @@ async def sweep_loop(
             except Exception as exc:
                 logger.debug("Hygiene mission poll skipped: %s", exc)
 
-            due = get_due_missions()
-            if not due:
+            busy = bool(getattr(interactive_agent, "_mission_running", False)) if interactive_agent else False
+            orch_cfg: dict = {}
+
+            try:
+                import yaml
+                from core.runtime_paths import app_root
+                cfg_path = app_root() / "config.yaml"
+                if cfg_path.is_file():
+                    with open(cfg_path, encoding="utf-8") as f:
+                        orch_cfg = (yaml.safe_load(f) or {}).get("orchestrator") or {}
+                if orch_cfg.get("enabled", True):
+                    from core.orchestrator import orchestrator_tick
+                    result = await orchestrator_tick(bg, interactive_busy=busy)
+                    if result.get("ran"):
+                        logger.info("Orchestrator ran job %s", result.get("job_id"))
+                        continue
+            except Exception as exc:
+                logger.debug("Orchestrator tick skipped: %s", exc)
+
+            if busy:
+                logger.debug("Skipping legacy scheduler — interactive mission in progress")
                 continue
 
-            if getattr(agent, "_mission_running", False):
-                logger.debug("Skipping scheduled missions — interactive mission in progress")
+            if not orch_cfg.get("run_legacy_scheduler", True):
+                continue
+
+            due = get_due_missions()
+            if not due:
                 continue
 
             for mission in due:
@@ -65,23 +93,20 @@ async def sweep_loop(
                     mission_id, specialist,
                 )
 
-                # Save and restore agent state around the scheduled execution
-                saved_specialist = getattr(agent, "active_specialist", "lead")
-                saved_mode = getattr(agent, "network_mode", "SANDBOX")
-                saved_session = getattr(agent, "session_id", None)
+                saved_spec = getattr(bg, "active_specialist", "lead")
+                saved_agent = getattr(bg, "active_agent", "lead")
+                saved_mode = getattr(bg, "network_mode", "SANDBOX")
 
                 try:
-                    # Configure agent for this mission
-                    agent.active_specialist = specialist
-                    agent.network_mode = network_mode
+                    bg.active_agent = specialist
+                    bg.active_specialist = specialist
+                    bg.network_mode = network_mode
 
-                    # Refresh prompt with new specialist/mode context
-                    if hasattr(agent, "_init_system_prompt"):
-                        agent._init_system_prompt()
+                    if hasattr(bg, "_init_system_prompt"):
+                        bg._init_system_prompt()
 
-                    # Create a fresh session for the scheduled run
-                    if hasattr(agent, "new_session"):
-                        agent.new_session()
+                    if hasattr(bg, "new_session"):
+                        bg.new_session()
 
                     def _log_event(event_type: str, data: Any) -> None:
                         logger.debug(
@@ -91,9 +116,8 @@ async def sweep_loop(
                         if event_callback:
                             event_callback(event_type, data)
 
-                    await agent.run_mission(mission_text, _log_event)
+                    await bg.run_mission(mission_text, _log_event)
                     mark_completed(mission_id)
-
                     logger.info("Scheduled mission completed: %s", mission_id)
 
                 except Exception as exc:
@@ -105,13 +129,11 @@ async def sweep_loop(
                     mark_failed(mission_id, err_msg)
 
                 finally:
-                    # Restore original agent state
-                    agent.active_specialist = saved_specialist
-                    agent.network_mode = saved_mode
-                    if saved_session and hasattr(agent, "session_id"):
-                        agent.session_id = saved_session
-                    if hasattr(agent, "_init_system_prompt"):
-                        agent._init_system_prompt()
+                    bg.active_agent = saved_agent
+                    bg.active_specialist = saved_spec
+                    bg.network_mode = saved_mode
+                    if hasattr(bg, "_init_system_prompt"):
+                        bg._init_system_prompt()
 
         except Exception as exc:
             logger.error("Sweep loop error: %s", exc)

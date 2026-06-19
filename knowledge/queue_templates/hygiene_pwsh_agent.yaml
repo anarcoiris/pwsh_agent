@@ -1,0 +1,10 @@
+# Hygiene AI review — pwsh_agent
+job_type: hygiene_review
+title: "Hygiene review pwsh_agent"
+priority: 55
+requires_idle_seconds: 900
+night_start_hour: 22
+night_end_hour: 7
+payload:
+  repo_path: "C:/Users/soyko/Documents/Libraries/pwsh_agent"
+  task_type: ai_review

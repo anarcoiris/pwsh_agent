@@ -16,7 +16,7 @@ meta:
 
 # Ventana de contexto Ollama compartida (orchestrator). Tags: Ollama/docker/models/registry.yaml
 ollama:
-  num_ctx: 8192
+  num_ctx: 16384
 
 # ── CONTROL DE COSTES ────────────────────────────────────────
 budget:
@@ -215,13 +215,13 @@ hub:
 
 # ── CONFIGURACIÓN DEL REVISOR DE IA Y DAEMON ──────────────────
 ai_review:
-  ollama_url: "http://localhost:11435"   # default / coder endpoint
+  ollama_url: "http://localhost:11436"   # default / coder endpoint (R1c swap)
   pipeline: dual
   unload_after_call: false               # false while models pinned (multi-GPU or concurrency)
 
   # Multi-GPU endpoints (docker-compose.multi-gpu.yml); omit to use ollama_url for both
   planner_ollama_url: "http://localhost:11434"
-  coder_ollama_url: "http://localhost:11435"
+  coder_ollama_url: "http://localhost:11436"
 
   # Parallel Phase-1 clusters — must match ollama-code OLLAMA_NUM_PARALLEL (registry.yaml)
   concurrency:
@@ -233,23 +233,23 @@ ai_review:
   planner:
     model: "vibethinker:3b"              # canonical tag; see Ollama/docker/models/registry.yaml
     ollama_url: "http://localhost:11434" # ollama-planner container (multi-GPU)
-    num_ctx: 16384
+    num_ctx: 32768
     reserve_output_tokens: 3072
-    max_context_chars: 28000
+    max_context_chars: 56000
     temperature: 0.3
 
   # Coder: análisis profundo por cluster (especializado en código)
   coder:
     model: "qwen2.5-coder:7b-instruct"
-    ollama_url: "http://localhost:11435" # ollama-coder container (multi-GPU)
-    num_ctx: 8192
+    ollama_url: "http://localhost:11436" # ollama-coder container (multi-GPU, R1c swap)
+    num_ctx: 16384
     reserve_output_tokens: 2048
     max_context_chars: 12000
     temperature: 0.1
 
   # Fallback legacy (pipeline: coder_only)
   model: "qwen2.5-coder:7b-instruct"
-  num_ctx: 8192
+  num_ctx: 16384
   reserve_output_tokens: 2048
   max_context_chars: 12000
   max_file_size_kb: 100

@@ -147,13 +147,12 @@ async def test_sweep_loop_execution():
     # Run sweep loop for one iteration by checking get_due_missions inside the loop
     # We will patch asyncio.sleep to break the loop or run it once
     with patch("core.sweep_loop.asyncio.sleep", AsyncMock()) as mock_sleep:
-        # Mock sleep to raise GeneratorExit or CancelledError to break the infinite loop after 1 run
         mock_sleep.side_effect = [None, asyncio.CancelledError()]
-        
-        try:
-            await sweep_loop(mock_agent, interval_s=1)
-        except asyncio.CancelledError:
-            pass
+        with patch("core.sweep_loop.get_background_agent", return_value=mock_agent):
+            try:
+                await sweep_loop(interactive_agent=MagicMock(_mission_running=False), interval_s=1)
+            except asyncio.CancelledError:
+                pass
             
     # Verify mock agent was called with correct text
     from unittest.mock import ANY
