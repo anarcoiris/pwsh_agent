@@ -1,6 +1,6 @@
 # Multi-Purpose Agent Design — From One-Trick Pony to General Operator
 
-**Status:** Design / proposal (no behavior changes yet, except the already-shipped `crack_hash` crash fix)
+**Status:** PARTIALLY IMPLEMENTED (Phases 1-3 fully shipped, Phases 4-6 partially implemented; see below for details)
 **Author:** drafted with the agent, grounded in code review of `agent.py`, `core/task_intent.py`, `core/chat_goals.py`, `core/task_plan.py`, `core/context_router.py`, `core/llm_utils.py`.
 **Builds on:** `consolidated_generalization_plan.md` (defensive de-biasing — partly shipped). This document is the *constructive* successor: instead of "stop forcing the hash trick," it defines the substrate that lets the agent do **any** task naturally.
 

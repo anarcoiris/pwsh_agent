@@ -9,7 +9,8 @@ An advanced autonomous local Windows developer, system auditor, and automation c
 - **No SCM / Docker**: Pure native implementation. Direct, safe local command execution under close operator review.
 
 ## 📈 Recent Milestones
-1. **Specialist handoff & prompt pack (2026-06-04)**: Fixed tool schema truncation (`core/tool_schemas.py`), premature handoff via `append_note`, post-delegate stall, orphan `(WEB)` badge. Handoff completes only on in-scope specialist tools; `CURRENT_STATE.md` documented as audit-only. Plans: `docs/plans/specialist_handoff_plan.md`, closure `docs/plans/session_closure_20260604.md`. Next: `web_auth_html_pipeline_plan.md` for ZTE/HTML login.
+1. **Context/monitoring/retry stack (2026-06-10)**: `llm_audit.jsonl` now logs token telemetry (`prompt_eval_count`, `ctx_saturation`) + parser paths; modes `full|meta|off` via `agent.llm_audit`; viewer `tools_dev/llm_audit_view.py` + console `audit → llm`. Context diet: minimal specialist pinned prompt, TOOLS md dropped, plan-step `priority_tools` ordering. Capped trial-and-error: verbatim deduped stderr (~1500 chars), per-step attempt counts, 8-attempt cap → step BLOCKED + strategy change. Success gating: exit code 0 required for step done/handoff complete. `http_get` artifact-first (full body to `artifacts/` before truncation) + `facts.web` + web specialist greps artifacts + fetch-before-login gate. See `docs/plans/context_retry_stack_20260610.md`.
+2. **Specialist handoff & prompt pack (2026-06-04)**: Fixed tool schema truncation (`core/tool_schemas.py`), premature handoff via `append_note`, post-delegate stall, orphan `(WEB)` badge. Handoff completes only on in-scope specialist tools; `CURRENT_STATE.md` documented as audit-only. Plans: `docs/plans/specialist_handoff_plan.md`, closure `docs/plans/session_closure_20260604.md`. Next: `web_auth_html_pipeline_plan.md` for ZTE/HTML login.
 2. **Python 3.10 Venv Alignment**: Reconfigured `inicio.bat` launcher to strictly target the `py -3.10` launcher, preventing cross-version conflicts.
 2. **Identity Implementation**: Created the core operational soul and identity blueprint documents (`SOUL.md`, `IDENTITY.md`, `USER.md`, `AGENTS.md`).
 3. **Tool Parser Fix (2026-05-30)**: Fixed critical bug where `core/parser.py` only extracted `<tool_call>` XML tags. Ollama/qwen2.5-coder emits tool calls as bare JSON or fenced blocks — now parsed via 5 fallback paths. Regression: `tests/test_parser_fix.py`.
@@ -66,6 +67,9 @@ python tests/test_tool_schemas.py
 python tests/test_specialist_handoff.py
 python tests/test_delegate_to.py
 python tests/test_orphan_specialist.py
+python tests/test_llm_audit.py
+python tests/test_retry_executor.py
+python tests/test_http_get_artifact.py
 ```
 
 All fourteen must print success lines (baseline ten + four specialist handoff tests from 2026-06-04).
@@ -115,5 +119,5 @@ All fourteen must print success lines (baseline ten + four specialist handoff te
 - **run_script over host_exec for .py**: `ExecutionPolicy` redirects automatically; do not regress.
 
 ## 📊 System Operations & Stats
-- **Last Run**: 2026-06-04 (Session: `20260603_234404`, Persona: `LEAD`)
-- **Total Auditing Days**: 7
+- **Last Run**: 2026-06-19 (Session: `smoke_040552`, Persona: `WORKSPACE`)
+- **Total Auditing Days**: 9

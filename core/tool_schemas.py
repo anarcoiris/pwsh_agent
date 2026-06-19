@@ -11,6 +11,7 @@ from core.specialists import SPECIALIST_REGISTRY
 AGENT_TOOL_ORDER: dict[str, tuple[str, ...]] = {
     "lead": (
         "delegate_to",
+        "hygiene_lookup",
         "append_note",
         "sequentialthinking",
         "finding_create",
@@ -18,6 +19,7 @@ AGENT_TOOL_ORDER: dict[str, tuple[str, ...]] = {
         "report_generate",
     ),
     "workspace": (
+        "hygiene_lookup",
         "read_file",
         "grep_file",
         "write_file",
@@ -29,6 +31,8 @@ AGENT_TOOL_ORDER: dict[str, tuple[str, ...]] = {
     "web": (
         "try_http_login",
         "http_get",
+        "grep_file",
+        "read_file",
         "http_headers_check",
         "ssl_analysis",
     ),
@@ -56,18 +60,30 @@ AGENT_TOOL_ORDER: dict[str, tuple[str, ...]] = {
 DEFAULT_SCHEMA_BUDGET_CHARS = 8000
 
 
-def tool_names_for_agent(agent_id: str) -> list[str]:
-    """Registry tools in priority order (not alphabetical)."""
+def tool_names_for_agent(
+    agent_id: str,
+    priority_tools: list[str] | None = None,
+) -> list[str]:
+    """Registry tools in priority order (not alphabetical).
+
+    ``priority_tools`` (e.g. the current plan step's tool hints) are moved to
+    the front when present in the agent registry, so the active atomic task's
+    tools survive any budget truncation first.
+    """
     reg = SPECIALIST_REGISTRY.get(agent_id, SPECIALIST_REGISTRY["lead"])
     order = AGENT_TOOL_ORDER.get(agent_id)
-    if order:
-        return [name for name in order if name in reg]
-    return sorted(reg)
+    base = [name for name in order if name in reg] if order else sorted(reg)
+    if priority_tools:
+        front = [t for t in priority_tools if t in reg]
+        if front:
+            base = front + [n for n in base if n not in front]
+    return base
 
 
 def schemas_for_agent(
     agent_id: str,
     max_chars: int = DEFAULT_SCHEMA_BUDGET_CHARS,
+    priority_tools: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Return TOOLS_SCHEMA entries for the active specialist.
 
@@ -76,7 +92,7 @@ def schemas_for_agent(
     """
     import tools
 
-    names = tool_names_for_agent(agent_id)
+    names = tool_names_for_agent(agent_id, priority_tools=priority_tools)
     out: list[dict[str, Any]] = []
     current_len = 0
     for name in names:
@@ -97,9 +113,12 @@ def schemas_for_agent(
 def schemas_json_for_agent(
     agent_id: str,
     max_chars: int = DEFAULT_SCHEMA_BUDGET_CHARS,
+    priority_tools: list[str] | None = None,
 ) -> str:
     """JSON array string for RELATED TOOL SCHEMAS injection."""
-    schemas = schemas_for_agent(agent_id, max_chars=max_chars)
+    schemas = schemas_for_agent(
+        agent_id, max_chars=max_chars, priority_tools=priority_tools
+    )
     if not schemas:
         return ""
     return json.dumps(schemas, indent=2)

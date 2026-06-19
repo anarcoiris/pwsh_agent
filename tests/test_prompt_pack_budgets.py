@@ -50,7 +50,27 @@ def test_assembled_system_excludes_identity():
     assert "USER.md" not in prompt
     assert "### AGENTS ###" in prompt
     assert "### SOUL ###" in prompt
-    assert "### TOOLS ###" in prompt
+    # Context diet: TOOLS markdown block replaced by a one-line roster
+    # (schemas arrive via the per-turn RELATED TOOL SCHEMAS injection).
+    assert "### TOOLS ###" not in prompt
+    assert "Your tools:" in prompt
+    assert "delegate_to" in prompt
+
+
+def test_specialist_system_is_minimal():
+    pack = PromptPack()
+    prompt = pack.assemble_system(active_agent="web", session_id="test")
+    # Strictly indispensable: no AGENTS roster, no SOUL essay, no TOOLS md.
+    assert "### AGENTS ###" not in prompt
+    assert "### SOUL ###" not in prompt
+    assert "### TOOLS ###" not in prompt
+    assert "web specialist" in prompt
+    assert "<tool_call>" in prompt
+    assert "try_http_login" in prompt and "http_get" in prompt
+    assert "append_note" in prompt and "unavailable" in prompt
+    # Far smaller than the LEAD prompt
+    lead = pack.assemble_system(active_agent="lead", session_id="test")
+    assert len(prompt) < len(lead) / 2
 
 
 def test_current_state_worst_case_within_budget():

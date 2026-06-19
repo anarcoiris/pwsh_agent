@@ -34,3 +34,4 @@ watcher/log_initial.txt
 # Dev smoke harness temp capture
 test_verify.pcapng
 capture.pcapng
+*.rar

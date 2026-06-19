@@ -25,6 +25,7 @@ Plans index (`docs/plans/`):
 - [session_closure_20260604.md](docs/plans/session_closure_20260604.md) — fixes verified this session
 - [specialist_handoff_plan.md](docs/plans/specialist_handoff_plan.md) — prompt pack + handoff (done)
 - [web_auth_html_pipeline_plan.md](docs/plans/web_auth_html_pipeline_plan.md) — router/HTML login (next)
-- [implementation_plan.md](docs/plans/implementation_plan.md) — batch notes + artifact compaction (backlog)
+- [implementation_plan.md](docs/plans/implementation_plan.md) — batch notes + artifact compaction (done)
+- [multi_purpose_agent_design.md](docs/plans/Generalization/multi_purpose_agent_design.md) — multi-purpose generalization plan (partially done)
 - [context_trim_plan.md](docs/plans/context_trim_plan.md) — context audit checklist
 - [README.md](docs/plans/README.md) — plans index

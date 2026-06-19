@@ -17,6 +17,30 @@ class StepStatus(str, Enum):
     FAILED = "failed"
     SKIPPED = "skipped"
     PARTIAL = "partial"  # bounded terminal (e.g. search space exhausted)
+    BLOCKED = "blocked"  # attempt cap reached — strategy change required
+
+
+# Trial-and-error cap per atomic step: after this many failed attempts the
+# step is BLOCKED and a strategy-change directive is injected. The agent
+# never idles and never re-issues the identical failing call.
+MAX_STEP_ATTEMPTS = 8
+
+
+def _error_signature(error_text: str) -> str:
+    """Stable signature for 'same error as last time' detection.
+
+    Normalizes volatile fragments (numbers, hex, quoted paths) so that the
+    same root cause at a different line/address still matches.
+    """
+    text = (error_text or "").strip()
+    if not text:
+        return ""
+    first = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+    norm = re.sub(r"0x[0-9a-fA-F]+", "<hex>", first)
+    norm = re.sub(r"\d+", "<n>", norm)
+    norm = re.sub(r"'[^']*'", "'<q>'", norm)
+    norm = re.sub(r'"[^"]*"', '"<q>"', norm)
+    return norm[:200].lower()
 
 
 @dataclass
@@ -29,6 +53,8 @@ class TaskStep:
     assigned_agent: str = "lead"
     success_criteria: str = ""
     delegate_brief: str = ""
+    # VibeThinker explains why this step is needed (for audit/debug)
+    rationale: str = ""
 
 
 _PLACEHOLDER_PWD = re.compile(
@@ -86,10 +112,71 @@ class TaskPlanTracker:
     strategy_notes: list[str] = field(default_factory=list)
     last_failure: str = ""
     evidence_seen: set[str] = field(default_factory=set)
+    # Trial-and-error state per atomic step (persisted across turns)
+    attempt_counts: dict[str, int] = field(default_factory=dict)
+    last_error_signatures: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.steps:
             self.steps = self._parse_steps_from_prompt(self.prompt)
+
+    @classmethod
+    def from_vt_roadmap(
+        cls,
+        prompt: str,
+        roadmap: list[dict],
+    ) -> "TaskPlanTracker":
+        """Construct a TaskPlanTracker from VibeThinker's decomposed roadmap.
+
+        Args:
+            prompt:  The original user message (for fallback and context).
+            roadmap: List of step-dicts from IntentPlanner.decompose().
+                     Expected keys per step: id, label, tool_hint,
+                     assigned_agent, success_criteria, rationale.
+
+        Falls back to the regex parser if the roadmap is empty or invalid.
+        """
+        tracker = cls.__new__(cls)
+        tracker.prompt = prompt
+        tracker.strategy_notes = []
+        tracker.last_failure = ""
+        tracker.evidence_seen = set()
+        tracker.attempt_counts = {}
+        tracker.last_error_signatures = {}
+
+        steps: list[TaskStep] = []
+        for raw in (roadmap or []):
+            if not isinstance(raw, dict):
+                continue
+            step_id = str(raw.get("id") or raw.get("step_id") or "").strip()
+            label   = str(raw.get("label") or raw.get("description") or "").strip()
+            if not step_id or not label:
+                continue
+            # tool_hint: accept a list or a pipe-joined string
+            tool_hint_raw = raw.get("tool_hint") or raw.get("tool") or ""
+            if isinstance(tool_hint_raw, list):
+                tool_hint = "|".join(str(t).strip() for t in tool_hint_raw if t)
+            else:
+                tool_hint = str(tool_hint_raw).strip()
+            # assigned_agent: validate against known agents
+            agent_raw = str(raw.get("assigned_agent") or raw.get("agent") or "lead").strip().lower()
+            assigned_agent = agent_raw if agent_raw in ("lead", "workspace", "web") else "lead"
+            steps.append(TaskStep(
+                id=step_id,
+                label=label[:200],
+                tool_hint=tool_hint or "sequentialthinking",
+                assigned_agent=assigned_agent,
+                success_criteria=str(raw.get("success_criteria") or "")[:200],
+                delegate_brief=str(raw.get("delegate_brief") or label)[:200],
+                rationale=str(raw.get("rationale") or "")[:300],
+            ))
+
+        # VT produced nothing usable — fall back to regex parser
+        if not steps:
+            steps = cls._parse_steps_from_prompt(prompt)
+
+        tracker.steps = steps
+        return tracker
 
     @staticmethod
     def _parse_steps_from_prompt(prompt: str) -> list[TaskStep]:
@@ -168,6 +255,16 @@ class TaskPlanTracker:
                 "write_file",
             ))
 
+        if not steps and re.search(r"(\.ps1|\bps1\b|powershell)", lower) and re.search(
+            r"\b(build|propose|start|must.?have|top\s+\d+|script)\b", lower
+        ):
+            steps.append(TaskStep(
+                "write_scripts",
+                "Create requested PowerShell scripts on disk",
+                "write_file",
+                assigned_agent="workspace",
+            ))
+
         return steps
 
     @property
@@ -228,16 +325,24 @@ class TaskPlanTracker:
                 return
 
         if tool_name == "try_http_login":
-            # Making the attempt satisfies the step regardless of the verdict
-            # (accepted / rejected / unreachable are all reportable terminals).
-            for s in self.steps:
-                if s.id == "attempt_login":
-                    s.status = StepStatus.DONE
-                    if isinstance(result, dict):
-                        s.note = str(result.get("verdict") or result.get("error") or "login attempt made")[:120]
-                    else:
-                        s.note = "login attempt made"
-            return
+            # A real attempt with a verdict satisfies the step (accepted /
+            # rejected / unreachable are all reportable terminals). A tool
+            # error WITHOUT a verdict means no attempt was made — fall through
+            # to the generic failure path instead of marking done.
+            attempted = not (
+                isinstance(result, dict)
+                and result.get("success") is False
+                and not result.get("verdict")
+            )
+            if attempted:
+                for s in self.steps:
+                    if s.id == "attempt_login":
+                        s.status = StepStatus.DONE
+                        if isinstance(result, dict):
+                            s.note = str(result.get("verdict") or result.get("error") or "login attempt made")[:120]
+                        else:
+                            s.note = "login attempt made"
+                return
 
         if tool_name == "crack_hash" and isinstance(result, dict):
             if result.get("status") == "exhausted":
@@ -271,9 +376,18 @@ class TaskPlanTracker:
                 continue
             hints = [h.strip() for h in s.tool_hint.split("|")]
             if tool_name in hints:
-                if isinstance(result, dict) and result.get("success") is False:
+                # Success gating: a step is done only on an actual success
+                # marker — explicit success!=False AND exit code 0/absent.
+                # "A tool ran" is not completion.
+                exec_failed = isinstance(result, dict) and (
+                    result.get("success") is False
+                    or result.get("exit_code", 0) not in (0, None)
+                )
+                if exec_failed:
                     s.status = StepStatus.FAILED
-                    s.note = str(result.get("error", "tool failed"))[:200]
+                    s.note = str(
+                        result.get("error") or result.get("stderr") or "tool failed"
+                    )[:200]
                     self.last_failure = s.note
                 else:
                     if (
@@ -289,8 +403,57 @@ class TaskPlanTracker:
                 break
 
     def needs_readaptation(self) -> bool:
-        # PARTIAL is intentionally excluded — it is a valid terminal outcome.
+        # PARTIAL/BLOCKED intentionally excluded — PARTIAL is a valid terminal
+        # outcome; BLOCKED already triggered its own strategy-change directive.
         return any(s.status == StepStatus.FAILED for s in self.steps)
+
+    _META_TOOLS = frozenset({
+        "append_note", "delegate_to", "sequentialthinking",
+        "finding_create", "finding_list", "report_generate",
+    })
+
+    def register_failure_attempt(self, tool_name: str, result: Any) -> dict[str, Any] | None:
+        """Track a failed executor-tool attempt against the current atomic step.
+
+        Returns attempt info for nudge injection, or None when the result is
+        not a failure / not attributable. At MAX_STEP_ATTEMPTS the step flips
+        to BLOCKED so the roadmap advances instead of looping forever.
+        """
+        if tool_name in self._META_TOOLS or not isinstance(result, dict):
+            return None
+        failed = (
+            result.get("success") is False
+            or result.get("exit_code", 0) not in (0, None)
+        )
+        if not failed:
+            return None
+        cur = self.current_step
+        if cur is None:
+            return None
+
+        error_text = str(
+            result.get("stderr") or result.get("error") or result.get("verdict") or ""
+        )
+        sig = _error_signature(error_text)
+        attempts = self.attempt_counts.get(cur.id, 0) + 1
+        self.attempt_counts[cur.id] = attempts
+        repeat = bool(sig) and self.last_error_signatures.get(cur.id) == sig
+        self.last_error_signatures[cur.id] = sig
+
+        cap_reached = attempts >= MAX_STEP_ATTEMPTS
+        if cap_reached:
+            cur.status = StepStatus.BLOCKED
+            cur.note = f"Blocked after {attempts} failed attempts: {error_text[:120]}"
+            self.record_strategy(
+                f"step {cur.id} blocked at attempt cap — switching strategy"
+            )
+        return {
+            "step_id": cur.id,
+            "attempts": attempts,
+            "max_attempts": MAX_STEP_ATTEMPTS,
+            "repeat_error": repeat,
+            "cap_reached": cap_reached,
+        }
 
     @staticmethod
     def _extract_evidence_markers(tool_name: str, result: dict[str, Any]) -> set[str]:
@@ -348,6 +511,7 @@ class TaskPlanTracker:
                 StepStatus.FAILED: "[!]",
                 StepStatus.SKIPPED: "[-]",
                 StepStatus.PARTIAL: "[≈]",
+                StepStatus.BLOCKED: "[B]",
             }[s.status]
             line = f"{mark} {s.label} (tool: {s.tool_hint})"
             if s.note:
@@ -433,7 +597,9 @@ class TaskPlanTracker:
             return step_index >= min_steps
         if self.needs_readaptation():
             return False
-        terminal = {StepStatus.DONE, StepStatus.PARTIAL, StepStatus.SKIPPED}
+        # BLOCKED is terminal: the attempt cap was reached and a strategy
+        # change was directed; the turn may end with the blocker reported.
+        terminal = {StepStatus.DONE, StepStatus.PARTIAL, StepStatus.SKIPPED, StepStatus.BLOCKED}
         if not all(s.status in terminal for s in self.steps):
             return False
         return step_index >= min_steps
@@ -482,12 +648,15 @@ def _tracker_to_dict(tracker: TaskPlanTracker) -> dict[str, Any]:
                 "assigned_agent": s.assigned_agent,
                 "success_criteria": s.success_criteria,
                 "delegate_brief": s.delegate_brief,
+                "rationale": s.rationale,
             }
             for s in tracker.steps
         ],
         "strategy_notes": list(tracker.strategy_notes),
         "last_failure": tracker.last_failure,
         "evidence_seen": sorted(tracker.evidence_seen),
+        "attempt_counts": dict(tracker.attempt_counts),
+        "last_error_signatures": dict(tracker.last_error_signatures),
     }
 
 
@@ -511,10 +680,17 @@ def _tracker_from_dict(data: dict[str, Any]) -> TaskPlanTracker:
             assigned_agent=str(raw.get("assigned_agent", "lead") or "lead"),
             success_criteria=str(raw.get("success_criteria", "")),
             delegate_brief=str(raw.get("delegate_brief", "")),
+            rationale=str(raw.get("rationale", "")),
         ))
     tracker.strategy_notes = list(data.get("strategy_notes", []))
     tracker.last_failure = str(data.get("last_failure", ""))
     tracker.evidence_seen = set(data.get("evidence_seen", []))
+    tracker.attempt_counts = {
+        str(k): int(v) for k, v in (data.get("attempt_counts") or {}).items()
+    }
+    tracker.last_error_signatures = {
+        str(k): str(v) for k, v in (data.get("last_error_signatures") or {}).items()
+    }
     return tracker
 
 

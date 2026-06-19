@@ -126,21 +126,47 @@ class MissionProgressTracker:
             return True
         if self.append_note_count >= 2 and not self.objective_satisfied():
             return True
+        if self.tools_executed.count("sequentialthinking") >= 2 and not self.objective_satisfied():
+            return True
         return False
 
     def stall_directive(self) -> str:
+        from core.task_intent import detect_mission_kind
+
+        kind = detect_mission_kind(self.prompt)
         base = (
             "[SYSTEM DIRECTIVE] Mission objective not satisfied yet. "
             "Do NOT call append_note or repeat find_file now. "
         )
-        if self.last_verbose_log_file:
+        if kind == "dev":
             return (
                 base
-                + f"Read the saved log in chunks: read_file(path=\"{self.last_verbose_log_file}\", "
-                  "line_start=1, line_count=80). Continue by next_line_start until credentials are found."
+                + "LEAD: call delegate_to(agent='workspace', brief=<script task>) NOW. "
+                  "Workspace: use write_file to create script(s), then run_script or host_exec to verify."
+            )
+        if kind == "file_find":
+            globs = []
+            try:
+                from core.task_intent import extract_filename_globs
+                globs = extract_filename_globs(self.prompt)
+            except Exception:
+                pass
+            glob = globs[0] if globs else "*.txt"
+            return base + f"Use find_file(name='{glob}'), then read_file on the recommended path."
+        if kind in ("pcap", "hash") or self.retrieval_mission:
+            if self.last_verbose_log_file:
+                return (
+                    base
+                    + f"Read the saved log in chunks: read_file(path=\"{self.last_verbose_log_file}\", "
+                      "line_start=1, line_count=80). Continue by next_line_start until credentials are found."
+                )
+            return (
+                base
+                + "Call analyze_pcapng with a narrower filter and verbose=true, then inspect key_fields. "
+                  "If a verbose_log_file is returned, read it in chunks with read_file."
             )
         return (
             base
-            + "Call analyze_pcapng with a narrower filter and verbose=true, then inspect key_fields. "
-              "If a verbose_log_file is returned, read it in chunks with read_file."
+            + "Call a substantive tool aligned with the mission (host_exec, write_file, run_script, "
+              "delegate_to) — do NOT default to PCAP analysis unless the mission asks for it."
         )

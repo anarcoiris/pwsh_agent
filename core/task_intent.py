@@ -129,7 +129,7 @@ def detect_mission_kind(text: str) -> MissionKind:
         lower,
     ))
     dev_task = bool(re.search(
-        r"\b(write|script|python|\.py|\.ps1|\.md|folder|save|create|implement|code|watcher)\b",
+        r"\b(write|script|python|\.py|\.ps1|\.md|folder|save|create|implement|code|watcher|ps1|powershell)\b|(?<![\w])\.(?:py|ps1|md)\b",
         lower,
     )) or (
         bool(re.search(r"\b(read|review)\b", lower))

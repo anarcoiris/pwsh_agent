@@ -1,0 +1,190 @@
+# ─────────────────────────────────────────────────────────────
+#  REPO-HYGIENE  ·  Master Configuration
+#  Cada tarea corre en contexto aislado. Ningún agente hereda
+#  estado de otro. Los cambios siempre van en rama separada.
+# ─────────────────────────────────────────────────────────────
+
+meta:
+  version: "1.0"
+  default_branch: main
+  reports_dir: .reports/hygiene
+  branches_prefix: hygiene/
+  model_provider: ollama               # ollama, gemini, o anthropic
+  model: qwen2.5-coder:7b-instruct     # Ejemplos: ollama/qwen2.5-coder:7b-instruct, gemini/gemini-1.5-flash, anthropic/claude-3-5-sonnet-20241022
+  max_tokens_per_task: 8192
+  dry_run: false                        # true → solo informes, sin commits/PRs
+
+# ── CONTROL DE COSTES ────────────────────────────────────────
+budget:
+  monthly_usd_limit: 50
+  alert_threshold_usd: 40
+  max_files_per_task: 200              # límite de archivos enviados por tarea
+  max_file_size_kb: 100                # archivos más grandes se truncan
+
+# ── CONTEXTO DE PROYECTO ─────────────────────────────────────
+# Ficheros que todos los agentes reciben como contexto inicial.
+# Si no existen, el agente sigue sin ellos.
+project_context:
+  - core.md
+  - README.md
+  - CONTRIBUTING.md
+  - ARCHITECTURE.md
+  - docs/decisions/*.md                # ADRs (Architecture Decision Records)
+
+# ── INTEGRACIONES ────────────────────────────────────────────
+github:
+  create_issues: true
+  create_prs: true                      # Crear PRs para auto-fixes (auto_fixable: true)
+  auto_merge_prs: false                 # requiere revisión humana siempre
+  labels:
+    P0: ["bug", "priority: critical", "hygiene"]
+    P1: ["priority: high", "hygiene"]
+    P2: ["priority: medium", "hygiene"]
+    P3: ["enhancement", "hygiene"]
+  issue_dedup_window_days: 30           # no re-abre issues cerradas recientes
+
+notifications:
+  slack_webhook_env: SLACK_HYGIENE_WEBHOOK   # opcional
+  only_notify_severity: [P0, P1]
+
+# ── DEFINICIÓN DE TAREAS ─────────────────────────────────────
+tasks:
+
+  # ── DAILY ────────────────────────────────────────────────
+  - id: dead-code-scan
+    schedule: daily
+    agent: refactor
+    priority: P1
+    title: "Escaneo de código muerto"
+    description: |
+      Detecta archivos, funciones, clases e imports que no están
+      referenciados por ningún otro módulo del proyecto.
+    scope:
+      include: ["*.py", "core/**/*.py", "tools/**/*.py"]
+      exclude: ["**/test_*.py", "**/test/**/*.py", "**/fixtures/**"]
+    output:
+      report: dead_code_report.md
+      data: dead_code.json
+    actions:
+      open_issue_if: P2_or_above         # abre issue si hay hallazgos P0-P2
+      create_pr_if: auto_fixable         # PR automático para imports muertos
+
+  - id: dependency-audit
+    schedule: daily
+    agent: dependency
+    priority: P0
+    title: "Auditoría de dependencias"
+    description: |
+      Combina análisis estático (imports sin uso) con auditoría de
+      seguridad (vulnerabilidades conocidas) y actualizaciones disponibles.
+    scope:
+      include: ["package.json", "requirements*.txt", "Cargo.toml",
+                "go.mod", "pyproject.toml", "Gemfile", "pom.xml"]
+    output:
+      report: dependency_audit.md
+      data: dependency_audit.json
+    actions:
+      open_issue_if: always
+      create_pr_if: auto_fixable
+
+  # ── WEEKLY ───────────────────────────────────────────────
+  - id: issue-triage
+    schedule: weekly
+    agent: refactor
+    priority: P2
+    title: "Triaje de deuda en código"
+    description: |
+      Revisa TODOs, FIXMEs, código comentado y analiza su antigüedad
+      estimada. Prioriza según impacto y esfuerzo.
+    scope:
+      include: ["*.py", "core/**/*.py", "tools/**/*.py", "scripts/**/*.py", "scripts/**/*.ps1"]
+      exclude: ["dist/**", "build/**", "node_modules/**", ".venv/**", ".repo-hygiene/**"]
+    output:
+      report: issue_triage.md
+      data: issue_triage.json
+    actions:
+      open_issue_if: P1_or_above
+
+  - id: documentation-health
+    schedule: weekly
+    agent: documentation
+    priority: P2
+    title: "Salud de la documentación"
+    description: |
+      Verifica coherencia entre código y docs: ejemplos rotos,
+      APIs documentadas que ya no existen, secciones huérfanas.
+    scope:
+      include: ["*.md", "docs/**/*.md", "*.py", "core/**/*.py", "tools/**/*.py"]
+    output:
+      report: documentation_health.md
+      data: documentation_health.json
+    actions:
+      open_issue_if: P2_or_above
+
+  - id: test-coverage-gaps
+    schedule: weekly
+    agent: refactor
+    priority: P1
+    title: "Brechas de cobertura de tests"
+    description: |
+      Identifica módulos críticos sin tests, tests que no cubren
+      paths de error, y fixtures obsoletos.
+    scope:
+      include: ["*.py", "core/**/*.py", "tools/**/*.py", "tests/**/*.py", "**/test_*.py"]
+    output:
+      report: test_gaps.md
+      data: test_gaps.json
+    actions:
+      open_issue_if: P1_or_above
+
+  # ── MONTHLY ──────────────────────────────────────────────
+  - id: architecture-review
+    schedule: monthly
+    agent: architecture
+    priority: P1
+    title: "Revisión de arquitectura"
+    description: |
+      Detecta módulos duplicados, acoplamiento excesivo,
+      inconsistencias en APIs internas y deuda técnica estructural.
+    scope:
+      include: ["*.py", "core/**/*.py", "tools/**/*.py", "docs/**/*.md"]
+    output:
+      report: architecture_review.md
+      data: architecture_review.json
+    actions:
+      open_issue_if: P1_or_above
+
+  - id: security-posture
+    schedule: monthly
+    agent: dependency
+    priority: P0
+    title: "Revisión de postura de seguridad"
+    description: |
+      Análisis profundo: secrets hardcodeados, configuraciones
+      inseguras, dependencias con CVEs, permisos excesivos.
+    scope:
+      include: ["**/*.env*", "**/*.config.*", "*.py", "core/**/*.py", "tools/**/*.py",
+                "scripts/**", "Dockerfile*", ".github/**"]
+      exclude: ["**/*.env.example", "node_modules/**", ".repo-hygiene/**"]
+    output:
+      report: security_posture.md
+      data: security_posture.json
+    actions:
+      open_issue_if: always
+      severity_override: P0              # todos los hallazgos como P0
+
+  - id: docs-full-audit
+    schedule: monthly
+    agent: documentation
+    priority: P2
+    title: "Auditoría completa de documentación"
+    description: |
+      Revisión profunda del estado global: estructura del proyecto,
+      README principal, wikis, changelogs y guías de contribución.
+    scope:
+      include: ["**/*.md", "docs/**", "wiki/**", "CHANGELOG*"]
+    output:
+      report: docs_full_audit.md
+      data: docs_full_audit.json
+    actions:
+      open_issue_if: P2_or_above

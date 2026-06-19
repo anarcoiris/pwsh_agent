@@ -1,17 +1,24 @@
 """
-core/intent_spec.py — Intent Formalization layer (Phase 1, shadow mode).
+core/intent_spec.py — Intent Formalization + Planning pipeline.
 
-Translates a raw user message into a structured "declaration of intent"
-(`IntentSpec`): domain, objectives, targets, capabilities, success criteria,
-and a safety assessment.
+Two-stage LLM pipeline:
+  Stage 1 — INTAKE (IntentFormalizer, chat-analyzer):
+    Translates a raw user message into a structured IntentSpec: domain,
+    objectives, targets, capabilities, success criteria, safety assessment.
+    JSON-structured output. chat-analyzer (7B) handles this well.
 
-Design notes (see docs/plans/Generalization/multi_purpose_agent_design.md):
-- A deterministic regex *fallback* builder always produces a usable spec with
-  no LLM call. This keeps the layer testable and crash-proof.
-- An optional `IntentFormalizer` uses a small LLM call to produce a richer spec;
-  its output is merged over the fallback (LLM wins; fallback fills gaps).
-- Phase 1 runs in SHADOW MODE: the spec is computed, persisted, and logged, but
-  does NOT yet gate routing/planning/completion. That wiring is later phases.
+  Stage 2 — PLAN (IntentPlanner, vibethinker):
+    Given the IntentSpec, VibeThinker emits a first-person reasoning monologue
+    (internalising the problem), then produces a structured JSON roadmap of
+    TaskStep-compatible dicts. The monologue is persisted for downstream
+    evaluation calls.
+
+Design invariants:
+- The deterministic regex fallback (build_fallback_spec) always produces a
+  usable spec without any LLM call — crash-proof and testable.
+- IntentFormalizer uses chat-analyzer (conversational_model).
+- IntentPlanner uses vibethinker (planner_model) — never loaded simultaneously.
+- shadow_mode=false: the spec now GATES routing/planning/completion.
 """
 
 from __future__ import annotations
@@ -599,3 +606,150 @@ def load_latest_intent_spec(session_id: str) -> IntentSpec | None:
     if isinstance(loaded, dict):
         return IntentSpec.from_dict(loaded)
     return None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# IntentPlanner — VibeThinker PLAN + EVALUATE
+# ──────────────────────────────────────────────────────────────────────────────
+
+class IntentPlanner:
+    """VibeThinker-backed planner: monologue → roadmap decomposition.
+
+    Stage 2 of the pipeline. Called after IntentFormalizer produces an
+    IntentSpec. Never loaded simultaneously with chat-analyzer.
+    """
+
+    def __init__(self, host: str, model: str, num_ctx: int = 16384,
+                 temperature: float = 0.4, monologue_max_tokens: int = 512,
+                 timeout: float = 90.0):
+        import httpx
+        from ollama import AsyncClient
+
+        self.host = host
+        self.model = model
+        self.num_ctx = num_ctx
+        self.temperature = temperature
+        self.monologue_max_tokens = monologue_max_tokens
+        self.client = AsyncClient(host=host, timeout=httpx.Timeout(timeout))
+
+    async def monologue(self, spec: IntentSpec, *, prior: str = "",
+                        exec_result: str = "") -> str:
+        """Emit a first-person reasoning monologue about the mission.
+
+        VibeThinker thinks out loud: what is the real goal, what are the risks,
+        what could go wrong, what is the best sequence of actions.
+        Returns the raw monologue text. Never raises — returns empty on error.
+        """
+        from core.model_dispatch import build_monologue_messages
+        messages = build_monologue_messages(spec, prior_monologue=prior,
+                                           exec_result=exec_result)
+        try:
+            resp = await self.client.chat(
+                model=self.model,
+                messages=messages,
+                options={
+                    "temperature": self.temperature,
+                    "num_predict": self.monologue_max_tokens,
+                    "num_ctx": self.num_ctx,
+                },
+                stream=False,
+            )
+            return (resp.message.content or "").strip()
+        except Exception:
+            return ""
+
+    async def decompose(self, spec: IntentSpec,
+                        monologue: str = "") -> list[dict]:
+        """Decompose an IntentSpec into a structured roadmap.
+
+        Returns a list of step-dicts compatible with TaskPlanTracker:
+          [{id, label, tool_hint, assigned_agent, success_criteria, rationale}, ...]
+        Falls back to [] on any error (caller uses regex fallback).
+        """
+        from core.model_dispatch import build_roadmap_messages
+        messages = build_roadmap_messages(spec, monologue)
+        try:
+            resp = await self.client.chat(
+                model=self.model,
+                messages=messages,
+                options={
+                    "temperature": self.temperature,
+                    "num_predict": 1024,
+                    "num_ctx": self.num_ctx,
+                },
+                format="json",
+                stream=False,
+            )
+            content = (resp.message.content or "").strip()
+        except Exception:
+            return []
+
+        # Parse: VT may return a bare array or {steps: [...]} object
+        m = re.search(r"\[.*\]", content, re.DOTALL)
+        if m:
+            try:
+                steps = json.loads(m.group(0))
+                if isinstance(steps, list):
+                    return steps
+            except (json.JSONDecodeError, TypeError):
+                pass
+        m2 = re.search(r"\{.*\}", content, re.DOTALL)
+        if m2:
+            try:
+                obj = json.loads(m2.group(0))
+                if isinstance(obj, dict):
+                    for key in ("steps", "roadmap", "tasks", "plan"):
+                        if isinstance(obj.get(key), list):
+                            return obj[key]
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return []
+
+    async def evaluate(self, spec: IntentSpec, monologue: str,
+                       exec_result: str, roadmap_status: str) -> dict:
+        """Evaluate execution progress and decide next step.
+
+        Returns:
+          {status: continue|done|blocked|needs_user,
+           next_step_id: str|None, hint: str, monologue: str}
+        """
+        from core.model_dispatch import build_evaluation_messages
+        messages = build_evaluation_messages(spec, monologue, exec_result,
+                                            roadmap_status)
+        _fallback = {
+            "status": "continue",
+            "next_step_id": None,
+            "hint": "",
+            "monologue": "",
+        }
+        try:
+            resp = await self.client.chat(
+                model=self.model,
+                messages=messages,
+                options={
+                    "temperature": self.temperature,
+                    "num_predict": 512,
+                    "num_ctx": self.num_ctx,
+                },
+                format="json",
+                stream=False,
+            )
+            content = (resp.message.content or "").strip()
+        except Exception:
+            return _fallback
+
+        m = re.search(r"\{.*\}", content, re.DOTALL)
+        if not m:
+            return _fallback
+        try:
+            data = json.loads(m.group(0))
+        except (json.JSONDecodeError, TypeError):
+            return _fallback
+        if not isinstance(data, dict):
+            return _fallback
+        return {
+            "status":       str(data.get("status", "continue")),
+            "next_step_id": data.get("next_step_id"),
+            "hint":         str(data.get("hint", ""))[:300],
+            "monologue":    str(data.get("monologue", ""))[:600],
+        }

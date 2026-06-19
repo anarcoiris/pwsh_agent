@@ -22,11 +22,8 @@ class MissionEvaluator:
 
     @staticmethod
     def should_run(prompt: str) -> bool:
-        lower = (prompt or "").lower()
-        return any(
-            k in lower
-            for k in ("retrieve", "login", "password", "xmlobj", "salt", "don't stop", "do not stop")
-        )
+        # Broadened to evaluate progress for all tasks
+        return True
 
     async def evaluate(
         self,

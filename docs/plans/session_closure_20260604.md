@@ -110,5 +110,5 @@ python tests/test_prompt_pack_injection.py
 ## Open follow-ups (not in this closure)
 
 1. Web auth HTML/XML pipeline — [web_auth_html_pipeline_plan.md](./web_auth_html_pipeline_plan.md)
-2. Batch note + strict artifact compaction — [implementation_plan.md](./implementation_plan.md) (pre-existing, not started)
+2. Batch note + strict artifact compaction — [implementation_plan.md](./implementation_plan.md) (completed/shipped in 2026-06-10 session)
 3. ZTE-specific login POST (custom XML body) — part of web auth plan Phase 2

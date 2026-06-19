@@ -95,13 +95,24 @@ class PromptPack:
         network_mode: str = "SANDBOX",
         session_id: str = "",
     ) -> str:
-        """Pinned system prompt: AGENTS + SOUL + TOOLS (CURRENT_STATE injected per turn)."""
+        """Pinned system prompt.
+
+        LEAD: AGENTS + SOUL (TOOLS markdown dropped — the per-turn RELATED TOOL
+        SCHEMAS injection already carries tool details; CURRENT_STATE injected
+        per turn).
+        Specialists: minimal contract — role line, tool-call format, scope
+        rules, and bare tool names. Everything else (nudge, CURRENT STATE,
+        schemas) arrives as transient per-turn injections.
+        """
+        if active_agent != "lead":
+            return self._assemble_specialist_minimal(
+                active_agent=active_agent,
+                network_mode=network_mode,
+                session_id=session_id,
+            )
+
         agents = trim_to_token_budget(self.load_agents_md(), self.budgets.agents_tokens)
         soul = trim_to_token_budget(self.load_soul_md(), self.budgets.soul_tokens)
-        tools_md = trim_to_token_budget(
-            build_tools_md(active_agent),
-            self.budgets.tools_tokens,
-        )
 
         parts = [
             "You are Pulse Windows Agent — an autonomous operator on Windows via PowerShell.",
@@ -119,9 +130,43 @@ class PromptPack:
             parts.append(f"### AGENTS ###\n{agents}\n################")
         if soul:
             parts.append(f"### SOUL ###\n{soul}\n############")
-        if tools_md:
-            parts.append(f"### TOOLS ###\n{tools_md}\n#############")
+        parts.append(
+            "Your tools: " + ", ".join(sorted(SPECIALIST_REGISTRY.get("lead", set())))
+            + ". Schemas arrive in RELATED TOOL SCHEMAS each turn. "
+            "Emit ONE action tool per turn (multiple append_note allowed)."
+        )
 
+        return "\n\n".join(parts)
+
+    def _assemble_specialist_minimal(
+        self,
+        *,
+        active_agent: str,
+        network_mode: str,
+        session_id: str = "",
+    ) -> str:
+        """Strictly indispensable pinned prompt for a specialist micro-turn."""
+        from core.tool_schemas import tool_names_for_agent
+
+        tool_names = tool_names_for_agent(active_agent)
+        parts = [
+            f"You are the {active_agent} specialist of Pulse Windows Agent "
+            f"(Windows / PowerShell). MODE: [{network_mode}]",
+        ]
+        if session_id:
+            parts.append(f"Session: {session_id}")
+        parts.append(
+            "TOOL CALL FORMAT: use <tool_call> XML with valid JSON only.\n"
+            '<tool_call>\n{"name": "tool_name", "arguments": {...}}\n</tool_call>'
+        )
+        parts.append(
+            f"Your tools (schemas in RELATED TOOL SCHEMAS): {', '.join(tool_names)}.\n"
+            "Execute ONE in-scope tool call NOW to complete the delegated action; "
+            "control returns to LEAD automatically afterwards.\n"
+            "append_note, delegate_to, and findings/report tools are unavailable to you.\n"
+            "If a previous attempt failed, fix the cause shown in the error and retry "
+            "with a corrected call — do not repeat an identical call."
+        )
         return "\n\n".join(parts)
 
     def schemas_for_agent(

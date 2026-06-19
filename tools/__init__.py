@@ -50,6 +50,7 @@ from tools.intel import (
     finding_list,
     report_generate,
 )
+from tools.hygiene import hygiene_lookup
 
 # ── Extend TOOLS_SCHEMA with new tool definitions ───────────────────────────
 TOOLS_SCHEMA += [
@@ -117,12 +118,12 @@ TOOLS_SCHEMA += [
         "type": "function",
         "function": {
             "name": "http_get",
-            "description": "Perform a plain HTTP GET of a URL and return the response body (HTML/text), status, and headers. This is the correct tool for 'GET/fetch/download the HTML of <site>' or 'retrieve and analyze the page at <url>' — NOT capture_packets/analyze_pcapng (packet capture is for sniffing traffic, not fetching a web page).",
+            "description": "Perform a plain HTTP GET of a URL. The FULL response body is saved to a session artifact file (artifact_path in result) and a preview is returned inline. After fetching, use grep_file on artifact_path to locate login forms/xmlobj/endpoints. Correct tool for 'GET/fetch/download the HTML of <site>' — NOT capture_packets/analyze_pcapng (packet capture is for sniffing traffic, not fetching a web page).",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "url": {"type": "string", "description": "Full URL to fetch (e.g., http://192.168.1.1/ or http://host/index.html)."},
-                    "max_chars": {"type": "integer", "description": "Maximum number of body characters to return (default: 20000)."},
+                    "max_chars": {"type": "integer", "description": "Maximum body characters returned inline (default: 2500; full body is always at artifact_path)."},
                     "timeout_sec": {"type": "integer", "description": "Request timeout in seconds (default: 20)."}
                 },
                 "required": ["url"]
@@ -284,6 +285,24 @@ TOOLS_SCHEMA += [
     {
         "type": "function",
         "function": {
+            "name": "hygiene_lookup",
+            "description": "Search the repo-hygiene feed for findings (dead code, architecture issues). Returns compact excerpts — use before remediation, not full reports.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Free-text search across finding titles and paths."},
+                    "repo": {"type": "string", "description": "Filter by repo slug (e.g. pwsh_agent)."},
+                    "severity": {"type": "string", "description": "Filter by P0, P1, P2, or P3."},
+                    "finding_id": {"type": "string", "description": "Exact finding id (e.g. REF-001)."},
+                    "auto_fixable_only": {"type": "boolean", "description": "Only return auto-fixable findings."},
+                    "max_results": {"type": "integer", "description": "Max results (default 5)."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "delegate_to",
             "description": "Hand off to a specialist agent (LEAD only). Required before any non-LEAD tool runs.",
             "parameters": {
@@ -317,5 +336,6 @@ __all__ = [
     "http_headers_check", "http_get", "ssl_analysis", "try_http_login", "cve_lookup", "system_info",
     "encode_decode", "hash_identify",
     "finding_create", "finding_list", "report_generate",
+    "hygiene_lookup",
     "TOOLS_SCHEMA",
 ]

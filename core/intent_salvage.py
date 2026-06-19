@@ -1,9 +1,26 @@
-"""Map prose LLM output + user context to concrete tool calls when the parser misses."""
+"""Map malformed LLM tool-call output to valid tool calls — FORMAT HARNESS ONLY.
+
+This module does NOT infer intent from user context. It only:
+  1. Detects prose stalls (model emitting status text instead of acting).
+  2. Catches tool calls that are structurally close to valid but malformed
+     (e.g. tool_name {args} without proper wrapping, Python-style calls).
+  3. Redirects tool calls that are misrouted by format (not by intent).
+  4. When the harness finds nothing, returns None — the caller should ask
+     VibeThinker to reformulate the instruction to the executor model.
+
+Domain-specific salvage logic (pcap/hash/credentials) has been removed.
+VibeThinker handles strategy when the executor model fails to produce valid output.
+"""
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Format-level detectors  (kept: these are format signals, not intent signals)
+# ──────────────────────────────────────────────────────────────────────────────
 
 # Model emits status prose instead of tool calls — treat as stall, not completion.
 PROSE_STALL_RE = re.compile(
@@ -11,32 +28,138 @@ PROSE_STALL_RE = re.compile(
     re.I | re.M,
 )
 
-# PCAP/log content search — not filename discovery in workspace.
-_SEARCH_INTENT_RE = re.compile(
-    r"\b(expand.*search|search.*term|grep|filter|password|xml|xmlobj|login|salt|verbose|credential|"
-    r"analyze.*filter|complete.*previous|previous task)\b",
+# Model echoes the CURRENT STATE handoff banner instead of acting.
+_HANDOFF_ECHO_RE = re.compile(
+    r"\[HANDOFF COMPLETE[^\]]*\]",
     re.I,
 )
 
+# PCAP/log content search glob patterns (kept for redirect_misrouted_search_tool)
 _PCAP_LOG_GLOB_RE = re.compile(r"verbose_[\w.*-]*\.txt|\.pulse/", re.I)
 
-_DISPLAY_FACTS_RE = re.compile(
-    r"\b(show|display|tell|list|what are|give me)\b.*\b(facts?|hash|salt|cracked|credential)\b",
-    re.I,
+# Python-style call: tool_name(arg=value, ...)
+_PYTHON_CALL_RE = re.compile(
+    r'\b([\w]+)\s*\(\s*((?:["\']?\w+["\']?\s*=\s*[^,)]+,?\s*)+)\)',
+    re.DOTALL,
 )
 
-_HASH_CRACK_RE = re.compile(
-    r"(crack.*hash|hash.*crack|brute.*force|password.*hash|\bcrack_hash\b|"
-    r"crack.*sha-?256|sha-?256.*crack|\bhaspro\b|\bhashpro\b|\bhash_pro7\b)",
-    re.I,
-)
+# Bare call: tool_name {"key": "value"} (no wrapper)
+# Built dynamically against the registered tools list.
 
-_PCAP_OR_EXTRACT_RE = re.compile(
-    r"(\.pcapng|\.pcap\b|\btshark\b|\bwireshark\b|last_capture|decode.*packet|"
-    r"analyze.*packet|http packet|login.*packet|locate.*pcap|login_forms\.txt|"
-    r"pwd(?:_[\d]+)?\.txt|credentials?\.txt|extract.*(?:pcap|password|salt))",
-    re.I,
-)
+
+def _default_registered_tools() -> frozenset[str]:
+    """Best-effort list of known tools (used when registry not available)."""
+    return frozenset({
+        "append_note", "find_file", "analyze_pcapng", "host_exec", "run_script",
+        "read_file", "write_file", "sequentialthinking", "capture_packets",
+        "list_network_interfaces", "crack_hash", "system_info", "port_scan",
+        "ping_sweep", "dns_lookup", "find_and_grep", "grep_file",
+        "http_get", "http_headers_check", "ssl_analysis", "try_http_login",
+        "encode_decode", "hash_identify", "delegate_to", "cve_lookup",
+        "finding_create", "finding_list", "report_generate",
+    })
+
+
+_DEFAULT_REGISTERED_TOOLS = _default_registered_tools()
+
+
+def _try_parse_json(s: str) -> Any | None:
+    """Parse JSON with escape-fix fallback."""
+    s = s.strip()
+    if not s:
+        return None
+    for candidate in (s, re.sub(r'\\([^nrt\\"\/ubf])', r'\\\\\1', s)):
+        try:
+            return json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            continue
+    return None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Format harness: detect malformed tool calls
+# ──────────────────────────────────────────────────────────────────────────────
+
+def salvage_intent_tool_call(
+    raw_content: str,
+    user_context: str = "",
+    *,
+    session_id: str | None = None,
+    registered_tools: frozenset[str] | None = None,
+) -> dict[str, Any] | None:
+    """Harness-only salvage: detect structurally malformed tool calls.
+
+    Checks if the model's output contains registered tool names followed by
+    JSON-like argument structures that are close to valid but not wrapped
+    correctly. Does NOT infer intent from context.
+
+    Returns a normalised {function: {name, arguments}} dict, or None.
+    When None is returned, the caller should escalate to VibeThinker.
+    """
+    if not raw_content:
+        return None
+
+    tools = registered_tools or _DEFAULT_REGISTERED_TOOLS
+    content = raw_content.strip()
+
+    # 1. Handoff echo — model is narrating instead of acting
+    if _HANDOFF_ECHO_RE.search(raw_content):
+        return _handoff_return_call(user_context, session_id=session_id)
+
+    # 2. Python-style call: tool_name(key=value, ...)
+    for m in _PYTHON_CALL_RE.finditer(content):
+        name = m.group(1)
+        if name not in tools:
+            continue
+        # Try to convert Python kwargs to a JSON dict
+        kwargs_str = m.group(2)
+        args: dict[str, Any] = {}
+        for kv in re.finditer(r'(\w+)\s*=\s*(["\']?)([^,)]+)\2', kwargs_str):
+            key = kv.group(1)
+            val_raw = kv.group(3).strip()
+            # Coerce obvious types
+            if val_raw.lower() in ("true", "false"):
+                args[key] = val_raw.lower() == "true"
+            elif val_raw.isdigit():
+                args[key] = int(val_raw)
+            else:
+                args[key] = val_raw.strip('"\'')
+        if args:
+            return {"function": {"name": name, "arguments": args}}
+
+    # 3. Bare JSON object after tool name: tool_name {"key": "value"}
+    for tool_name in tools:
+        pattern = rf'\b{re.escape(tool_name)}\s+(\{{.*?\}})'
+        m = re.search(pattern, content, re.DOTALL)
+        if m:
+            parsed = _try_parse_json(m.group(1))
+            if parsed and isinstance(parsed, dict):
+                return {"function": {"name": tool_name, "arguments": parsed}}
+
+    # 4. Tool name on its own line followed immediately by a JSON block
+    for tool_name in tools:
+        pattern = rf'(?:^|\n)\s*{re.escape(tool_name)}\s*\n\s*(\{{.*?\}})'
+        m = re.search(pattern, content, re.DOTALL | re.MULTILINE)
+        if m:
+            parsed = _try_parse_json(m.group(1))
+            if parsed and isinstance(parsed, dict):
+                return {"function": {"name": tool_name, "arguments": parsed}}
+
+    return None
+
+
+def looks_like_prose_stall(content: str) -> bool:
+    """True when the model emitted status prose instead of a tool call."""
+    text = (content or "").strip()
+    if not text:
+        return False
+    if PROSE_STALL_RE.search(text):
+        return True
+    # Reasoning-only turn: long prose, no tool_call/json fence
+    if len(text) > 80 and not re.search(r"<tool_call>|```(?:json)?\s*\{", text, re.I):
+        if re.search(r"\b(will use|next step|filter the content|analyze the filtered)\b", text, re.I):
+            return True
+    return False
 
 
 def redirect_misrouted_search_tool(
@@ -44,8 +167,9 @@ def redirect_misrouted_search_tool(
     args: dict[str, Any],
     anchor_query: str,
 ) -> tuple[str, dict[str, Any], str | None]:
-    """
-    When the user asked to find files by glob, block find_and_grep/grep_file aimed at .pulse logs.
+    """Block find_and_grep/grep_file aimed at .pulse logs when looking for files by name.
+
+    Format-level redirect: the model called the wrong tool class.
     Returns (tool_name, args, redirect_note_or_none).
     """
     from core.task_intent import extract_filename_globs, is_file_discovery_mission
@@ -79,111 +203,133 @@ def redirect_misrouted_search_tool(
     return "find_file", {"name": globs[0]}, note
 
 
-def looks_like_prose_stall(content: str) -> bool:
-    text = (content or "").strip()
-    if not text:
-        return False
-    if PROSE_STALL_RE.search(text):
-        return True
-    # Reasoning-only turn: long prose, no tool_call/json fence
-    if len(text) > 80 and not re.search(r"<tool_call>|```(?:json)?\s*\{", text, re.I):
-        if re.search(r"\b(will use|next step|filter the content|analyze the filtered)\b", text, re.I):
-            return True
-    return False
-
-
-def _find_file_call(glob: str) -> dict[str, Any]:
-    return {"function": {"name": "find_file", "arguments": {"name": glob}}}
-
-
-def _find_and_grep_call(pattern: str | None = None) -> dict[str, Any]:
-    return {
-        "function": {
-            "name": "find_and_grep",
-            "arguments": {
-                "pattern": pattern or "password|Password|Username|xml|xmlObj|616a6178|login",
-                "path_glob": ".pulse/pcap_logs/verbose_*.txt",
-                "max_files": 10,
-                "case_insensitive": True,
-            },
-        }
-    }
-
-
-def salvage_intent_tool_call(
-    raw_content: str,
-    user_context: str = "",
+def mission_lead_dev_guard(
+    tool_name: str,
+    tools_executed: list[str],
+    anchor_query: str,
     *,
-    session_id: str | None = None,
-) -> dict[str, Any] | None:
-    """
-    Infer a concrete tool call from user intent when the model emitted prose only.
-    Used by parser_reflection before falling back to sequentialthinking.
-    """
-    combined = f"{user_context} {raw_content}".lower()
+    active_agent: str = "lead",
+    tool_args: dict | None = None,
+    last_delegate_brief: str = "",
+) -> str | None:
+    """Block LEAD planning loops on dev/script missions — force delegate_to(workspace)."""
+    if active_agent != "lead":
+        return None
+    from core.task_intent import detect_mission_kind
 
-    from core.task_intent import extract_filename_globs, is_file_discovery_mission
-
-    if is_file_discovery_mission(user_context or raw_content):
-        globs = extract_filename_globs(user_context or raw_content)
-        if globs:
-            return _find_file_call(globs[0])
-
-    # Simple hash cracking prompts without PCAP/extraction intent should never trigger grep salvage
-    if _HASH_CRACK_RE.search(combined) and not _PCAP_OR_EXTRACT_RE.search(combined):
+    if detect_mission_kind(anchor_query) != "dev":
         return None
 
-    if _DISPLAY_FACTS_RE.search(combined):
-        paths = []
-        if session_id:
-            paths.append(f"state/sessions/{session_id}/facts.json")
-        paths.extend(["state/sessions/*/facts.json", "workspace/sessions/*/login_forms.txt"])
-        try:
-            from core.session_visibility import _CTX
+    done = list(tools_executed or [])
+    has_delegate = "delegate_to" in done
+    write_count = done.count("write_file")
+    delegate_count = done.count("delegate_to")
 
-            if _CTX.get("fence_enabled"):
-                paths = [p for p in paths if "*" not in p]
-        except Exception:
-            pass
-        for path in paths:
-            if "*" not in path:
-                return {"function": {"name": "read_file", "arguments": {"path": path}}}
-        return {"function": {"name": "find_file", "arguments": {"name": "facts.json"}}}
+    if tool_name in ("run_script", "host_exec", "write_file", "read_file", "grep_file"):
+        return (
+            f"Blocked: {tool_name} is workspace-owned. "
+            "Call delegate_to(agent='workspace', brief=<next script task>) — LEAD orchestrates only."
+        )
 
-    if _SEARCH_INTENT_RE.search(combined) and not is_file_discovery_mission(user_context or raw_content):
-        return _find_and_grep_call()
-
+    if tool_name == "sequentialthinking" and done.count("sequentialthinking") >= 1:
+        return (
+            "Blocked: one planning thought is enough. "
+            "Call delegate_to(agent='workspace', brief=<script task>) now — "
+            "do NOT repeat sequentialthinking."
+        )
+    if (
+        tool_name == "append_note"
+        and done.count("append_note") >= 2
+        and write_count < delegate_count
+    ):
+        return (
+            "Blocked: enough status notes. "
+            "Wait for workspace write_file or delegate the next script."
+        )
+    if tool_name == "delegate_to":
+        brief = str((tool_args or {}).get("brief", "")).strip()
+        if brief and brief == last_delegate_brief.strip() and write_count >= delegate_count:
+            nxt = write_count + 1
+            return (
+                f"Blocked: this brief was already delegated. "
+                f"Delegate script {nxt}/10: write workspace/scripts/tool{nxt}.ps1"
+            )
+        if delegate_count >= 1 and write_count < delegate_count:
+            return "Blocked: workspace is still working — wait for write_file before re-delegating."
+    if tool_name == "report_generate" and write_count == 0:
+        return "Blocked: no scripts written yet — delegate_to workspace and write_file first."
     return None
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# VibeThinker reformulation fallback
+# ──────────────────────────────────────────────────────────────────────────────
+
+def build_vt_reformulation_prompt(
+    failed_content: str,
+    tool_catalog_excerpt: str,
+    user_context: str = "",
+) -> list[dict[str, str]]:
+    """Build messages to ask VibeThinker to reformulate a failed instruction.
+
+    Called when the parser found no tool calls AND the harness found no
+    malformed calls. VibeThinker re-expresses the intended action as a
+    precise instruction that qwen-coder can parse correctly.
+
+    Returns a messages list ready for an Ollama chat call.
+    """
+    system = (
+        "You are VibeThinker, the planning model for an AI agent. "
+        "The executor model (qwen-coder) emitted prose instead of a tool call. "
+        "Your job: re-express the intended action as a SINGLE precise instruction "
+        "that qwen-coder can execute immediately. "
+        "State: which tool to call, what arguments to pass, and why. "
+        "Speak in first person. Be direct and specific. "
+        "End with an exact example of the correct tool call format."
+    )
+    user = (
+        f"The executor model's failed output:\n{(failed_content or '').strip()[:400]}\n\n"
+        f"User's original request: {(user_context or '').strip()[:300]}\n\n"
+        f"Available tools (excerpt):\n{tool_catalog_excerpt[:600]}\n\n"
+        "Reformulate: what should the executor model do next, and exactly how?"
+    )
+    return [
+        {"role": "system", "content": system},
+        {"role": "user",   "content": user},
+    ]
+
+
 def hard_action_nudge(user_context: str = "", session_id: str | None = None) -> str:
-    """Directive with exact tool_call format when reflection loop exhausts."""
-    salvaged = salvage_intent_tool_call("", user_context, session_id=session_id)
-    if salvaged:
-        import json
+    """Directive injected when reflection loop exhausts without producing tool calls.
 
-        name = salvaged["function"]["name"]
-        args = json.dumps(salvaged["function"]["arguments"], indent=2)
-        return (
-            "[SYSTEM DIRECTIVE] Prose is not execution. Emit EXACTLY one tool call NOW "
-            "using <tool_call> tags — no summaries, no [STATUS] lines.\n"
-            f"<tool_call>\n{{\"name\": \"{name}\", \"arguments\": {args}}}\n</tool_call>"
-        )
-    from core.task_intent import extract_filename_globs, is_file_discovery_mission
-
-    if is_file_discovery_mission(user_context):
-        globs = extract_filename_globs(user_context)
-        glob = globs[0] if globs else "*.txt"
-        return (
-            "[SYSTEM DIRECTIVE] Prose is not execution. Emit EXACTLY one tool call NOW "
-            "using <tool_call> tags — no summaries, no [STATUS] lines.\n"
-            f'<tool_call>\n{{"name": "find_file", "arguments": {{"name": "{glob}"}}}}\n</tool_call>'
-        )
+    This is a last-resort format nudge. It no longer hardcodes domain-specific
+    tool calls; instead it prompts the model to emit any valid tool call from
+    the registered set.
+    """
     return (
-        "[SYSTEM DIRECTIVE] Prose is not execution. Emit EXACTLY one tool call NOW "
-        "using <tool_call> tags — no summaries, no [STATUS] lines.\n"
+        "[SYSTEM DIRECTIVE] Prose is not execution. "
+        "Emit EXACTLY one tool call NOW using <tool_call> tags — "
+        "no summaries, no [STATUS] lines, no explanations.\n"
+        "Format:\n"
         "<tool_call>\n"
-        '{"name": "find_and_grep", "arguments": {"pattern": "password|Password|Username|xml|xmlObj|login", '
-        '"path_glob": ".pulse/pcap_logs/verbose_*.txt", "max_files": 10, "case_insensitive": true}}\n'
+        '{"name": "<tool_name>", "arguments": {<args>}}\n'
         "</tool_call>"
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Internal helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _handoff_return_call(user_context: str, session_id: str | None = None) -> dict[str, Any]:
+    """Salvage LEAD action after specialist handoff — update status, do not re-delegate."""
+    path = "workspace/status.md"
+    if session_id:
+        path = f"workspace/sessions/{session_id}/status_{session_id}.md"
+    line = f"Specialist returned — next: continue {(user_context or 'mission').strip()[:120]}"
+    return {
+        "function": {
+            "name": "append_note",
+            "arguments": {"path": path, "line": line},
+        }
+    }

@@ -256,6 +256,9 @@ class AgentOutputParser:
         self, content: str, user_context: str = ""
     ) -> list[dict]:
         blocks: list[Any] = []
+        # Which fallback paths produced candidate blocks this call (audit telemetry).
+        paths: list[str] = []
+        self.last_discovery_paths: list[str] = paths
 
         # Path 2b — tool_name {"arg": "val"} prose (model omits name/arguments wrapper)
         for m in self._tool_name_json.finditer(content):
@@ -263,6 +266,8 @@ class AgentOutputParser:
             parsed = _try_parse_json(m.group(2).strip())
             if parsed is not None and isinstance(parsed, dict):
                 blocks.append({"name": tool_name, "arguments": parsed})
+                if "prose_json" not in paths:
+                    paths.append("prose_json")
 
         # Path 2 — <tool_call>…</tool_call> tags
         for raw in re.findall(
@@ -274,6 +279,8 @@ class AgentOutputParser:
                     parsed = _try_parse_json(line)
                     if parsed is not None:
                         blocks.append(parsed)
+                        if "xml_tag" not in paths:
+                            paths.append("xml_tag")
 
         # Path 3 — ```json … ``` or ``` … ``` fenced blocks
         for raw in re.findall(
@@ -282,6 +289,8 @@ class AgentOutputParser:
             parsed = _try_parse_json(raw.strip())
             if parsed is not None:
                 blocks.append(parsed)
+                if "fenced_json" not in paths:
+                    paths.append("fenced_json")
             else:
                 for line in raw.strip().splitlines():
                     line = line.strip()
@@ -289,6 +298,8 @@ class AgentOutputParser:
                         parsed = _try_parse_json(line)
                         if parsed is not None:
                             blocks.append(parsed)
+                            if "fenced_json" not in paths:
+                                paths.append("fenced_json")
 
         # Path 4 — bare JSON / inline {"name":…,"arguments":…} objects
         stripped = content.strip()
@@ -296,9 +307,13 @@ class AgentOutputParser:
             parsed = _try_parse_json(stripped)
             if parsed is not None:
                 blocks.append(parsed)
+                if "bare_json" not in paths:
+                    paths.append("bare_json")
         for obj in _extract_json_objects(content):
             if obj not in blocks:
                 blocks.append(obj)
+                if "inline_json" not in paths:
+                    paths.append("inline_json")
 
         # Recursively extract normalised {function: {name, arguments}} dicts
         all_calls: list[dict] = []
@@ -306,7 +321,10 @@ class AgentOutputParser:
             all_calls.extend(self._extract_tool_calls_recursive(b))
 
         # Path 5 — ```python / ```powershell code blocks → write_file
-        all_calls.extend(_extract_code_block_tool_calls(content, user_context))
+        code_calls = _extract_code_block_tool_calls(content, user_context)
+        if code_calls:
+            paths.append("code_block")
+        all_calls.extend(code_calls)
 
         return all_calls
 

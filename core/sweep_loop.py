@@ -37,8 +37,21 @@ async def sweep_loop(
     while True:
         await asyncio.sleep(interval_s)
         try:
+            # Poll hygiene-feed mission stubs (repo-hygiene eyes)
+            try:
+                from core.hygiene_missions import poll_hygiene_missions
+                polled = poll_hygiene_missions()
+                if polled:
+                    logger.info("Enqueued %d hygiene mission(s) from feed", polled)
+            except Exception as exc:
+                logger.debug("Hygiene mission poll skipped: %s", exc)
+
             due = get_due_missions()
             if not due:
+                continue
+
+            if getattr(agent, "_mission_running", False):
+                logger.debug("Skipping scheduled missions — interactive mission in progress")
                 continue
 
             for mission in due:

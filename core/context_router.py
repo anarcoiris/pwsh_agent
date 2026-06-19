@@ -50,6 +50,11 @@ _VAGUE_CONTINUE_RE = re.compile(
     re.I,
 )
 
+_HYGIENE_SKILL_RE = re.compile(
+    r"\b(hygiene|dead\s*code|auto[_\s-]?fixable|repo[\s-]?maintenance)\b|(?:REF|DOC|DEP|ARCH)-\d+",
+    re.I,
+)
+
 
 class ContextRouter:
     """Build transient system messages for OllamaAdapter.chat()."""
@@ -67,6 +72,7 @@ class ContextRouter:
         *,
         prompt_pack_mode: bool = False,
         active_agent: str = "lead",
+        priority_tools: list[str] | None = None,
     ) -> list[dict[str, str]]:
         injections: list[dict[str, str]] = []
 
@@ -96,6 +102,7 @@ class ContextRouter:
             schemas_json = schemas_json_for_agent(
                 active_agent,
                 max_chars=max(injection_budget_chars // 2, DEFAULT_SCHEMA_BUDGET_CHARS),
+                priority_tools=priority_tools,
             )
             if schemas_json:
                 injections.append({
@@ -106,6 +113,23 @@ class ContextRouter:
                         "#############################"
                     ),
                 })
+            # Selective skill injection (small budget) — hygiene remediation
+            skill_query = query or ""
+            if skill_query and _HYGIENE_SKILL_RE.search(skill_query):
+                skill_playbook = get_rag_context_for_tools(
+                    ["hygiene_lookup", "delegate_to", "read_file", "write_file"],
+                    skill_query,
+                    max_chars=800,
+                )
+                if skill_playbook:
+                    injections.append({
+                        "role": "system",
+                        "content": (
+                            "### SKILL: Hygiene Remediation ###\n"
+                            f"{skill_playbook}\n"
+                            "##################################"
+                        ),
+                    })
             return injections
 
         phase_hint = DynamicContextBuilder.build_context(messages, anchor_query=query or None)

@@ -1,6 +1,14 @@
 # Plan: Web auth HTML/XML pipeline (PCAP parity)
 
-Status: **PLANNED** — not implemented. Created 2026-06-04 after ZTE router (`192.168.1.1`) login attempts.
+Status: **PHASE 1–2 DONE** (2026-06-10) — Phase 1 (artifact-first `http_get`, `facts.web`, fetch-before-login gate) and Phase 2 Option B (web specialist greps the artifact via shared `grep_file`/`read_file`; playbook in `knowledge/tools/http_get.md`) are implemented. Phase 3 (custom XML/raw POST + cookie jar) and Phases 4–5 remain. Created 2026-06-04 after ZTE router (`192.168.1.1`) login attempts.
+
+Implemented details (Phase 1–2):
+
+- `tools/recon.py::http_get` — full body to `state/sessions/<id>/artifacts/http_get_*.html` before truncation; inline preview default 2500 chars; `artifact_path`, `keyword_hits`, guidance note in result.
+- `core/facts_store.py` — `facts.web.last_page` / `pages` (url, status, length, artifact, keywords) surfaced in `[SESSION FACTS]`.
+- `core/specialists.py` — `grep_file`/`read_file` shared with web (`SHARED_TOOLS`).
+- `agent.py::_fetch_before_login_error` — `try_http_login` blocked until `fetch_page` is done or an artifact exists on disk.
+- Tests: `tests/test_http_get_artifact.py`.
 
 ## Problem statement
 

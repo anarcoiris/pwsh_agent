@@ -20,10 +20,34 @@ console = Console(force_terminal=True)
 class AgentConsole:
     def __init__(self):
         self.agent = agent.ReActAgent()
+        self.agent.ask_user_fn = self.ask_checkpoint
         self.is_running = True
         self._active_status = None
         console_cfg = self.agent.config.get("console", {})
         self.submit_binding = console_cfg.get("submit_binding", "ctrl-enter")
+
+    async def ask_checkpoint(self, message: str) -> str:
+        """Pausa el spinner y muestra una advertencia de Checkpoint pidiendo entrada al usuario."""
+        status_was_active = False
+        if self._active_status:
+            self._active_status.stop()
+            status_was_active = True
+
+        console.print()
+        from rich.markdown import Markdown
+        console.print(Markdown(message))
+        
+        try:
+            def ask_sync():
+                return input("Decision > ").strip()
+            raw_input = await asyncio.to_thread(ask_sync)
+        except Exception:
+            raw_input = "c"
+
+        if status_was_active and self._active_status:
+            self._active_status.start()
+
+        return raw_input
 
     @staticmethod
     def _normalize_command(cmd: str) -> str:
@@ -273,7 +297,16 @@ class AgentConsole:
                         console.print("[bold green]SAFE: Local actions run with standard sandbox assumptions.[/bold green]\n")
 
                 elif cmd == "audit":
-                    self.show_audit()
+                    sub = Prompt.ask(
+                        "Audit view",
+                        choices=["trail", "llm"],
+                        default="trail",
+                    )
+                    if sub == "trail":
+                        self.show_audit()
+                    else:
+                        n_raw = Prompt.ask("Last N LLM exchanges", default="1")
+                        self.show_llm_audit(n_raw)
 
                 elif cmd == "cancel":
                     self.agent.request_cancel()
@@ -346,6 +379,28 @@ class AgentConsole:
                 console.print("\n[yellow]Session interrupted. Type 'exit' to close cleanly.[/yellow]")
             except Exception as e:
                 console.print(f"[bold red]Fatal error during loop: {e}[/bold red]")
+
+    def show_llm_audit(self, n_raw: str = "1"):
+        """Render the last N llm_audit.jsonl exchanges (tokens, tool calls, injections)."""
+        try:
+            n = max(1, int(str(n_raw).strip() or "1"))
+        except ValueError:
+            n = 1
+        try:
+            from tools_dev.llm_audit_view import load_exchanges, render_exchange, summarize_exchange
+
+            entries = load_exchanges(self.agent.session_id, n)
+            if not entries:
+                console.print(
+                    f"[yellow]No llm_audit.jsonl entries for session "
+                    f"{self.agent.session_id} (agent.llm_audit may be 'off').[/yellow]\n"
+                )
+                return
+            for entry in entries:
+                console.print(render_exchange(summarize_exchange(entry)))
+            console.print()
+        except Exception as e:
+            console.print(f"[red]llm audit view error: {e}[/red]\n")
 
     def show_audit(self):
         audit = get_audit()

@@ -4,16 +4,31 @@ ollama:
   # Base URL for the local Ollama instance (same port 11435)
   base_url: "http://localhost:11435"
 
-  # Default model used for coding, reasoning, and tool calling
+  # ── 3-phase model pipeline ────────────────────────────────────────────────
+  # INTAKE  (chat-analyzer): user msg → structured IntentSpec (JSON output)
+  # PLAN    (vibethinker):   IntentSpec → 1st-person monologue → roadmap
+  # EXECUTE (qwen-coder):    tool_calls, code, strict syntax
+  # EVALUATE (vibethinker):  execution result → next step / done?
+  # Models are loaded/unloaded sequentially — never simultaneously.
+  # Future: pin to dedicated Pascal GPUs when available (no unload needed).
+  # ─────────────────────────────────────────────────────────────────────────
+
+  # EXECUTE phase: tool-calling, code, strict syntax
   default_model: "qwen2.5-coder:7b-instruct"
 
-  # Conversational/translation model if needed
+  # INTAKE phase: formalises user intention into structured IntentSpec
   conversational_model: "chat-analyzer"
 
-  # Context window — ensure the model is loaded with >= this context (Modelfile / OLLAMA_CONTEXT_LENGTH)
+  # PLAN + EVALUATE phase: leads the process, monologue, roadmap, evaluation
+  planner_model: "vibethinker:3b"
+
+  # Context window for the execute model
   num_ctx: 8192
+  # Context window for the planner model (VibeThinker has 16k)
+  num_ctx_planner: 16384
+
   num_predict: 3072
-  num_predict_synthesis: 4096
+  num_predict_planner: 2048
 
 agent:
   # Maximum steps in a single autonomous ReAct loop
@@ -45,21 +60,55 @@ agent:
   # disk for audit; CURRENT STATE carries durable continuity. 0 = send all.
   history_window_turns: 8
 
+  # LLM I/O audit (state/sessions/<id>/llm_audit.jsonl):
+  #   full — entire message array + tools schema + response (debug missions)
+  #   meta — roles/lengths/token counts only (daily default, avoids quadratic logs)
+  #   off  — disabled
+  # Validated 2026-06-10 with full; meta is the daily default.
+  llm_audit: meta
+
 intent:
-  # Phase 1 intent formalization. shadow_mode computes/logs a structured
-  # IntentSpec per turn WITHOUT gating routing/planning/completion yet.
-  shadow_mode: true
-  # Use a small LLM call to enrich the spec. If false (or no model resolves),
-  # the deterministic regex fallback is used instead.
+  # INTAKE phase: chat-analyzer formalises the user message into a structured
+  # IntentSpec (JSON). shadow_mode=false → the spec now GATES routing/planning.
+  shadow_mode: false
   use_llm: true
-  # Model for formalization; defaults to ollama.conversational_model when unset.
+  # Intake model: defaults to ollama.conversational_model (chat-analyzer)
   model: null
   temperature: 0.1
-  # Inject a concise "DECLARED INTENT" context block (domain, objectives,
-  # success criteria, safety) so the agent self-directs and judges completion
-  # against the criteria. Informational only — does not hard-gate tools.
   inject_context: true
+
+planner:
+  # PLAN + EVALUATE phase — VibeThinker leads the process.
+  # monologue: VT emits a first-person reasoning monologue before producing
+  #   the structured roadmap. This helps smaller models "think out loud".
+  monologue_enabled: true
+  monologue_max_tokens: 512
+  # Re-evaluate after: mission start, any failure/warning, any code/cmd result
+  reevaluate_on: ["start", "failure", "warning", "exec_result"]
+  temperature: 0.4
+
+checkpoint:
+  # User checkpoint: blocks execution and asks the user for direction.
+  # The user can answer once or whitelist "always continue in this case".
+  enabled: true
+  # Trigger types that pause and ask the user
+  triggers:
+    - needs_readaptation    # a roadmap step FAILED
+    - stall_recovery        # 3+ non-substantive tools in a row
+    - attempt_cap_reached   # step BLOCKED after 8 failed attempts
+    - exec_result_review    # after every code/script execution result
+  # Persist whitelist decisions: {trigger_type: "always_continue" | "always_ask"}
+  whitelist_file: "state/checkpoint_whitelist.json"
 
 console:
   # Multiline submit binding. Options: "ctrl-enter", "esc-enter", "enter"
   submit_binding: "ctrl-enter"
+
+hygiene_eyes:
+  feed_dir: "C:/Users/soyko/Documents/Libraries/hygiene-feed"
+  poll_missions: true
+  poll_interval_seconds: 120
+
+rag:
+  extra_dirs:
+    - "C:/Users/soyko/Documents/Libraries/hygiene-feed"

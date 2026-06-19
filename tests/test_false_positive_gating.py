@@ -82,18 +82,21 @@ def test_passwd_find_mission_uses_file_find_phase():
     assert ".pulse/pcap_logs" not in ctx.split("Do NOT")[0]
 
 
-def test_file_find_salvage_uses_find_file_not_grep():
-    from core.intent_salvage import redirect_misrouted_search_tool, salvage_intent_tool_call
+def test_file_find_salvage_redirect_still_works():
+    """redirect_misrouted_search_tool is a format redirect — still active."""
+    from core.intent_salvage import redirect_misrouted_search_tool
 
     msg = (
         "find any passwd*.txt or pass*.txt file in your workspace and nearby folders, "
         "then report the content"
     )
+    # Harness: salvage_intent_tool_call no longer infers intent from context alone.
+    # That role now belongs to VibeThinker. salvage returns None for prose-only input.
+    from core.intent_salvage import salvage_intent_tool_call
     salvaged = salvage_intent_tool_call("", msg)
-    assert salvaged is not None
-    assert salvaged["function"]["name"] == "find_file"
-    assert salvaged["function"]["arguments"]["name"] == "passwd*.txt"
+    assert salvaged is None  # harness-only: no malformed format detected
 
+    # Format redirect is unchanged: find_and_grep aimed at .pulse → find_file
     new_name, new_args, note = redirect_misrouted_search_tool(
         "find_and_grep",
         {"pattern": "passwd", "path_glob": "*.pulse/**"},
@@ -104,13 +107,24 @@ def test_file_find_salvage_uses_find_file_not_grep():
     assert note
 
 
-def test_hash_cracking_excludes_grep_salvage():
+def test_harness_catches_python_style_tool_call():
+    """Harness detects Python-style malformed calls: tool_name(key=value)."""
     from core.intent_salvage import salvage_intent_tool_call
-    msg = 'crack this hash "18846efb090813788c3246ce05884e7155eee92186ec23569abc0c39b44b7032" with this salt "55077791" to recover password'
-    salvaged = salvage_intent_tool_call(
-        raw_content="Task is complete.",
-        user_context=msg,
-        session_id="test_session"
-    )
-    assert salvaged is None
+
+    raw = "I think we should use find_file(name='report_*.md') to locate the report."
+    salvaged = salvage_intent_tool_call(raw)
+    assert salvaged is not None
+    assert salvaged["function"]["name"] == "find_file"
+    assert salvaged["function"]["arguments"].get("name") == "report_*.md"
+
+
+def test_harness_catches_bare_json_after_tool_name():
+    """Harness detects bare JSON after tool name (missing wrapper)."""
+    from core.intent_salvage import salvage_intent_tool_call
+
+    raw = 'read_file {"path": "workspace/status.md"}'
+    salvaged = salvage_intent_tool_call(raw)
+    assert salvaged is not None
+    assert salvaged["function"]["name"] == "read_file"
+    assert salvaged["function"]["arguments"]["path"] == "workspace/status.md"
 

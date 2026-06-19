@@ -1,0 +1,33 @@
+# Model benchmark profiles for tools_dev/benchmark_models.py
+# Ollama model names must match `ollama list` on port 11435
+
+VIBE_MODEL: "hf.co/oussaber/VibeThinker-3B-Q4_K_M-GGUF"
+QWEN_CODER: "qwen2.5-coder:7b-instruct"
+QWEN_3B: "qwen2.5:3b"
+CHAT_ANALYZER: "chat-analyzer"
+
+profiles:
+  baseline:
+    default_model: qwen2.5-coder:7b-instruct
+    synthesis_model: null
+    conversational_model: chat-analyzer
+
+  vibe_solo:
+    default_model: hf.co/oussaber/VibeThinker-3B-Q4_K_M-GGUF
+    synthesis_model: null
+    conversational_model: hf.co/oussaber/VibeThinker-3B-Q4_K_M-GGUF
+
+  qwen_vibe_synth:
+    default_model: qwen2.5-coder:7b-instruct
+    synthesis_model: hf.co/oussaber/VibeThinker-3B-Q4_K_M-GGUF
+    conversational_model: qwen2.5:3b
+
+  qwen_vibe_aux:
+    default_model: qwen2.5-coder:7b-instruct
+    synthesis_model: null
+    conversational_model: hf.co/oussaber/VibeThinker-3B-Q4_K_M-GGUF
+
+  qwen_3b_synth:
+    default_model: qwen2.5-coder:7b-instruct
+    synthesis_model: qwen2.5:3b
+    conversational_model: qwen2.5:3b

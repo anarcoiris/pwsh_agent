@@ -298,21 +298,50 @@ try {{
     return {"success": False, "url": url, "error": result.get("error") or result.get("stderr", "HTTP check failed")}
 
 
-def http_get(url: str, max_chars: int = 20000, timeout_sec: int = 20) -> dict:
-    """
-    Perform a plain HTTP GET of a URL and return the response body (HTML/text).
+_WEB_KEYWORDS = ("login", "xmlobj", "password", "form", "session", "token", "auth")
 
-    This is the right tool for "GET/fetch/download the HTML of <site>" or
-    "retrieve and analyze the page at <url>" — NOT capture_packets/analyze_pcapng
-    (packet capture is for sniffing traffic, not for fetching a web page).
+
+def _save_http_artifact(url: str, content: str) -> str:
+    """Write the FULL response body to a session artifact before any truncation."""
+    try:
+        import hashlib
+        from datetime import datetime, timezone
+
+        from core.session_paths import load_active_session_id, session_artifacts_dir
+
+        out_dir = session_artifacts_dir(load_active_session_id())
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        digest = hashlib.sha1(
+            (url + content[:200]).encode("utf-8", errors="replace")
+        ).hexdigest()[:10]
+        path = out_dir / f"http_get_{ts}_{digest}.html"
+        path.write_text(content, encoding="utf-8")
+        return str(path)
+    except Exception:
+        return ""
+
+
+def http_get(url: str, max_chars: int = 2500, timeout_sec: int = 20) -> dict:
+    """
+    Perform a plain HTTP GET of a URL and return a preview of the response body.
+
+    The FULL body is always saved to a session artifact file (artifact_path in
+    the result) BEFORE truncation — use grep_file/read_file on that path to
+    analyze large pages (login forms, xmlobj, JS endpoints). This is the right
+    tool for "GET/fetch/download the HTML of <site>" — NOT
+    capture_packets/analyze_pcapng (packet capture is for sniffing traffic,
+    not for fetching a web page).
 
     Args:
         url: Full URL to fetch (e.g. http://192.168.1.1/ or http://host/index.html).
-        max_chars: Maximum number of body characters to return (default: 20000).
+        max_chars: Maximum body characters returned inline (default: 2500 — the
+            full body is on disk at artifact_path regardless).
         timeout_sec: Request timeout in seconds (default: 20).
 
     Returns:
-        Dict with status_code, headers, content (truncated), content_length.
+        Dict with status_code, headers, content (preview), content_length,
+        truncated, artifact_path (full body on disk), keyword_hits.
     """
     ps_cmd = f"""
 try {{
@@ -340,7 +369,12 @@ try {{
         if not isinstance(content, str):
             content = str(content)
         truncated = len(content) > max_chars
-        return {
+        # Persist the full body BEFORE truncation; scan keywords on the
+        # full body, not the preview.
+        artifact_path = _save_http_artifact(url, content) if content else ""
+        lower = content.lower()
+        keyword_hits = [k for k in _WEB_KEYWORDS if k in lower]
+        out = {
             "success": True,
             "url": url,
             "status_code": data.get("StatusCode"),
@@ -348,7 +382,16 @@ try {{
             "content_length": len(content),
             "truncated": truncated,
             "content": content[:max_chars],
+            "artifact_path": artifact_path,
+            "keyword_hits": keyword_hits,
         }
+        if artifact_path and truncated:
+            out["note"] = (
+                f"Full body ({len(content)} chars) saved to {artifact_path}. "
+                f"Use grep_file(path='{artifact_path}', pattern='login|xmlobj|password|form|action=') "
+                "to locate the login mechanism before attempting authentication."
+            )
+        return out
     return {"success": False, "url": url, "error": result.get("error") or result.get("stderr", "HTTP GET failed")}
 
 

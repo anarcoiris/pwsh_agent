@@ -1,0 +1,156 @@
+# ─────────────────────────────────────────────────────────────
+#  REPO-HYGIENE · GitHub Actions
+#  Un workflow unificado con tres triggers de schedule.
+#  Cada trigger pasa un parámetro distinto al orquestador.
+# ─────────────────────────────────────────────────────────────
+name: Repo Hygiene
+
+on:
+  # ── Schedules automáticos ──────────────────────────────────
+  schedule:
+    - cron: "0 3 * * *"          # daily  · 03:00 UTC todos los días
+    - cron: "0 4 * * 1"          # weekly · 04:00 UTC cada lunes
+    - cron: "0 5 1 * *"          # monthly · 05:00 UTC el día 1 de cada mes
+
+  # ── Disparo manual con parámetros ─────────────────────────
+  workflow_dispatch:
+    inputs:
+      schedule:
+        description: "Qué tareas ejecutar"
+        required: true
+        default: "daily"
+        type: choice
+        options: [daily, weekly, monthly, all]
+      task_id:
+        description: "Ejecutar solo una tarea (deja vacío para todo el schedule)"
+        required: false
+        default: ""
+      dry_run:
+        description: "Dry-run (solo informes, sin issues/PRs)"
+        required: false
+        default: "false"
+        type: boolean
+
+# Un solo job por vez para no correr tareas solapadas
+concurrency:
+  group: repo-hygiene
+  cancel-in-progress: false
+
+jobs:
+  hygiene:
+    name: "Hygiene · ${{ github.event_name == 'workflow_dispatch' && inputs.schedule || 'scheduled' }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+
+    steps:
+      # ── Setup ───────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0              # historial completo para análisis de antigüedad
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install anthropic pyyaml
+
+      # ── Determinar el schedule activo ────────────────────────
+      - name: Resolve schedule
+        id: resolve
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "schedule=${{ inputs.schedule }}"         >> $GITHUB_OUTPUT
+            echo "task_id=${{ inputs.task_id }}"           >> $GITHUB_OUTPUT
+            echo "dry_run=${{ inputs.dry_run }}"           >> $GITHUB_OUTPUT
+          else
+            # Detectar qué cron disparó el workflow por hora UTC
+            HOUR=$(date -u +%H)
+            DOW=$(date -u +%u)    # 1=lun … 7=dom
+            DOM=$(date -u +%d)
+
+            if   [ "$DOM" = "01" ] && [ "$HOUR" = "05" ]; then
+              echo "schedule=monthly" >> $GITHUB_OUTPUT
+            elif [ "$DOW" = "1"  ] && [ "$HOUR" = "04" ]; then
+              echo "schedule=weekly"  >> $GITHUB_OUTPUT
+            else
+              echo "schedule=daily"   >> $GITHUB_OUTPUT
+            fi
+            echo "task_id="    >> $GITHUB_OUTPUT
+            echo "dry_run=false" >> $GITHUB_OUTPUT
+          fi
+
+      # ── Herramientas opcionales de auditoría ─────────────────
+      - name: Install audit tools (best-effort)
+        run: |
+          npm install -g npm@latest 2>/dev/null || true
+          pip install pip-audit 2>/dev/null || true
+        continue-on-error: true
+
+      # ── Ejecutar orquestador ─────────────────────────────────
+      - name: Run Orchestrator
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ARGS="--schedule ${{ steps.resolve.outputs.schedule }}"
+
+          if [ -n "${{ steps.resolve.outputs.task_id }}" ]; then
+            ARGS="$ARGS --task ${{ steps.resolve.outputs.task_id }}"
+          fi
+
+          if [ "${{ steps.resolve.outputs.dry_run }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+
+          python .repo-hygiene/scripts/orchestrator.py $ARGS
+
+      # ── Subir informes como artefactos ───────────────────────
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hygiene-reports-${{ steps.resolve.outputs.schedule }}-${{ github.run_id }}
+          path: .reports/hygiene/
+          retention-days: 90
+
+      # ── Commit de informes al repo (rama dedicada) ───────────
+      - name: Commit reports
+        if: success()
+        run: |
+          git config user.name  "repo-hygiene[bot]"
+          git config user.email "repo-hygiene[bot]@users.noreply.github.com"
+
+          # Solo añade si hay cambios en .reports/
+          if git status --short .reports/hygiene/ | grep -q .; then
+            BRANCH="hygiene/reports-$(date -u +%Y-%m-%d)"
+            git checkout -B "$BRANCH"
+            git add .reports/hygiene/
+            git commit -m "chore(hygiene): ${{ steps.resolve.outputs.schedule }} reports $(date -u +%Y-%m-%d)"
+            git push origin "$BRANCH" --force-with-lease
+            echo "✓ Informes pusheados a $BRANCH"
+          else
+            echo "Sin cambios en .reports/"
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Notificación Slack (opcional) ────────────────────────
+      - name: Notify Slack on failure
+        if: failure() && env.SLACK_WEBHOOK != ''
+        run: |
+          curl -s -X POST "$SLACK_WEBHOOK" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "text": "⚠️ *repo-hygiene falló* en `'"${{ github.repository }}"'`\nSchedule: `'"${{ steps.resolve.outputs.schedule }}"'`\nRun: '"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"'"
+            }'
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_HYGIENE_WEBHOOK }}

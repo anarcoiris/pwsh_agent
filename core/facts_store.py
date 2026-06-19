@@ -287,6 +287,25 @@ def update_from_tool(session_id: str, tool_name: str, result: dict[str, Any], ar
                 return save_facts(session_id, facts)
         return None
 
+    if tool_name == "http_get":
+        url = _clip(str(result.get("url") or args.get("url") or ""), 200)
+        if url:
+            web = facts.setdefault("web", {})
+            page = {
+                "url": url,
+                "status_code": result.get("status_code"),
+                "content_length": result.get("content_length"),
+                "artifact_path": _clip(str(result.get("artifact_path") or ""), 260),
+                "keyword_hits": list(result.get("keyword_hits") or [])[:10],
+            }
+            web["last_page"] = page
+            pages = web.setdefault("pages", [])
+            if not any(p.get("url") == url for p in pages if isinstance(p, dict)):
+                pages.append(page)
+                del pages[:-5]
+            return save_facts(session_id, facts)
+        return None
+
     return None
 
 
@@ -334,9 +353,20 @@ def summarize_facts(session_id: str, max_chars: int = 700) -> str:
     web_targets: list[str] = []
     for vals in web.values():
         if isinstance(vals, list):
-            web_targets.extend(vals)
+            web_targets.extend(v for v in vals if isinstance(v, str))
     if web_targets:
         lines.append(f"web.targets={','.join(web_targets[:6])}")
+    last_page = web.get("last_page") or {}
+    if isinstance(last_page, dict) and last_page.get("url"):
+        lines.append(
+            f"web.last_page={last_page.get('url')} "
+            f"({last_page.get('content_length')} chars)"
+        )
+        if last_page.get("artifact_path"):
+            lines.append(f"web.artifact={last_page.get('artifact_path')}")
+        hits = last_page.get("keyword_hits") or []
+        if hits:
+            lines.append(f"web.keywords={','.join(hits[:8])}")
     if not lines:
         return ""
     out = "[SESSION FACTS]\n" + "\n".join(lines)

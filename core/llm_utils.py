@@ -275,12 +275,26 @@ class RetryOrchestrator:
         Returns None once MAX_REFLECTIONS is exceeded (caller should inject
         a hard stall nudge instead).
         """
+        salvaged = None
+        intent_call = None
         # Salvage path: model wrote valid tool JSON as plain text
         if parser is not None:
             salvaged = parser.salvage_tool_call(raw_content)
             if salvaged:
                 logger.info("parser_reflection: salvaged tool call %s", salvaged["function"]["name"])
                 self._parse_fail_count = 0
+                # #region agent log
+                try:
+                    from core.debug_log import trace
+                    trace(
+                        "core.llm_utils:parser_reflection",
+                        "salvaged tool call",
+                        {"path": "json_salvage", "tool": salvaged["function"]["name"]},
+                        run_id="parse",
+                    )
+                except Exception:
+                    pass
+                # #endregion
                 return salvaged
 
         # Intent salvage: map user/action prose to a concrete tool (avoid thinking loops)
@@ -297,11 +311,42 @@ class RetryOrchestrator:
                     intent_call["function"]["name"],
                 )
                 self._parse_fail_count = 0
+                # #region agent log
+                try:
+                    from core.debug_log import trace
+                    trace(
+                        "core.llm_utils:parser_reflection",
+                        "salvaged tool call",
+                        {"path": "intent_salvage", "tool": intent_call["function"]["name"]},
+                        run_id="parse",
+                    )
+                except Exception:
+                    pass
+                # #endregion
                 return intent_call
         except Exception:
             pass
 
         self._parse_fail_count += 1
+        # #region agent log
+        try:
+            from core.debug_log import trace
+            trace(
+                "core.llm_utils:parser_reflection",
+                "falling back to sequentialthinking reflection",
+                {
+                    "parse_fail_count": self._parse_fail_count,
+                    "has_handoff_echo": "HANDOFF COMPLETE" in (raw_content or ""),
+                    "snippet_head": (raw_content or "")[:200],
+                    "user_ctx_head": (getattr(parser, "_user_context", "") if parser else "")[:120],
+                    "json_salvage": salvaged is not None,
+                    "intent_salvage": intent_call is not None,
+                },
+                run_id="parse",
+            )
+        except Exception:
+            pass
+        # #endregion
         if self._parse_fail_count > self.MAX_REFLECTIONS:
             logger.warning(
                 "parser_reflection: MAX_REFLECTIONS (%d) hit — stopping reflection loop",
@@ -312,7 +357,12 @@ class RetryOrchestrator:
         snippet = raw_content[:400].strip()
         user_ctx = getattr(parser, "_user_context", "") if parser else ""
         from core.task_intent import detect_mission_kind, extract_filename_globs
-        from core.intent_salvage import _SEARCH_INTENT_RE
+        # Phase-detection: PCAP/credential search intent — used only locally.
+        _SEARCH_INTENT_RE = re.compile(
+            r"\b(expand.*search|search.*term|grep|filter|password|xml|xmlobj|login|salt|verbose|"
+            r"analyze.*filter|complete.*previous|previous task)\b",
+            re.I,
+        )
 
         kind = detect_mission_kind(user_ctx)
         if kind == "file_find":
@@ -464,7 +514,12 @@ class DynamicContextBuilder:
                 "Do NOT default path_glob to .pulse/pcap_logs — that is only for PCAP verbose logs.\n"
             )
 
-        from core.intent_salvage import _SEARCH_INTENT_RE
+        # Phase-detection: PCAP/credential search intent — used only locally.
+        _SEARCH_INTENT_RE = re.compile(
+            r"\b(expand.*search|search.*term|grep|filter|password|xml|xmlobj|login|salt|verbose|"
+            r"analyze.*filter|complete.*previous|previous task)\b",
+            re.I,
+        )
         from core.task_intent import is_file_discovery_mission
 
         if _SEARCH_INTENT_RE.search(latest_lower) and not is_file_discovery_mission(latest):

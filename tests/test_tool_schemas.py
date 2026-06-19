@@ -52,3 +52,16 @@ def test_forensic_includes_find_tshark():
 def test_default_budget_fits_largest_agent():
     lead_schemas = schemas_for_agent("lead", max_chars=DEFAULT_SCHEMA_BUDGET_CHARS)
     assert len(lead_schemas) == len(SPECIALIST_REGISTRY["lead"])
+
+
+def test_plan_priority_tools_move_to_front():
+    # Plan step hints (e.g. fetch_page → http_get) take selection priority.
+    order = tool_names_for_agent("web", priority_tools=["http_get"])
+    assert order[0] == "http_get"
+    # Hints outside the agent registry are ignored, roster preserved.
+    order = tool_names_for_agent("web", priority_tools=["crack_hash"])
+    assert order == tool_names_for_agent("web")
+    # Priority survives a tight schema budget.
+    schemas = schemas_for_agent("web", max_chars=900, priority_tools=["http_get"])
+    names = [s["function"]["name"] for s in schemas]
+    assert names and names[0] == "http_get"

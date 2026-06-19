@@ -22,6 +22,7 @@ SPECIALIST_REGISTRY: dict[str, frozenset[str]] = {
         "sequentialthinking",
         "delegate_to",
         "append_note",
+        "hygiene_lookup",
         "finding_create",
         "finding_list",
         "report_generate",
@@ -34,12 +35,18 @@ SPECIALIST_REGISTRY: dict[str, frozenset[str]] = {
         "find_and_grep",
         "run_script",
         "host_exec",
+        "hygiene_lookup",
     }),
     "web": frozenset({
         "http_get",
         "try_http_login",
         "http_headers_check",
         "ssl_analysis",
+        # Artifact analysis: http_get spills the full page to a session
+        # artifact; the web specialist greps/reads it to find the login
+        # mechanism before posting credentials (PCAP-pipeline parity).
+        "grep_file",
+        "read_file",
     }),
     "recon": frozenset({
         "dns_lookup",
@@ -91,6 +98,7 @@ TOOL_SUMMARIES: dict[str, str] = {
     "sequentialthinking": "One brief planning thought before acting.",
     "delegate_to": "Hand off to a specialist (LEAD only).",
     "append_note": "Progress line to plan/status/session log.",
+    "hygiene_lookup": "Query repo-hygiene feed for findings before remediation.",
     "finding_create": "Record a structured finding.",
     "finding_list": "List findings for this session.",
     "report_generate": "Produce an engagement report from findings.",
@@ -127,6 +135,12 @@ def all_registry_tools() -> frozenset[str]:
     return frozenset(out)
 
 
+# Tools deliberately available to more than one specialist. grep_file and
+# read_file are shared with web so fetched-page artifacts can be analyzed
+# in-scope (PCAP-pipeline parity) without a workspace round-trip.
+SHARED_TOOLS = frozenset({"grep_file", "read_file"})
+
+
 def validate_registry() -> list[str]:
     """Return list of validation errors (empty if ok)."""
     errors: list[str] = []
@@ -135,7 +149,7 @@ def validate_registry() -> list[str]:
         if agent_id not in AGENT_IDS:
             errors.append(f"unknown agent id: {agent_id}")
         for tool in tool_set:
-            if tool in seen:
+            if tool in seen and tool not in SHARED_TOOLS:
                 errors.append(f"tool {tool!r} in both {seen[tool]!r} and {agent_id!r}")
             else:
                 seen[tool] = agent_id

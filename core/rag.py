@@ -18,6 +18,26 @@ _KNOWLEDGE_DIR = app_root() / "knowledge"
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 
 
+def _extra_knowledge_dirs() -> list[Path]:
+    """Optional extra RAG roots from config.yaml rag.extra_dirs."""
+    cfg_path = app_root() / "config.yaml"
+    if not cfg_path.exists():
+        return []
+    try:
+        import yaml
+        with open(cfg_path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        raw_dirs = cfg.get("rag", {}).get("extra_dirs", []) or []
+        dirs: list[Path] = []
+        for raw in raw_dirs:
+            p = Path(str(raw)).expanduser()
+            if p.is_dir():
+                dirs.append(p.resolve())
+        return dirs
+    except Exception:
+        return []
+
+
 def _parse_frontmatter(content: str) -> tuple[dict[str, Any], str]:
     """Return (metadata dict, body without frontmatter)."""
     m = _FRONTMATTER_RE.match(content)
@@ -47,8 +67,9 @@ class LocalRAG:
     Requires no external packages or database engines.
     """
 
-    def __init__(self, knowledge_dir: Path = _KNOWLEDGE_DIR):
+    def __init__(self, knowledge_dir: Path = _KNOWLEDGE_DIR, extra_dirs: list[Path] | None = None):
         self.knowledge_dir = knowledge_dir
+        self.extra_dirs = extra_dirs if extra_dirs is not None else _extra_knowledge_dirs()
         self.sections: list[dict[str, Any]] = []
         self._load_knowledge_base()
 
@@ -61,10 +82,17 @@ class LocalRAG:
         return set(words)
 
     def _load_knowledge_base(self) -> None:
-        if not self.knowledge_dir.exists():
-            return
+        roots: list[tuple[Path, str | None]] = [(self.knowledge_dir, None)]
+        for extra in self.extra_dirs:
+            roots.append((extra, extra.name))
 
-        for path in sorted(self.knowledge_dir.rglob("*.md")):
+        for root, label in roots:
+            if not root.exists():
+                continue
+            self._load_from_root(root, label)
+
+    def _load_from_root(self, root: Path, label: str | None) -> None:
+        for path in sorted(root.rglob("*.md")):
             try:
                 raw = path.read_text(encoding="utf-8")
                 meta, content = _parse_frontmatter(raw)
@@ -77,8 +105,13 @@ class LocalRAG:
 
                 parts = re.split(r"(?=(?:^|\n)#+\s+)", content)
                 doc_title = path.stem.replace("_", " ").title()
-                rel = path.relative_to(self.knowledge_dir)
+                try:
+                    rel = path.relative_to(root)
+                except ValueError:
+                    rel = path.name
                 rel_norm = str(rel).replace("\\", "/")
+                if label:
+                    rel_norm = f"{label}/{rel_norm}"
 
                 for part in parts:
                     part = part.strip()

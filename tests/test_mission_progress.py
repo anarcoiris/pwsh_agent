@@ -31,3 +31,19 @@ def test_tracker_requires_evidence_for_retrieval():
     tr.register("analyze_pcapng", {"success": True, "analysis": {}}, True)
     assert tr.objective_satisfied() is False
 
+
+def test_stall_directive_dev_not_pcap():
+    tr = MissionProgressTracker("Propose top 10 must-have .ps1 tools and build them")
+    tr.register("append_note", {"success": True}, True)
+    tr.register("append_note", {"success": True}, True)
+    directive = tr.stall_directive()
+    assert "analyze_pcapng" not in directive
+    assert "delegate_to" in directive
+
+
+def test_stall_recovery_on_thinking_spam():
+    tr = MissionProgressTracker("write watcher.py script")
+    tr.register("sequentialthinking", {"status": "success"}, True)
+    tr.register("sequentialthinking", {"status": "success"}, True)
+    assert tr.needs_stall_recovery() is True
+

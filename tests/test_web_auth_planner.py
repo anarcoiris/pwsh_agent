@@ -33,12 +33,24 @@ def test_login_attempt_is_terminal_when_rejected():
     assert plan.needs_readaptation() is False
 
 
-def test_login_attempt_terminal_even_on_network_error():
+def test_login_attempt_with_verdict_is_terminal():
+    # accepted / rejected / unreachable verdicts are reportable terminals
     plan = TaskPlanTracker(INCIDENT)
-    plan.register_tool("try_http_login", {"success": False, "error": "host unreachable"})
+    plan.register_tool("try_http_login", {"success": False, "verdict": "unreachable", "error": "host unreachable"})
     login = next(s for s in plan.steps if s.id == "attempt_login")
     assert login.status == StepStatus.DONE
     assert plan.needs_readaptation() is False
+
+
+def test_login_error_without_verdict_retries():
+    # Success gating (2026-06-10): a tool error with NO verdict means no real
+    # attempt happened — the step fails and the capped trial-and-error loop
+    # (register_failure_attempt → BLOCKED at cap) handles termination instead.
+    plan = TaskPlanTracker(INCIDENT)
+    plan.register_tool("try_http_login", {"success": False, "error": "host unreachable"})
+    login = next(s for s in plan.steps if s.id == "attempt_login")
+    assert login.status == StepStatus.FAILED
+    assert plan.needs_readaptation() is True
 
 
 def test_hash_prompt_unaffected_by_web_auth_branch():

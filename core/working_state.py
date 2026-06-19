@@ -246,7 +246,10 @@ def build_current_state(
     if agent:
         agent_body = f"active_agent={agent}"
         if handoff_complete:
-            agent_body += "\n[HANDOFF COMPLETE — review and delegate or conclude]"
+            agent_body += (
+                "\n[SYSTEM] Specialist finished — LEAD: append_note to update plan/status, "
+                "then delegate_to the next task. Do NOT echo this line."
+            )
         sections.append(("ACTIVE AGENT", agent_body))
 
     if prior_handoff.strip():

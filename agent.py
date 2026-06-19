@@ -98,6 +98,8 @@ from core.execution_policy import ExecutionPolicy, set_pip_near
 from core.runtime_paths import app_root, workspace_root
 from core.mission_progress import MissionProgressTracker
 from core.mission_evaluator import MissionEvaluator
+from core.user_checkpoint import CheckpointGate, CheckpointTrigger, CheckpointDecision
+from core.model_dispatch import should_reevaluate
 from core.intent_spec import IntentFormalizer, build_fallback_spec, save_intent_spec
 
 logger = logging.getLogger("pwsh_agent.agent")
@@ -136,6 +138,7 @@ class OllamaAdapter:
         num_ctx: int = 8192,
         num_predict: int = 3072,
         injection_budget_chars: int = 8000,
+        llm_audit_mode: str = "full",
     ):
         self.host = host
         self.model = model
@@ -143,6 +146,7 @@ class OllamaAdapter:
         self.num_ctx = num_ctx
         self.num_predict = num_predict
         self.injection_budget_chars = injection_budget_chars
+        self.llm_audit_mode = llm_audit_mode
         self.client = AsyncClient(host=host, timeout=httpx.Timeout(300.0))
 
     async def chat(
@@ -158,6 +162,8 @@ class OllamaAdapter:
         current_state: str | None = None,
         prompt_pack_mode: bool = False,
         active_agent: str = "lead",
+        priority_tools: list[str] | None = None,
+        model: str | None = None,
     ) -> dict[str, Any]:
         try:
             for injection in ContextRouter.build_injections(
@@ -170,6 +176,7 @@ class OllamaAdapter:
                 injection_budget_chars=self.injection_budget_chars,
                 prompt_pack_mode=prompt_pack_mode,
                 active_agent=active_agent,
+                priority_tools=priority_tools,
             ):
                 messages = messages + [injection]
         except Exception as e:
@@ -186,12 +193,13 @@ class OllamaAdapter:
         anchor = (anchor_query or "").strip() or resolve_anchor_query(messages)
         self.parser.set_user_context(anchor)
         latest_user = anchor
+        active_model = model or self.model
 
         # region agent log
         try:
             from core.debug_log import trace
             trace("agent.OllamaAdapter.chat:request", "llm prompt", {
-                "model": self.model,
+                "model": active_model,
                 "num_messages": len(messages),
                 "anchor": (anchor or "")[:300],
                 "messages": [
@@ -209,25 +217,13 @@ class OllamaAdapter:
             try:
                 start_t = time.time()
                 response = await self.client.chat(
-                    model=self.model,
+                    model=active_model,
                     messages=messages,
                     tools=tools_schema,
                     options=_options,
                     stream=False,
                 )
                 latency_ms = int((time.time() - start_t) * 1000)
-                
-                try:
-                    from core.debug_log import log_llm_interaction
-                    log_llm_interaction(
-                        model=self.model,
-                        latency_ms=latency_ms,
-                        messages=messages,
-                        response_text=response.message.content or "[(tool_calls)]",
-                        tools_schema=tools_schema
-                    )
-                except Exception:
-                    pass
 
                 msg: dict[str, Any] = {
                     "role":    response.message.role,
@@ -235,7 +231,9 @@ class OllamaAdapter:
                 }
 
                 # Extract native tool_calls from SDK response
+                native_count = 0
                 if response.message.tool_calls:
+                    native_count = len(response.message.tool_calls)
                     msg["tool_calls"] = [
                         {
                             "function": {
@@ -247,12 +245,37 @@ class OllamaAdapter:
                     ]
 
                 # Parser fallback: scan content for missed tool calls
+                parser_paths: list[str] = ["native"] if native_count else []
                 if not msg.get("tool_calls"):
                     extracted = self.parser.discover_tool_calls(
                         msg["content"], user_context=latest_user
                     )
                     if extracted:
                         msg["tool_calls"] = extracted
+                    parser_paths = list(
+                        getattr(self.parser, "last_discovery_paths", []) or []
+                    )
+
+                try:
+                    from core.debug_log import log_llm_interaction
+                    _total_ns = getattr(response, "total_duration", None)
+                    log_llm_interaction(
+                        model=active_model,
+                        latency_ms=latency_ms,
+                        messages=messages,
+                        response_text=response.message.content or "[(tool_calls)]",
+                        tools_schema=tools_schema,
+                        mode=self.llm_audit_mode,
+                        prompt_eval_count=getattr(response, "prompt_eval_count", None),
+                        eval_count=getattr(response, "eval_count", None),
+                        total_duration_ms=int(_total_ns / 1e6) if _total_ns else None,
+                        num_ctx=_options.get("num_ctx", self.num_ctx),
+                        native_tool_calls=native_count,
+                        parsed_tool_calls=len(msg.get("tool_calls") or []),
+                        parser_paths=parser_paths,
+                    )
+                except Exception:
+                    pass
 
                 # region agent log
                 try:
@@ -275,6 +298,11 @@ class OllamaAdapter:
                 await asyncio.sleep(2 ** attempt)
 
         return {"message": {"role": "assistant", "content": "ERROR: Ollama unreachable."}}
+
+
+async def default_ask_user(message: str) -> str:
+    print(message)
+    return await asyncio.to_thread(input, "Checkpoint > ")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -306,6 +334,7 @@ class ReActAgent:
         ollama_cfg = self.config.get("ollama", {})
         self.base_url      = ollama_cfg.get("base_url", "http://localhost:11435")
         self.default_model = ollama_cfg.get("default_model", "qwen2.5-coder:7b-instruct")
+        self.synthesis_model = ollama_cfg.get("synthesis_model") or self.default_model
         self.conversational_model = ollama_cfg.get("conversational_model")
         self.evaluator_temperature = float(ollama_cfg.get("evaluator_temperature", 0.1))
         self.num_ctx = int(ollama_cfg.get("num_ctx", 8192))
@@ -348,6 +377,9 @@ class ReActAgent:
         self._handoff_brief: str = ""
         self._return_to_lead_when: str = ""
         self._handoff_complete: bool = False
+        self._mission_running: bool = False
+        self._pending_dev_continue: bool = False
+        self._last_delegate_brief: str = ""
         self._stop_tool_batch: bool = False
         self._specialist_block_count: int = 0
         self._unlocked_sessions: set[str] = set()
@@ -368,6 +400,7 @@ class ReActAgent:
         self.tools_registry["delegate_to"] = execute_delegate_to
 
         self.parser  = AgentOutputParser(self.tools_registry)
+        self.llm_audit_mode = str(agent_cfg.get("llm_audit", "meta")).lower()
         self.adapter = OllamaAdapter(
             host=self.base_url,
             model=self.default_model,
@@ -375,12 +408,14 @@ class ReActAgent:
             num_ctx=self.num_ctx,
             num_predict=self.num_predict,
             injection_budget_chars=self.injection_budget_chars,
+            llm_audit_mode=self.llm_audit_mode,
         )
         self.mission_evaluator: MissionEvaluator | None = None
-        if self.conversational_model:
+        eval_model = ollama_cfg.get("planner_model") or self.conversational_model or self.default_model
+        if eval_model:
             self.mission_evaluator = MissionEvaluator(
                 host=self.base_url,
-                model=self.conversational_model,
+                model=eval_model,
                 temperature=self.evaluator_temperature,
             )
 
@@ -420,6 +455,11 @@ class ReActAgent:
             reserve_generation_tokens=self.reserve_generation_tokens,
             reserve_injection_tokens=self.reserve_injection_tokens,
         )
+
+        # Checkpoint gates
+        self.ask_user_fn = None
+        self._checkpoint_gate = CheckpointGate(self.session_id, self.config)
+        self._checkpoint_decision = None
 
         # Cancellation
         self._cancel_event = asyncio.Event()
@@ -580,16 +620,29 @@ class ReActAgent:
             "suggested_agent": suggested_agent_for_domain(spec.domain),
         }
 
+    def _plan_priority_tools(self) -> list[str]:
+        """Current plan step's tool hints — pushed to the front of schema selection."""
+        tracker = getattr(self, "_task_plan", None)
+        if tracker is None:
+            return []
+        try:
+            return tracker.pending_tool_hints()
+        except Exception:
+            return []
+
     def _tools_schema_for_turn(self) -> list[dict[str, Any]]:
         if self.prompt_pack_mode:
-            from core.tool_schemas import DEFAULT_SCHEMA_BUDGET_CHARS
+            from core.tool_schemas import DEFAULT_SCHEMA_BUDGET_CHARS, schemas_for_agent
 
             budget = max(
                 self.reserve_injection_tokens * 4,
                 DEFAULT_SCHEMA_BUDGET_CHARS,
             )
-            schemas = self.prompt_pack.schemas_for_agent(self.active_agent, max_chars=budget)
-            return schemas
+            return schemas_for_agent(
+                self.active_agent,
+                max_chars=budget,
+                priority_tools=self._plan_priority_tools(),
+            )
         return tools.TOOLS_SCHEMA
 
     def _reset_handoff_state(self) -> None:
@@ -677,6 +730,7 @@ class ReActAgent:
         self._selected_prior_session = None
         self._unlocked_sessions = set()
         self._reset_handoff_state()
+        self._checkpoint_gate = CheckpointGate(self.session_id, self.config)
         self._init_system_prompt()
         return self.session_id
 
@@ -732,6 +786,9 @@ class ReActAgent:
         url = extract_target_url(getattr(self, "_anchor_query", "") or "", targets)
         if not tool_hint and (spec and spec.domain == "web_auth"):
             tool_hint = "http_get"
+        from core.task_intent import detect_mission_kind
+        if not tool_hint and detect_mission_kind(getattr(self, "_anchor_query", "") or "") == "dev":
+            tool_hint = "write_file"
         return specialist_action_nudge(
             self.active_agent,
             self._handoff_brief,
@@ -826,6 +883,22 @@ class ReActAgent:
             save_current_state(self.session_id, block)
         return block
 
+    def _check_checkpoint_decision(self) -> str | None:
+        """Check if a checkpoint decision was set and return action/string or raise to break.
+        Returns:
+            "break" if STOP was chosen,
+            "return_pause" if CHANGE_CONTEXT was chosen,
+            None otherwise.
+        """
+        decision = getattr(self, "_checkpoint_decision", None)
+        if decision is not None:
+            self._checkpoint_decision = None  # reset
+            if decision == CheckpointDecision.STOP:
+                return "break"
+            if decision == CheckpointDecision.CHANGE_CONTEXT:
+                return "return_pause"
+        return None
+
     # ── Tool execution ─────────────────────────────────────────────────────
 
     async def _execute_tool(
@@ -846,6 +919,7 @@ class ReActAgent:
 
         # Normalise args
         tool_args = ArgumentNormalizer.normalize(tool_name, tool_args)
+        tool_args = self._correct_web_target_arg(tool_name, tool_args)
 
         anchor = getattr(self, "_anchor_query", "") or ""
         try:
@@ -861,20 +935,57 @@ class ReActAgent:
         except Exception:
             pass
 
-        if self.prompt_pack_mode and tool_name == "delegate_to" and self.active_agent != "lead":
-            block_err = "Blocked: only LEAD may call delegate_to."
-            if step_callback:
-                step_callback("AGENT_TOOL_CALL", {"tool": tool_name, "args": tool_args})
-                step_callback("AGENT_TOOL_RESULT", {
-                    "tool": tool_name,
-                    "result": {"success": False, "error": block_err},
+        if self.prompt_pack_mode and tool_name == "delegate_to":
+            if self.active_agent != "lead":
+                block_err = "Blocked: only LEAD may call delegate_to."
+            elif self._handoff_complete:
+                block_err = (
+                    "Blocked: specialist just returned. Call append_note to update status, "
+                    "then delegate_to the NEXT sub-task (not the same brief again)."
+                )
+            else:
+                block_err = ""
+            if block_err:
+                if step_callback:
+                    step_callback("AGENT_TOOL_CALL", {"tool": tool_name, "args": tool_args})
+                    step_callback("AGENT_TOOL_RESULT", {
+                        "tool": tool_name,
+                        "result": {"success": False, "error": block_err},
+                    })
+                self.ctx_manager.add_message({
+                    "role": "tool",
+                    "name": tool_name,
+                    "content": json.dumps({"success": False, "error": block_err}),
                 })
-            self.ctx_manager.add_message({
-                "role": "tool",
-                "name": tool_name,
-                "content": json.dumps({"success": False, "error": block_err}),
-            })
-            return False, 0
+                return False, 0
+
+        if getattr(self, "_mission_running", False) and self.active_agent == "lead":
+            from core.intent_salvage import mission_lead_dev_guard
+            dev_block = mission_lead_dev_guard(
+                tool_name,
+                getattr(self, "_mission_tools_executed", []),
+                getattr(self, "_anchor_query", "") or "",
+                active_agent=self.active_agent,
+                tool_args=tool_args if isinstance(tool_args, dict) else None,
+                last_delegate_brief=getattr(self, "_last_delegate_brief", ""),
+            )
+            if dev_block:
+                if step_callback:
+                    step_callback("AGENT_TOOL_CALL", {"tool": tool_name, "args": tool_args})
+                    step_callback("AGENT_TOOL_RESULT", {
+                        "tool": tool_name,
+                        "result": {"success": False, "error": dev_block},
+                    })
+                self.ctx_manager.add_message({
+                    "role": "tool",
+                    "name": tool_name,
+                    "content": json.dumps({"success": False, "error": dev_block}),
+                })
+                if self._mission_tracker:
+                    self._mission_tracker.register(
+                        tool_name, {"success": False, "error": dev_block}, False, True
+                    )
+                return False, 0
 
         if self.prompt_pack_mode and specialist_hard_block(self.active_agent, tool_name):
             self._specialist_block_count = getattr(self, "_specialist_block_count", 0) + 1
@@ -1156,6 +1267,22 @@ class ReActAgent:
                     # Readaptation surfaced via plan_block next step, not persisted.
                 return False, 0
 
+        if tool_name == "try_http_login":
+            gate_err = self._fetch_before_login_error()
+            if gate_err:
+                if step_callback:
+                    step_callback("AGENT_TOOL_CALL", {"tool": tool_name, "args": tool_args})
+                    step_callback("AGENT_TOOL_RESULT", {
+                        "tool": tool_name,
+                        "result": {"success": False, "error": gate_err},
+                    })
+                self.ctx_manager.add_message({
+                    "role": "tool",
+                    "name": tool_name,
+                    "content": json.dumps({"success": False, "error": gate_err}),
+                })
+                return False, 0
+
         # Deduplication
         call_key = f"{tool_name}:{json.dumps(tool_args, sort_keys=True, default=str)}"
         call_hash = hashlib.sha256(call_key.encode()).hexdigest()[:16]
@@ -1299,6 +1426,10 @@ class ReActAgent:
                 "success": success_flag,
                 "args": dict(tool_args),
             })
+
+        web_target_hint = self._build_web_target_hint(tool_name, result, tool_args)
+        if web_target_hint:
+            self.ctx_manager.add_message({"role": "user", "content": web_target_hint})
 
         script_hint = self._build_script_failure_hint(tool_name, result, tool_args)
         if script_hint:
@@ -1687,6 +1818,11 @@ class ReActAgent:
         plan = getattr(self, "_task_plan", None)
         if plan and plan.steps:
             plan.register_tool(tool_name, result, tool_args)
+            attempt_info = None
+            try:
+                attempt_info = plan.register_failure_attempt(tool_name, result)
+            except Exception:
+                attempt_info = None
             try:
                 if plan.all_done:
                     clear_plan_state(self.session_id)
@@ -1694,6 +1830,23 @@ class ReActAgent:
                     save_plan_state(self.session_id, plan)
             except Exception:
                 pass
+            if attempt_info:
+                self._inject_retry_nudge(attempt_info)
+                if attempt_info.get("cap_reached"):
+                    ask_fn = getattr(self, "ask_user_fn", None) or default_ask_user
+                    err_msg = ""
+                    if isinstance(result, dict):
+                        err_msg = str(result.get("stderr") or result.get("error") or result.get("verdict") or "")
+                    detail = f"Step '{plan.current_step.label}' blocked after {attempt_info.get('attempts')} failed attempts."
+                    if err_msg:
+                        detail += f" Error: {err_msg}"
+                    decision = await self._checkpoint_gate.maybe_checkpoint(
+                        CheckpointTrigger.ATTEMPT_CAP_REACHED,
+                        detail=detail.strip(),
+                        ask_user_fn=ask_fn,
+                    )
+                    if decision in (CheckpointDecision.STOP, CheckpointDecision.CHANGE_CONTEXT):
+                        self._checkpoint_decision = decision
             if plan.needs_readaptation():
                 note = plan.last_failure or "step failed"
                 plan.record_strategy(note)
@@ -1714,7 +1867,15 @@ class ReActAgent:
         if tool_name == "finding_create" and isinstance(result, dict) and result.get("success"):
             self._session_findings_count = getattr(self, "_session_findings_count", 0) + 1
 
-        success_exec = not (isinstance(result, dict) and result.get("success") is False)
+        # Execution success requires an actual success marker: explicit
+        # success!=False AND exit code 0/absent ("a tool ran" is not success).
+        success_exec = not (
+            isinstance(result, dict)
+            and (
+                result.get("success") is False
+                or result.get("exit_code", 0) not in (0, None)
+            )
+        )
 
         if tool_name == "delegate_to" and isinstance(result, dict) and result.get("success"):
             self.active_agent = str(result.get("active_agent", "lead"))
@@ -1722,6 +1883,7 @@ class ReActAgent:
             self._handoff_brief = str(result.get("handoff_brief", ""))
             self._return_to_lead_when = str(result.get("success_criteria", ""))
             self._handoff_complete = False
+            self._last_delegate_brief = str(tool_args.get("brief", "")) if isinstance(tool_args, dict) else ""
             plan = getattr(self, "_task_plan", None)
             if plan and plan.current_step:
                 from core.task_plan import StepStatus, save_plan_state
@@ -1749,6 +1911,23 @@ class ReActAgent:
             self.active_agent = "lead"
             self.active_specialist = "lead"
             self._specialist_block_count = 0
+            # #region agent log
+            try:
+                from core.debug_log import trace
+                trace(
+                    "agent.py:_execute_tool:handoff_complete",
+                    "specialist auto-return to LEAD",
+                    {
+                        "prior_agent": prior_agent,
+                        "tool_name": tool_name,
+                        "handoff_brief_head": (self._handoff_brief or "")[:200],
+                        "mission_head": (getattr(self, "_anchor_query", "") or "")[:120],
+                    },
+                    run_id="handoff",
+                )
+            except Exception:
+                pass
+            # #endregion
             plan = getattr(self, "_task_plan", None)
             if plan and plan.current_step:
                 try:
@@ -1759,6 +1938,26 @@ class ReActAgent:
                     save_plan_state(self.session_id, plan)
                 except Exception:
                     pass
+            self._refresh_system_prompt()
+
+            from core.task_intent import detect_mission_kind
+            if (
+                tool_name == "write_file"
+                and detect_mission_kind(getattr(self, "_anchor_query", "") or "") == "dev"
+            ):
+                written = getattr(self, "_mission_tools_executed", []).count("write_file") + 1
+                target = self._dev_script_target(getattr(self, "_anchor_query", "") or "")
+                if written < target:
+                    self._pending_dev_continue = True
+
+        elif (
+            self.prompt_pack_mode
+            and tool_name == "append_note"
+            and self.active_agent == "lead"
+            and success_exec
+            and self._handoff_complete
+        ):
+            self._handoff_complete = False
             self._refresh_system_prompt()
 
         # Phase 2 STRUCTURED UPDATE: refresh volatile working memory + last-tool
@@ -1782,6 +1981,27 @@ class ReActAgent:
             save_working_memory(self.session_id, self._working_memory)
         except Exception:
             pass
+
+        if tool_name in ("host_exec", "run_script"):
+            ask_fn = getattr(self, "ask_user_fn", None) or default_ask_user
+            detail = f"Tool: {tool_name}\n"
+            if isinstance(result, dict):
+                detail += f"Exit code: {result.get('exit_code')}\n"
+                if result.get("stdout"):
+                    detail += f"Stdout: {str(result.get('stdout'))[:200]}\n"
+                if result.get("stderr"):
+                    detail += f"Stderr: {str(result.get('stderr'))[:200]}\n"
+                if result.get("error"):
+                    detail += f"Error: {str(result.get('error'))[:200]}\n"
+            else:
+                detail += str(result)[:300]
+            decision = await self._checkpoint_gate.maybe_checkpoint(
+                CheckpointTrigger.EXEC_RESULT_REVIEW,
+                detail=detail.strip(),
+                ask_user_fn=ask_fn,
+            )
+            if decision in (CheckpointDecision.STOP, CheckpointDecision.CHANGE_CONTEXT):
+                self._checkpoint_decision = decision
 
         return success_exec, (1 if success_exec else 0)
 
@@ -1816,7 +2036,13 @@ class ReActAgent:
         self._mission_tracker = MissionProgressTracker(user_prompt)
         mission_nudges = 0
         max_mission_nudges = 4
+        dev_bootstrap_attempted = False
         recent_result_heads: list[str] = []
+        self._pending_dev_continue = False
+        self._last_delegate_brief = ""
+        self.parser.set_user_context(user_prompt)
+        from core.task_intent import detect_mission_kind
+        mission_kind = detect_mission_kind(user_prompt)
         if self._mission_goals and self._mission_goals.context_directive():
             self.ctx_manager.add_message({
                 "role": "user",
@@ -1827,11 +2053,32 @@ class ReActAgent:
         evaluator_nudges = 0
         max_evaluator_nudges = 1
 
+        # #region agent log
+        try:
+            from core.debug_log import trace
+            from core.task_intent import detect_mission_kind
+            trace(
+                "agent.py:run_mission:start",
+                "mission initialized",
+                {
+                    "user_prompt_head": user_prompt[:160],
+                    "mission_kind": detect_mission_kind(user_prompt),
+                    "goals_label": getattr(self._mission_goals, "label", None) if self._mission_goals else None,
+                    "goals_required": list(getattr(self._mission_goals, "required_tools", []) or []) if self._mission_goals else [],
+                    "cwd": str(Path.cwd()),
+                },
+                run_id="start",
+            )
+        except Exception:
+            pass
+        # #endregion
+
         tools_executed: int  = 0
         tools_called: set    = set()
         consecutive_empty: int = 0
         final_answer: str    = ""
 
+        self._mission_running = True
         for step in range(self.max_steps):
             if self._cancel_event.is_set():
                 final_answer = "[Mission cancelled by user.]"
@@ -1855,11 +2102,13 @@ class ReActAgent:
                     current_state=current_state or None,
                     prompt_pack_mode=self.prompt_pack_mode,
                     active_agent=self.active_agent,
+                    priority_tools=self._plan_priority_tools(),
                 )
             except Exception as e:
                 err = f"Ollama error: {e}"
                 if step_callback:
                     step_callback("ERROR", err)
+                self._mission_running = False
                 return err
 
             msg      = response.get("message", {})
@@ -1956,6 +2205,7 @@ class ReActAgent:
                 consecutive_empty = 0
                 self.retry_orchestrator.reset()
                 self._stop_tool_batch = False
+                batch_executed = False
                 for tc in tool_calls:
                     func     = tc.get("function", tc)
                     name     = func.get("name", tc.get("name", ""))
@@ -1972,6 +2222,15 @@ class ReActAgent:
                         name, args, tools_called, step_callback
                     )
                     tools_executed += delta
+                    chk = self._check_checkpoint_decision()
+                    if chk == "break":
+                        self._checkpoint_decision = "STOPPED"
+                        break
+                    elif chk == "return_pause":
+                        self._mission_running = False
+                        return "[Checkpoint: Paused for user context input.]"
+                    if did_exec:
+                        batch_executed = True
                     if self._stop_tool_batch:
                         break
                     if did_exec:
@@ -1980,6 +2239,96 @@ class ReActAgent:
                             recent_result_heads.append(self.ctx_manager.get_messages()[-1]["content"][:240])
                         if len(recent_result_heads) > 5:
                             recent_result_heads = recent_result_heads[-5:]
+
+                if (
+                    self.prompt_pack_mode
+                    and self.active_agent != "lead"
+                    and not batch_executed
+                    and self._specialist_block_count >= 2
+                ):
+                    boot = await self._bootstrap_specialist_action(tools_called, step_callback)
+                    if boot:
+                        tools_executed += len(boot)
+                        self._mission_tools_executed.extend(boot)
+                        self._specialist_block_count = 0
+                        self._add_nudge(
+                            "[SYSTEM] Specialist stalled on LEAD-only tools — ran deterministic fallback."
+                        )
+                        # #region agent log
+                        try:
+                            from core.debug_log import trace
+                            trace(
+                                "agent.py:run_mission:specialist_bootstrap",
+                                "workspace/web fallback executed",
+                                {"tools": boot},
+                                run_id="handoff-fix",
+                            )
+                        except Exception:
+                            pass
+                        # #endregion
+                        continue
+
+                if (
+                    getattr(self, "_pending_dev_continue", False)
+                    and mission_kind == "dev"
+                    and self.active_agent == "lead"
+                ):
+                    self._pending_dev_continue = False
+                    written = self._mission_tools_executed.count("write_file")
+                    target = self._dev_script_target(user_prompt)
+                    if written < target:
+                        boot = await self._bootstrap_dev_next_script(
+                            written + 1, user_prompt, tools_called, step_callback
+                        )
+                        if boot:
+                            tools_executed += len(boot)
+                            self._mission_tools_executed.extend(boot)
+                            # #region agent log
+                            try:
+                                from core.debug_log import trace
+                                trace(
+                                    "agent.py:run_mission:dev_continue",
+                                    "auto delegate next script",
+                                    {"script_num": written + 1, "tools": boot},
+                                    run_id="dev-fix",
+                                )
+                            except Exception:
+                                pass
+                            # #endregion
+                            continue
+
+                if (
+                    not dev_bootstrap_attempted
+                    and mission_kind == "dev"
+                    and self.active_agent == "lead"
+                    and "delegate_to" not in self._mission_tools_executed
+                    and "write_file" not in self._mission_tools_executed
+                    and (
+                        self._mission_tracker.needs_stall_recovery()
+                        if self._mission_tracker
+                        else False
+                    )
+                ):
+                    dev_bootstrap_attempted = True
+                    boot = await self._bootstrap_dev_mission(
+                        user_prompt, tools_called, step_callback
+                    )
+                    if boot:
+                        tools_executed += len(boot)
+                        self._mission_tools_executed.extend(boot)
+                        # #region agent log
+                        try:
+                            from core.debug_log import trace
+                            trace(
+                                "agent.py:run_mission:dev_bootstrap",
+                                "auto delegate_to workspace",
+                                {"tools": boot},
+                                run_id="dev-fix",
+                            )
+                        except Exception:
+                            pass
+                        # #endregion
+                        continue
 
                 pending_goals = self._mission_goals.pending(self._mission_tools_executed) if self._mission_goals else []
                 if pending_goals and mission_nudges < max_mission_nudges:
@@ -1997,8 +2346,50 @@ class ReActAgent:
                             )
                         )
 
+                if getattr(self, "_checkpoint_decision", None) == "STOPPED":
+                    self._checkpoint_decision = None
+                    final_answer = await self._final_synthesis()
+                    if step_callback:
+                        step_callback("MISSION_COMPLETED", final_answer)
+                    break
+
                 plan = getattr(self, "_task_plan", None)
+
+                if batch_executed and self.mission_evaluator and should_reevaluate("exec_result", self.config):
+                    try:
+                        eval_data = await self.mission_evaluator.evaluate(
+                            user_prompt,
+                            self._mission_tools_executed,
+                            recent_result_heads or [
+                                self.ctx_manager.get_messages()[-1].get("content", "")[:240]
+                            ],
+                            plan.all_done if plan else False,
+                        )
+                        hint = str(eval_data.get("hint", "")).strip()
+                        if hint and plan:
+                            plan.record_strategy(hint)
+                            cur = plan.current_step
+                            if cur:
+                                plan.append_scratchpad(self.session_id, cur.id, hint)
+                    except Exception as e:
+                        logger.warning("Evaluator error on exec_result: %s", e)
+
                 if plan and plan.steps and plan.needs_readaptation():
+                    ask_fn = getattr(self, "ask_user_fn", None) or default_ask_user
+                    decision = await self._checkpoint_gate.maybe_checkpoint(
+                        CheckpointTrigger.NEEDS_READAPTATION,
+                        detail=plan.last_failure or "A step in the plan has failed.",
+                        ask_user_fn=ask_fn,
+                    )
+                    if decision == CheckpointDecision.STOP:
+                        final_answer = await self._final_synthesis()
+                        if step_callback:
+                            step_callback("MISSION_COMPLETED", final_answer)
+                        break
+                    elif decision == CheckpointDecision.CHANGE_CONTEXT:
+                        self._mission_running = False
+                        return "[Checkpoint: Paused for user context input.]"
+
                     if self.mission_evaluator and evaluator_nudges < max_evaluator_nudges:
                         evaluator_nudges += 1
                         try:
@@ -2021,6 +2412,21 @@ class ReActAgent:
                     continue
 
                 if self._mission_tracker and self._mission_tracker.needs_stall_recovery():
+                    ask_fn = getattr(self, "ask_user_fn", None) or default_ask_user
+                    decision = await self._checkpoint_gate.maybe_checkpoint(
+                        CheckpointTrigger.STALL_RECOVERY,
+                        detail="The agent has run multiple non-substantive tools consecutively and is stalling.",
+                        ask_user_fn=ask_fn,
+                    )
+                    if decision == CheckpointDecision.STOP:
+                        final_answer = await self._final_synthesis()
+                        if step_callback:
+                            step_callback("MISSION_COMPLETED", final_answer)
+                        break
+                    elif decision == CheckpointDecision.CHANGE_CONTEXT:
+                        self._mission_running = False
+                        return "[Checkpoint: Paused for user context input.]"
+
                     self._add_nudge(self._mission_tracker.stall_directive())
                     if self.mission_evaluator and MissionEvaluator.should_run(user_prompt):
                         try:
@@ -2039,9 +2445,50 @@ class ReActAgent:
                 # No tool call — attempt parser reflection
                 consecutive_empty += 1
 
+                # #region agent log
+                try:
+                    from core.debug_log import trace
+                    trace(
+                        "agent.py:run_mission:no_tool_call",
+                        "LLM output had no parseable tool call",
+                        {
+                            "step": step,
+                            "handoff_complete": self._handoff_complete,
+                            "active_agent": self.active_agent,
+                            "is_handoff_echo": "HANDOFF COMPLETE" in (content or ""),
+                            "content_head": (content or "")[:240],
+                            "consecutive_empty": consecutive_empty,
+                        },
+                        run_id="parse",
+                    )
+                except Exception:
+                    pass
+                # #endregion
+
                 reflection = self.retry_orchestrator.parser_reflection(
                     content, self.parser, session_id=self.session_id
                 )
+
+                if (
+                    not reflection
+                    and self._handoff_complete
+                    and self.prompt_pack_mode
+                ):
+                    from core.intent_salvage import _handoff_return_call
+                    reflection = _handoff_return_call(user_prompt, session_id=self.session_id)
+                    self.retry_orchestrator.reset()
+                    # #region agent log
+                    try:
+                        from core.debug_log import trace
+                        trace(
+                            "agent.py:run_mission:handoff_salvage",
+                            "forced append_note after handoff stall",
+                            {"path": reflection["function"]["arguments"].get("path")},
+                            run_id="handoff-fix",
+                        )
+                    except Exception:
+                        pass
+                    # #endregion
 
                 if reflection:
                     consecutive_empty = 0
@@ -2062,6 +2509,15 @@ class ReActAgent:
                         tools_called,
                         step_callback,
                     )
+                    chk = self._check_checkpoint_decision()
+                    if chk == "break":
+                        final_answer = await self._final_synthesis()
+                        if step_callback:
+                            step_callback("MISSION_COMPLETED", final_answer)
+                        break
+                    elif chk == "return_pause":
+                        self._mission_running = False
+                        return "[Checkpoint: Paused for user context input.]"
                 else:
                     # Hard stall nudge — keep looping instead of exiting early
                     nudge = (
@@ -2141,6 +2597,7 @@ class ReActAgent:
         self._mission_goals = None
         self._mission_tools_executed = []
         self._mission_tracker = None
+        self._mission_running = False
         return final_answer
 
     # ── Chat turn (interactive) ────────────────────────────────────────────
@@ -2279,6 +2736,7 @@ class ReActAgent:
         from core.credential_inputs import extract_web_auth_credentials
         self._web_auth_credentials = extract_web_auth_credentials(raw_message)
         self._session_findings_count = 0
+        self._mission_tracker = MissionProgressTracker(raw_message)
         self._in_chat_turn = True
         self._active_intent = TaskIntentExtractor.parse(message)
         await self._compute_intent_spec(raw_message)
@@ -2396,6 +2854,9 @@ class ReActAgent:
         self._chat_tools_executed: list[str] = []
 
         for step in range(12):
+            if getattr(self, "_checkpoint_decision", None) == "STOPPED":
+                self._checkpoint_decision = None
+                break
             self._chat_tools_executed = list(tools_executed_names)
 
             draft = ""
@@ -2430,6 +2891,7 @@ class ReActAgent:
                 current_state=current_state or None,
                 prompt_pack_mode=self.prompt_pack_mode,
                 active_agent=self.active_agent,
+                priority_tools=self._plan_priority_tools(),
             )
 
             msg     = response.get("message", {})
@@ -2541,6 +3003,12 @@ class ReActAgent:
                     if name != "append_note":
                         batch_only_notes = False
                     did_exec, _ = await self._execute_tool(name, args, tools_called, step_callback)
+                    chk = self._check_checkpoint_decision()
+                    if chk == "break":
+                        self._checkpoint_decision = "STOPPED"
+                        break
+                    elif chk == "return_pause":
+                        return "[Checkpoint: Paused for user context input.]"
                     if self._stop_tool_batch:
                         if self.prompt_pack_mode and self.active_agent != "lead":
                             self._add_nudge(self._build_specialist_action_nudge())
@@ -2552,6 +3020,9 @@ class ReActAgent:
                             paths_written.append(str(args["path"]).replace("\\", "/"))
 
                 self._chat_tools_executed = list(tools_executed_names)
+                if getattr(self, "_checkpoint_decision", None) == "STOPPED":
+                    self._checkpoint_decision = None
+                    break
 
                 if (
                     self.prompt_pack_mode
@@ -2646,7 +3117,35 @@ class ReActAgent:
                         self._chat_tools_executed = list(tools_executed_names)
                         continue
 
+                if batch_executed and self.mission_evaluator and should_reevaluate("exec_result", self.config):
+                    try:
+                        eval_data = await self.mission_evaluator.evaluate(
+                            message,
+                            tools_executed_names,
+                            [self.ctx_manager.get_messages()[-1].get("content", "")[:240]],
+                            self._task_plan.all_done if self._task_plan else False,
+                        )
+                        hint = str(eval_data.get("hint", "")).strip()
+                        if hint and self._task_plan:
+                            self._task_plan.record_strategy(hint)
+                            cur = self._task_plan.current_step
+                            if cur:
+                                self._task_plan.append_scratchpad(self.session_id, cur.id, hint)
+                    except Exception as e:
+                        logger.warning("Evaluator error on exec_result: %s", e)
+
                 if self._task_plan.steps and self._task_plan.needs_readaptation():
+                    ask_fn = getattr(self, "ask_user_fn", None) or default_ask_user
+                    decision = await self._checkpoint_gate.maybe_checkpoint(
+                        CheckpointTrigger.NEEDS_READAPTATION,
+                        detail=self._task_plan.last_failure or "A step in the plan has failed.",
+                        ask_user_fn=ask_fn,
+                    )
+                    if decision == CheckpointDecision.STOP:
+                        break
+                    elif decision == CheckpointDecision.CHANGE_CONTEXT:
+                        return "[Checkpoint: Paused for user context input.]"
+
                     if self.mission_evaluator and evaluator_nudges < max_evaluator_nudges:
                         evaluator_nudges += 1
                         try:
@@ -2664,8 +3163,37 @@ class ReActAgent:
                                     self._task_plan.append_scratchpad(self.session_id, cur.id, hint)
                         except Exception:
                             pass
-                    # Readaptation/evaluator guidance is surfaced via CURRENT STATE
-                    # (readaptation section + strategy notes), not persisted.
+                    continue
+
+                if self._mission_tracker and self._mission_tracker.needs_stall_recovery():
+                    ask_fn = getattr(self, "ask_user_fn", None) or default_ask_user
+                    decision = await self._checkpoint_gate.maybe_checkpoint(
+                        CheckpointTrigger.STALL_RECOVERY,
+                        detail="The agent has run multiple non-substantive tools consecutively and is stalling.",
+                        ask_user_fn=ask_fn,
+                    )
+                    if decision == CheckpointDecision.STOP:
+                        break
+                    elif decision == CheckpointDecision.CHANGE_CONTEXT:
+                        return "[Checkpoint: Paused for user context input.]"
+
+                    self._add_nudge(self._mission_tracker.stall_directive())
+                    if self.mission_evaluator and MissionEvaluator.should_run(message):
+                        try:
+                            eval_data = await self.mission_evaluator.evaluate(
+                                message,
+                                tools_executed_names,
+                                [self.ctx_manager.get_messages()[-1].get("content", "")[:240]],
+                                self._task_plan.all_done if self._task_plan else False,
+                            )
+                            hint = str(eval_data.get("hint", "")).strip()
+                            if hint and self._task_plan:
+                                self._task_plan.record_strategy(hint)
+                                cur = self._task_plan.current_step
+                                if cur:
+                                    self._task_plan.append_scratchpad(self.session_id, cur.id, hint)
+                        except Exception:
+                            pass
                     continue
             else:
                 consecutive_no_tool += 1
@@ -2697,6 +3225,12 @@ class ReActAgent:
                         did_exec, _ = await self._execute_tool(
                             iname, iargs, tools_called, step_callback
                         )
+                        chk = self._check_checkpoint_decision()
+                        if chk == "break":
+                            self._checkpoint_decision = "STOPPED"
+                            break
+                        elif chk == "return_pause":
+                            return "[Checkpoint: Paused for user context input.]"
                         if did_exec:
                             tools_executed_names.append(iname)
                             self.retry_orchestrator.reset()
@@ -2723,6 +3257,12 @@ class ReActAgent:
                         did_exec, _ = await self._execute_tool(
                             sname, sargs, tools_called, step_callback
                         )
+                        chk = self._check_checkpoint_decision()
+                        if chk == "break":
+                            self._checkpoint_decision = "STOPPED"
+                            break
+                        elif chk == "return_pause":
+                            return "[Checkpoint: Paused for user context input.]"
                         if did_exec:
                             tools_executed_names.append(sname)
                             if sname == "write_file" and sargs.get("path"):
@@ -2893,6 +3433,12 @@ class ReActAgent:
                     did_exec, _ = await self._execute_tool(
                         rname, rargs, tools_called, step_callback
                     )
+                    chk = self._check_checkpoint_decision()
+                    if chk == "break":
+                        self._checkpoint_decision = "STOPPED"
+                        break
+                    elif chk == "return_pause":
+                        return "[Checkpoint: Paused for user context input.]"
                     if did_exec and rname != "sequentialthinking":
                         tools_executed_names.append(rname)
                         if rname == "write_file" and rargs.get("path"):
@@ -2914,6 +3460,12 @@ class ReActAgent:
                             did_exec, _ = await self._execute_tool(
                                 "find_file", sargs, tools_called, step_callback
                             )
+                            chk = self._check_checkpoint_decision()
+                            if chk == "break":
+                                self._checkpoint_decision = "STOPPED"
+                                break
+                            elif chk == "return_pause":
+                                return "[Checkpoint: Paused for user context input.]"
                             if did_exec:
                                 tools_executed_names.append("find_file")
                                 self._add_nudge(hard_action_nudge(message, self.session_id))
@@ -3004,6 +3556,7 @@ class ReActAgent:
         self._mission_goals = None
         self._mission_tools_executed = []
         self._task_plan = None
+        self._mission_tracker = None
 
         content = self._enforce_deliverables_guard(
             paths_written, intent_snapshot, self.workspace_root,
@@ -3253,6 +3806,151 @@ class ReActAgent:
             executed.extend(wboot)
         return executed
 
+    def _correct_web_target_arg(self, tool_name: str, tool_args: dict) -> dict:
+        """Deterministically fix mangled mission URLs before dispatch.
+
+        The 7B model reliably drops octets when re-typing IPs (observed:
+        'http://168.1.1' for mission target 'http://192.168.1.1'). When the
+        called host is a strict trailing fragment of the mission target host,
+        substitute the mission URL instead of burning a retry attempt.
+        """
+        if tool_name not in ("http_get", "try_http_login", "http_headers_check"):
+            return tool_args
+        url_called = str(tool_args.get("url", "")).strip()
+        if not url_called:
+            return tool_args
+        spec = getattr(self, "_intent_spec", None)
+        targets = list(spec.targets) if spec and spec.targets else []
+        mission_url = extract_target_url(getattr(self, "_anchor_query", "") or "", targets)
+        if not mission_url or url_called.rstrip("/") == mission_url.rstrip("/"):
+            return tool_args
+
+        def _host(u: str) -> str:
+            return re.sub(r"^https?://", "", u).split("/")[0].split(":")[0]
+
+        called_host, target_host = _host(url_called), _host(mission_url)
+        if (
+            called_host
+            and called_host != target_host
+            and target_host.endswith(called_host)
+        ):
+            fixed = dict(tool_args)
+            fixed["url"] = mission_url
+            self._add_nudge(
+                f"[SYSTEM] Corrected mangled URL '{url_called}' → mission target "
+                f"'{mission_url}'."
+            )
+            return fixed
+        return tool_args
+
+    def _build_web_target_hint(
+        self,
+        tool_name: str,
+        result: Any,
+        tool_args: dict,
+    ) -> str | None:
+        """Correct mangled/wrong URLs after a failed web tool call.
+
+        Observed live: the 7B model emitted 'http://168.1.1' for a mission
+        targeting 'http://192.168.1.1' and never recovered. When the failed
+        URL differs from the mission target, feed the exact target back.
+        """
+        if tool_name not in ("http_get", "try_http_login", "http_headers_check"):
+            return None
+        if not isinstance(result, dict) or result.get("success") is not False:
+            return None
+        url_called = str(tool_args.get("url", "")).strip()
+        spec = getattr(self, "_intent_spec", None)
+        targets = list(spec.targets) if spec and spec.targets else []
+        mission_url = extract_target_url(getattr(self, "_anchor_query", "") or "", targets)
+        if not mission_url or url_called.rstrip("/") == mission_url.rstrip("/"):
+            return None
+        return (
+            f"[SYSTEM] {tool_name} failed for '{url_called}' — that is NOT the mission "
+            f"target. The target URL is '{mission_url}'. Retry now with "
+            f"{tool_name}(url='{mission_url}')."
+        )
+
+    def _fetch_before_login_error(self) -> str | None:
+        """Gate try_http_login behind a completed fetch_page step (artifact evidence).
+
+        Blind credential posts against unparsed pages waste attempts — the
+        web_auth roadmap requires http_get (full body to artifact) first.
+        """
+        plan = getattr(self, "_task_plan", None)
+        if not plan or not plan.steps:
+            return None
+        from core.task_plan import StepStatus
+
+        fetch = next((s for s in plan.steps if s.id == "fetch_page"), None)
+        if fetch is None or fetch.status in (
+            StepStatus.DONE, StepStatus.SKIPPED, StepStatus.BLOCKED
+        ):
+            return None
+        # An artifact already on disk satisfies the gate (e.g. fetched in a
+        # prior turn of the same session).
+        try:
+            from core.facts_store import load_facts
+
+            last_page = (load_facts(self.session_id).get("web") or {}).get("last_page") or {}
+            artifact = str(last_page.get("artifact_path") or "")
+            if artifact and Path(artifact).is_file():
+                fetch.status = StepStatus.DONE
+                fetch.note = f"artifact on disk: {artifact}"
+                return None
+        except Exception:
+            pass
+        return (
+            "Blocked: fetch the page first. Run http_get(url=<target>) — the full "
+            "body is saved to an artifact — then grep_file(path=<artifact_path>, "
+            "pattern='login|xmlobj|password|form|action=') to find the login "
+            "mechanism before try_http_login."
+        )
+
+    @staticmethod
+    def _dev_script_target(prompt: str) -> int:
+        lower = (prompt or "").lower()
+        m = re.search(r"\btop\s+(\d+)\b", lower)
+        if m:
+            return max(1, int(m.group(1)))
+        if re.search(r"\b10\b.*\.ps1|must.?have.*10", lower):
+            return 10
+        return 10
+
+    async def _bootstrap_dev_mission(
+        self,
+        brief: str,
+        tools_called: set,
+        step_callback=None,
+    ) -> list[str]:
+        """Auto-delegate dev/script missions when LEAD stalls on planning tools."""
+        return await self._bootstrap_dev_next_script(1, brief, tools_called, step_callback)
+
+    async def _bootstrap_dev_next_script(
+        self,
+        script_num: int,
+        mission_brief: str,
+        tools_called: set,
+        step_callback=None,
+    ) -> list[str]:
+        """Delegate workspace to write the next numbered .ps1 script."""
+        executed: list[str] = []
+        brief = (
+            f"Write must-have PowerShell utility #{script_num} to "
+            f"workspace/scripts/tool{script_num}.ps1 — {mission_brief.strip()[:200]}"
+        )
+        args = {
+            "agent": "workspace",
+            "brief": brief,
+            "success_criteria": f"workspace/scripts/tool{script_num}.ps1 exists on disk.",
+        }
+        if step_callback:
+            step_callback("AGENT_TOOL_CALL", {"tool": "delegate_to", "args": args})
+        did, _ = await self._execute_tool("delegate_to", args, tools_called, step_callback)
+        if did:
+            executed.append("delegate_to")
+        return executed
+
     async def _bootstrap_specialist_action(
         self,
         tools_called: set,
@@ -3272,6 +3970,24 @@ class ReActAgent:
         url = extract_target_url(getattr(self, "_anchor_query", "") or "", targets)
 
         if agent != "web" or not url:
+            if agent == "workspace":
+                from core.task_intent import detect_mission_kind
+                anchor = getattr(self, "_anchor_query", "") or ""
+                if detect_mission_kind(anchor) == "dev":
+                    script_num = getattr(self, "_mission_tools_executed", []).count("write_file") + 1
+                    path = f"workspace/scripts/tool{script_num}.ps1"
+                    content = (
+                        f"# Script {script_num}/10 — {anchor[:100]}\n"
+                        "Write-Host 'Pulse utility script — extend with real logic'\n"
+                    )
+                    if step_callback:
+                        step_callback("AGENT_TOOL_CALL", {"tool": "write_file", "args": {"path": path}})
+                    did, _ = await self._execute_tool(
+                        "write_file", {"path": path, "content": content}, tools_called, step_callback
+                    )
+                    if did:
+                        executed.append("write_file")
+                    return executed
             return executed
 
         from core.task_plan import StepStatus
@@ -3393,16 +4109,124 @@ class ReActAgent:
 
         return content
 
+    def _inject_retry_nudge(self, attempt_info: dict) -> None:
+        """Trial-and-error directives from the per-step attempt tracker.
+
+        - Same error twice: the previous fix changed nothing — demand a
+          different approach instead of another identical iteration.
+        - Attempt cap reached: the step is BLOCKED; force a strategy change
+          (different tool, decomposition, or more evidence) and keep moving.
+        """
+        step_id = attempt_info.get("step_id", "")
+        attempts = attempt_info.get("attempts", 0)
+        max_attempts = attempt_info.get("max_attempts", 8)
+
+        if attempt_info.get("cap_reached"):
+            plan = getattr(self, "_task_plan", None)
+            nxt = plan.current_step if plan else None
+            move_on = (
+                f"Move to the next step: {nxt.label} (use `{nxt.tool_hint.split('|')[0]}`)."
+                if nxt
+                else "Summarize evidence gathered and report the blocker with specifics."
+            )
+            self.ctx_manager.add_message({
+                "role": "user",
+                "content": (
+                    f"[SYSTEM — STRATEGY CHANGE REQUIRED] Step '{step_id}' is BLOCKED "
+                    f"after {attempts} failed attempts. Do NOT retry the same approach.\n"
+                    f"Options: use a different tool, decompose the task, or gather more "
+                    f"evidence first (read_file/grep_file/http_get). {move_on}"
+                ),
+            })
+            return
+
+        if attempt_info.get("repeat_error"):
+            self.ctx_manager.add_message({
+                "role": "user",
+                "content": (
+                    f"[SYSTEM — RETRY {attempts}/{max_attempts}] The previous fix did NOT "
+                    "change the error — the exact same failure occurred again. Change the "
+                    "approach: modify a different part of the code/arguments, or inspect "
+                    "the failing input first. Do not resubmit the identical call."
+                ),
+            })
+
+    _ERROR_BLOCK_START = re.compile(
+        r"^(?:\w+(?:Error|Exception)|InvalidOperation|ObjectNotFound|ParserError"
+        r"|CommandNotFound|Traceback)\b",
+    )
+
+    @staticmethod
+    def _format_error_feedback(
+        error_text: str,
+        max_chars: int = 1500,
+        max_blocks: int = 2,
+    ) -> str:
+        """Verbatim error feedback for the trial-and-error loop.
+
+        Keeps exact error text (incl. PowerShell `Line |` position markers) but
+        deduplicates repeated lines (e.g. the same Out-File error 200x in a
+        parallel loop) and stops after `max_blocks` distinct error blocks.
+        """
+        text = (error_text or "").strip()
+        if not text:
+            return ""
+        seen: set[str] = set()
+        out: list[str] = []
+        blocks = 0
+        for ln in text.splitlines():
+            stripped = ln.rstrip()
+            if not stripped:
+                continue
+            key = re.sub(r"\d+", "<n>", stripped.strip())
+            if key in seen:
+                continue
+            seen.add(key)
+            if ReActAgent._ERROR_BLOCK_START.match(stripped.strip()):
+                blocks += 1
+                if blocks > max_blocks:
+                    out.append("[... further distinct errors omitted ...]")
+                    break
+            out.append(stripped)
+            if sum(len(o) + 1 for o in out) > max_chars:
+                out.append("[... truncated ...]")
+                break
+        return "\n".join(out)[: max_chars + 60]
+
     @staticmethod
     def _build_script_failure_hint(
         tool_name: str,
         result: Any,
         tool_args: dict,
     ) -> str | None:
-        """Dialectical recovery hint after run_script import/runtime failures."""
-        if tool_name != "run_script" or not isinstance(result, dict):
+        """Dialectical recovery hint after run_script/host_exec runtime failures."""
+        if tool_name not in ("run_script", "host_exec") or not isinstance(result, dict):
             return None
-        if result.get("exit_code", 0) == 0:
+
+        if tool_name == "host_exec":
+            stderr_raw = str(result.get("stderr", "") or result.get("error", ""))
+            exit_code = result.get("exit_code", 0)
+            # PowerShell non-terminating errors leave exit code 0 — detect
+            # error markers in stderr as well (e.g. 'Out-File: Cannot bind…').
+            has_error_markers = any(
+                ReActAgent._ERROR_BLOCK_START.match(ln.strip())
+                or re.match(r"^\S+\s*:\s+(Cannot|The term|Method invocation)", ln.strip())
+                for ln in stderr_raw.splitlines()
+            )
+            if exit_code in (0, None) and not has_error_markers:
+                return None
+            stderr = ReActAgent._format_error_feedback(stderr_raw)
+            if not stderr:
+                return None
+            return (
+                "[COMMAND FAILURE — RECOVER]\n"
+                f"host_exec exited {exit_code} with errors. Exact error output (deduplicated):\n"
+                f"{stderr}\n"
+                "Fix the cause shown above and retry with a corrected command/script. "
+                "Do not repeat the identical failing command."
+            )
+
+        if result.get("exit_code", 0) in (0, None):
             return None
 
         missing = result.get("missing_module")
@@ -3422,12 +4246,17 @@ class ReActAgent:
                 f"3) If still failing, read_file the script and inspect imports before next action."
             )
 
-        stderr = str(result.get("stderr", "") or result.get("error", ""))[:400]
+        stderr = ReActAgent._format_error_feedback(
+            str(result.get("stderr", "") or result.get("error", ""))
+        )
         if stderr:
             return (
                 "[SCRIPT FAILURE — RECOVER]\n"
-                f"Script '{script}' failed. stderr: {stderr}\n"
-                "Read the script, fix environment or arguments, then re-run run_script."
+                f"Script '{script}' failed. Exact error output (deduplicated):\n"
+                f"{stderr}\n"
+                "Fix the cause shown above (code, environment, or arguments), then "
+                "re-run run_script with the corrected script. Do not repeat the "
+                "identical failing code."
             )
         return None
 
@@ -3616,6 +4445,7 @@ class ReActAgent:
             response = await self.adapter.chat(
                 messages=self.ctx_manager.messages_for_llm(self.history_window_turns),
                 tools_schema=None,
+                model=self.synthesis_model,
                 options={
                     "temperature": 0.2,
                     "num_predict": self.num_predict_synthesis,
